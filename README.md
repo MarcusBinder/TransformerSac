@@ -36,7 +36,7 @@ Develop a zero-shot generalizable wind farm controller that can be trained on a 
 
 Priority | Issue | Type | Effort | Explanation | 
 -----------------------------------------------
-1 | Wind direction is fixed at 270° for positional encoding | 🔴  Bug | Medium | 
+[x] | Wind direction is fixed at 270° for positional encoding | 🔴  Bug | Medium | 
     The wind-relative positional encoding is designed to rotate turbine coordinates so wind always "comes from" a canonical direction. But the code hardcodes 270° instead of reading the actual wind direction from the observation. This means whenever the wind isn't exactly 270° (which is most of the time, given the 265-275° range), the positional encoding is wrong. The model learns with corrupted spatial information.
 
 2 | Critic architecture: actions through attention | Design choice | Medium | 
@@ -71,11 +71,32 @@ Priority  | Direction                  | Novelty    | Effort | Key Benefit
 
 Recommended Implementation Order
 Phase       | Task                                       | Rationale | 
-Now         | Fix wind direction bug (A1)                 | Critical correctness issue
-Now         | Add gradient clipping (A6)                 | Simple stability safeguard
+DONE        | Fix wind direction bug (A1)                | Critical correctness issue
+DONE        | Add gradient clipping (A6)                 | Simple stability safeguard
 Soon        | Implement attention masking (A3)           | Required for multi-layout training
 Soon        | Polar coordinates (B1)                     | Low effort, good physical grounding
 Medium-term | Test critic architecture alternatives (A2) | Could improve learning
 Medium-term | GTrXL (B2)                                 | Stabilize training for harder problems
 Research    | Wind-relative RoPE (B3)                    | Novel contribution potential
 Research    | Hybrid GNN-Transformer (B4)                | Strongest paper contribution
+
+
+Marcus ideas:
+- The entropy target is a bit weird. Especially if we have varrying number of turbines. We could do something like:
+```
+# In training loop, when computing alpha loss:
+with torch.no_grad():
+    _, log_pi, _, _ = actor.get_action(data["observations"], data["positions"], batch_mask)
+    
+    # Compute actual turbine counts per sample
+    if batch_mask is not None:
+        n_real_turbines = (~batch_mask).sum(dim=1, keepdim=True).float()  # (batch, 1)
+    else:
+        n_real_turbines = torch.full((log_pi.shape[0], 1), n_turbines_max, device=device)
+    
+    # Per-sample adaptive target
+    target_entropy_batch = -action_dim_per_turbine * n_real_turbines * 0.5
+
+alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy_batch)).mean()
+```
+
