@@ -39,6 +39,7 @@ PHASE 2: VALIDATION & DEBUGGING
 [ ] Verify wind-relative encoding is working (test with different wind dirs)
 [ ] Check that model attends to upwind turbines (physics validation)
 [ ] Hyperparameter tuning (embed_dim, num_layers, learning rates)
+[ ] We could 'split' farms into smaller sub-farms to augment data. We could treat the 2x2 farm as 2 separate 2x1 farms during training.
 
 PHASE 3: MULTI-LAYOUT GENERALIZATION
 [ ] Train on multiple layouts simultaneously
