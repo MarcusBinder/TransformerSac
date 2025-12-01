@@ -28,17 +28,18 @@ PHASE 1: CORE IMPLEMENTATION (CURRENT)
 [x] Replay buffer with raw position storage
 [x] Adaptive target entropy for variable turbine counts
 [x] Training loop with proper logging
-[ ] Test on single layout (test_layout: 2x1 grid)
-[ ] Verify learning signal (reward increasing)
+[x] Test on single layout (test_layout: 2x1 grid)
+[x] Verify learning signal (reward increasing)
 [ ] Debug attention patterns
-[ ] Verify wind direction index detection in EnhancedPerTurbineWrapper
+[x] Verify wind direction index detection in EnhancedPerTurbineWrapper
 
 PHASE 2: VALIDATION & DEBUGGING
 [ ] Attention visualization during evaluation
-[ ] Compare with baseline (greedy yaw controller)
+[x] Compare with baseline (greedy yaw controller)
 [ ] Verify wind-relative encoding is working (test with different wind dirs)
 [ ] Check that model attends to upwind turbines (physics validation)
 [ ] Hyperparameter tuning (embed_dim, num_layers, learning rates)
+[ ] We could 'split' farms into smaller sub-farms to augment data. We could treat the 2x2 farm as 2 separate 2x1 farms during training.
 
 PHASE 3: MULTI-LAYOUT GENERALIZATION
 [ ] Train on multiple layouts simultaneously
@@ -62,7 +63,7 @@ PHASE 5: ADVANCED FEATURES
 KNOWN ISSUES / NOTES:
 - History length of 15 may need tuning based on wake propagation time
 - Farm token is optional - test with and without
-- Gradient clipping at 1.0 seems to help stability
+- Gradient clipping at 1.0 is not yet tested
 
 ================================================================================
 """
