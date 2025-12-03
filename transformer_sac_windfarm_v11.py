@@ -2,6 +2,7 @@
 Transformer-based SAC for Wind Farm Control - V10
 
 - Added utd_ratio
+- Added debug logger
 
 A clean implementation of transformer-based Soft Actor-Critic for wind farm
 yaw control with the goal of generalizing across different farm layouts.
@@ -103,6 +104,12 @@ from WindGym.utils.generate_layouts import generate_square_grid, generate_cirula
 from collections import deque
 from MultiLayoutEnv import MultiLayoutEnv, LayoutConfig, create_layout_configs
 
+# Logging utilities for multi-layout training
+from multi_layout_debug import (
+    MultiLayoutDebugLogger,
+    create_debug_logger,
+)
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -121,6 +128,7 @@ class Args:
     wandb_entity: Optional[str] = None
     save_model: bool = True
     save_interval: int = 25000
+    log_image: bool = False  # Log attention images to TensorBoard
     
     # === Environment Settings ===
     turbtype: str = "DTU10MW"  # Wind turbine type
@@ -1157,6 +1165,14 @@ def load_checkpoint(
     return checkpoint["step"]
 
 
+def get_env_current_layout(envs) -> List[str]:
+    '''Get the current layout name for each environment.'''
+    names_tuple = envs.env.get_attr('current_layout')
+    names_list = [names_tuple[x].name for x in range(len(names_tuple))]
+    return names_list
+
+
+
 # =============================================================================
 # VISUALIZATION
 # =============================================================================
@@ -1350,10 +1366,10 @@ def get_layout_positions(layout_type: str, wind_turbine) -> Tuple[np.ndarray, np
         "square_3x3": lambda: generate_square_grid(turbine=wind_turbine, nx=3, ny=3, xDist=5, yDist=5),
         "circular_6": lambda: generate_cirular_farm(n_list=[1, 5], turbine=wind_turbine, r_dist=5),
         "circular_10": lambda: generate_cirular_farm(n_list=[3, 7], turbine=wind_turbine, r_dist=5),
-        "tri1": lambda: generate_right_triangle_grid(turbine=wind_turbine, nx=2, ny=3, xDist=6, yDist=6, orientation='lower_left'),
-        "tri2": lambda: generate_right_triangle_grid(turbine=wind_turbine, nx=2, ny=3, xDist=6, yDist=6, orientation='lower_right'),
-        "tri3": lambda: generate_right_triangle_grid(turbine=wind_turbine, nx=2, ny=3, xDist=6, yDist=6, orientation='upper_left'),
-        "tri4": lambda: generate_right_triangle_grid(turbine=wind_turbine, nx=2, ny=3, xDist=6, yDist=6, orientation='upper_right'),
+        "tri1": lambda: generate_right_triangle_grid(turbine=wind_turbine, nx=2, ny=2, xDist=5, yDist=5, orientation='lower_left'),
+        "tri2": lambda: generate_right_triangle_grid(turbine=wind_turbine, nx=2, ny=2, xDist=5, yDist=5, orientation='lower_right'),
+        "tri3": lambda: generate_right_triangle_grid(turbine=wind_turbine, nx=2, ny=2, xDist=5, yDist=5, orientation='upper_left'),
+        "tri4": lambda: generate_right_triangle_grid(turbine=wind_turbine, nx=2, ny=2, xDist=5, yDist=5, orientation='upper_right'),
     }
     
     if layout_type not in layouts:
@@ -1414,22 +1430,16 @@ def main():
     os.makedirs(f"runs/{run_name}/attention_plots", exist_ok=True)
     
     # Tracking
-    if args.track:
-        import wandb
-        wandb.init(
-            project=args.wandb_project_name,
-            entity=args.wandb_entity,
-            sync_tensorboard=True,
-            config=vars(args),
-            name=run_name,
-            save_code=True,
-        )
-    
-    writer = SummaryWriter(f"runs/{run_name}")
-    writer.add_text(
-        "hyperparameters",
-        "|param|value|\n|-|-|\n" + "\n".join([f"|{k}|{v}|" for k, v in vars(args).items()])
-    )
+    # if args.track:
+    #     import wandb
+    #     wandb.init(
+    #         project=args.wandb_project_name,
+    #         entity=args.wandb_entity,
+    #         sync_tensorboard=True,
+    #         config=vars(args),
+    #         name=run_name,
+    #         save_code=True,
+    #     )
     
     # Seeding
     random.seed(args.seed)
@@ -1548,6 +1558,53 @@ def main():
     action_scale = (action_high - action_low) / 2.0
     action_bias = (action_high + action_low) / 2.0
     
+    # =========================================================================
+    # DEBUG LOGGER AND TRACKING SETUP
+    # =========================================================================
+
+    # Initialize debug logger with configurable frequencies
+    debug_logger = create_debug_logger(
+        layout_names=layout_names,
+        log_every=250,  # Base frequency - others are multiples of this
+    )
+    # Frequencies will be:
+    #   - summary metrics: every 100 steps
+    #   - attention analysis: every 500 steps  
+    #   - gradient norms: every 100 steps
+    #   - q-value stats: every 50 steps
+    #   - diagnostic print: every 2000 steps
+
+    print(f"Debug logger initialized for layouts: {layout_names}")
+    print(f"  Attention logging every {debug_logger.attention_log_frequency} steps")
+    print(f"  Gradient logging every {debug_logger.gradient_log_frequency} steps")
+    
+    if args.track:
+        import wandb
+        wandb.init(
+            project=args.wandb_project_name,
+            entity=args.wandb_entity,
+            sync_tensorboard=True,
+            config=vars(args) | {
+                # Debug/multi-layout config
+                "debug/n_layouts": len(layout_names),
+                "debug/layout_names": layout_names,
+                "debug/is_multi_layout": is_multi_layout,
+                "debug/max_turbines": n_turbines_max,
+                "debug/log_frequency": debug_logger.log_frequency,
+                "debug/attention_log_frequency": debug_logger.attention_log_frequency,
+                "debug/gradient_log_frequency": debug_logger.gradient_log_frequency,
+            },
+            name=run_name,
+            monitor_gym=True,
+            save_code=True,
+        )
+
+    writer = SummaryWriter(f"runs/{run_name}")
+    writer.add_text(
+        "hyperparameters",
+        "|param|value|\n|-|-|\n" + "\n".join([f"|{k}|{v}|" for k, v in vars(args).items()])
+    )
+
     # =========================================================================
     # NETWORK SETUP
     # =========================================================================
@@ -1709,7 +1766,22 @@ def main():
         
         # Step environment
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
-        
+
+
+        # Get current layout names for each env
+        current_layouts = get_env_current_layout(envs)
+
+        # Log per-step data to debug tracker (always - internal deques handle storage)
+        for i in range(args.num_envs):
+            debug_logger.log_layout_step(
+                layout_name=current_layouts[i],
+                reward=float(rewards[i]),
+                power=float(infos.get("Power agent", [0.0] * args.num_envs)[i]) if "Power agent" in infos else None,
+                actions=actions[i] if isinstance(actions, np.ndarray) else np.array(actions[i]),
+            )
+            debug_logger.log_wind_direction(float(wind_dirs[i]))
+
+
         # Track rewards
         step_reward_window.extend(np.array(rewards).flatten().tolist())
         
@@ -1724,6 +1796,15 @@ def main():
             writer.add_scalar("charts/episodic_length", ep_length, global_step)
             writer.add_scalar("charts/episodic_power", ep_power, global_step)
         
+            # NEW: Per-layout episode tracking
+            for i, final_info in enumerate(infos.get("final_info", [])):
+                if final_info is not None and i < len(current_layouts):
+                    layout_name = current_layouts[i]
+                    ep_ret = final_info.get("episode", {}).get("r", ep_return)
+                    
+                    debug_logger.log_layout_episode(layout_name, float(ep_ret))
+                    writer.add_scalar(f"charts/layout/{layout_name}/episodic_return", ep_ret, global_step)
+
         # Handle final observations
         real_next_obs = next_obs.copy()
         for idx, trunc in enumerate(truncations):
@@ -1795,6 +1876,17 @@ def main():
                 qf1_value = qf1(data["observations"], data["actions"], data["positions"], batch_mask)
                 qf2_value = qf2(data["observations"], data["actions"], data["positions"], batch_mask)
                 
+
+                # Log Q-value statistics (frequency controlled by logger)
+                if debug_logger.should_log_q_values(total_gradient_steps):
+                    debug_logger.log_q_value_stats(
+                        qf1_values=qf1_value,
+                        qf2_values=qf2_value,
+                        target_q=target_q,
+                        writer=writer,
+                        global_step=global_step,
+                    )
+
                 # Critic loss
                 qf1_loss = F.mse_loss(qf1_value, target_q)
                 qf2_loss = F.mse_loss(qf2_value, target_q)
@@ -1810,6 +1902,9 @@ def main():
                     )
                 q_optimizer.step()
                 
+                if debug_logger.should_log_gradients(total_gradient_steps):
+                    debug_logger.log_critic_gradient_norms(qf1, qf2, writer, global_step)
+
                 # Accumulate losses for logging
                 loss_accumulator['qf1_loss'].append(qf1_loss.item())
                 loss_accumulator['qf2_loss'].append(qf2_loss.item())
@@ -1840,7 +1935,10 @@ def main():
                             max_norm=args.grad_clip_max_norm
                         )
                     actor_optimizer.step()
-                    
+
+                    if debug_logger.should_log_gradients(total_gradient_steps):
+                        debug_logger.log_actor_gradient_norms(actor, writer, global_step)
+
                     loss_accumulator['actor_loss'].append(actor_loss.item())
                     
                     # -------------------------------------------------------------
@@ -1881,6 +1979,43 @@ def main():
                             args.tau * param.data + (1 - args.tau) * target_param.data
                         )
                 
+                # Attention physics analysis (frequency controlled by logger)
+                if debug_logger.should_log_attention(total_gradient_steps):
+                    with torch.no_grad():
+                        # Get fresh attention weights from a small batch
+                        sample_size = min(8, args.batch_size)
+                        _, _, _, attn_weights = actor.get_action(
+                            data["observations"][:sample_size],
+                            data["positions"][:sample_size],
+                            batch_mask[:sample_size] if batch_mask is not None else None
+                        )
+                        
+                        # This logs both scalar metrics AND a visualization image!
+                        debug_logger.log_attention_metrics(
+                            attention_weights=attn_weights,
+                            positions=data["positions"][:sample_size],
+                            attention_mask=batch_mask[:sample_size] if batch_mask is not None else None,
+                            writer=writer,
+                            global_step=global_step,
+                            log_image=args.log_image,  # Set False to disable image (faster)
+                        )
+                        
+                        # Optional: Log per-head attention figure (more expensive)
+                        if args.log_image:
+                            # Useful for understanding what each head specializes in
+                            if debug_logger.should_log_histograms(total_gradient_steps):  # Less frequent
+                                fig = debug_logger.create_multi_head_attention_figure(
+                                    attention_weights=attn_weights,
+                                    positions=data["positions"][:1],  # Single sample
+                                    attention_mask=batch_mask[:1] if batch_mask is not None else None,
+                                    title=f"Step {global_step}",
+                                )
+                                if fig is not None:
+                                    writer.add_figure("debug/attention/per_head", fig, global_step)
+                                    import matplotlib.pyplot as plt
+                                    plt.close(fig)
+
+
                 total_gradient_steps += 1
 
             # -----------------------------------------------------------------
@@ -1910,6 +2045,19 @@ def main():
                       f"reward_mean={mean_reward:.4f}, grad_steps={total_gradient_steps}")
         
         
+            # Log summary metrics (frequency controlled by logger)
+            if debug_logger.should_log(global_step):
+                debug_logger.log_summary_metrics(
+                    writer=writer,
+                    global_step=global_step,
+                )
+
+                # Print diagnostic summary to console (frequency controlled by logger)
+                if debug_logger.should_print_diagnostics(global_step):
+                    debug_logger.print_diagnostics(global_step)
+
+
+
         # =====================================================================
         # CHECKPOINTING
         # =====================================================================
