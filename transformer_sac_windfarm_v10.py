@@ -1,5 +1,7 @@
 """
-Transformer-based SAC for Wind Farm Control - V9
+Transformer-based SAC for Wind Farm Control - V10
+
+- Added utd_ratio
 
 A clean implementation of transformer-based Soft Actor-Critic for wind farm
 yaw control with the goal of generalizing across different farm layouts.
@@ -139,6 +141,7 @@ class Args:
     pos_embed_dim: int = 32       # Dimension for positional encoding
     
     # === SAC Hyperparameters ===
+    utd_ratio: float = 1.0           # Update-to-data ratio
     total_timesteps: int = 100_000
     buffer_size: int = int(1e6)
     gamma: float = 0.99           # Discount factor
@@ -1638,11 +1641,13 @@ def main():
     # =========================================================================
     
     print(f"\nStarting training for {args.total_timesteps} timesteps...")
+    print(f"UTD ratio: {args.utd_ratio} (gradient updates per env step)")
+    print(f"With {args.num_envs} envs: {int(args.num_envs * args.utd_ratio)} gradient updates per iteration")
     print("=" * 60)
     
     start_time = time.time()
     global_step = 0
-    
+    total_gradient_steps = 0  # Track total gradient updates for logging
     # Reset environments
     obs, infos = envs.reset(seed=args.seed)
     
@@ -1650,6 +1655,11 @@ def main():
     step_reward_window = deque(maxlen=1000)
     next_save_step = args.save_interval
     
+    # For logging losses (we'll average over the UTD updates)
+    loss_accumulator = {
+        'qf1_loss': [], 'qf2_loss': [], 'actor_loss': [], 'alpha_loss': []
+    }
+
     num_updates = args.total_timesteps // args.num_envs
     
     for update in range(num_updates + 2):
@@ -1728,58 +1738,72 @@ def main():
         # =====================================================================
         
         if global_step > args.learning_starts and len(rb) >= args.batch_size:
-            # Sample batch
-            data = rb.sample(args.batch_size)
+
+            # Calculate number of gradient updates for this iteration
+            # This scales with num_envs to maintain consistent sample efficiency
+            num_gradient_updates = max(1, int(args.num_envs * args.utd_ratio))
             
-            batch_mask = data["attention_mask"] if is_multi_layout else None
-            
-            # -----------------------------------------------------------------
-            # Update Critics
-            # -----------------------------------------------------------------
-            with torch.no_grad():
-                # Get next actions from current policy
-                next_actions, next_log_pi, _, _ = actor.get_action(
-                    data["next_observations"],
-                    data["positions"],
-                    batch_mask
-                )
+            # Clear loss accumulator for this iteration
+            loss_accumulator = {k: [] for k in loss_accumulator}
+
+
+            for grad_step in range(num_gradient_updates):
+                # Sample a fresh batch for each gradient update
+                data = rb.sample(args.batch_size)
                 
-                # Compute target Q-values
-                qf1_next = qf1_target(
-                    data["next_observations"], next_actions, data["positions"], batch_mask
-                )
-                qf2_next = qf2_target(
-                    data["next_observations"], next_actions, data["positions"], batch_mask
-                )
-                min_qf_next = torch.min(qf1_next, qf2_next) - alpha * next_log_pi
+                batch_mask = data["attention_mask"] if is_multi_layout else None
                 
-                # Bellman target
-                target_q = data["rewards"] + (1 - data["dones"]) * args.gamma * min_qf_next
-            
-            # Current Q-values
-            qf1_value = qf1(data["observations"], data["actions"], data["positions"], batch_mask)
-            qf2_value = qf2(data["observations"], data["actions"], data["positions"], batch_mask)
-            
-            # Critic loss
-            qf1_loss = F.mse_loss(qf1_value, target_q)
-            qf2_loss = F.mse_loss(qf2_value, target_q)
-            qf_loss = qf1_loss + qf2_loss
-            
-            # Update critics
-            q_optimizer.zero_grad()
-            qf_loss.backward()
-            if args.grad_clip:
-                torch.nn.utils.clip_grad_norm_(
-                    list(qf1.parameters()) + list(qf2.parameters()),
-                    max_norm=args.grad_clip_max_norm
-                )
-            q_optimizer.step()
-            
-            # -----------------------------------------------------------------
-            # Update Actor (delayed)
-            # -----------------------------------------------------------------
-            if update % args.policy_frequency == 0:
-                for _ in range(args.policy_frequency):
+
+                # -----------------------------------------------------------------
+                # Update Critics
+                # -----------------------------------------------------------------
+                with torch.no_grad():
+                    # Get next actions from current policy
+                    next_actions, next_log_pi, _, _ = actor.get_action(
+                        data["next_observations"],
+                        data["positions"],
+                        batch_mask
+                    )
+                    
+                    # Compute target Q-values
+                    qf1_next = qf1_target(
+                        data["next_observations"], next_actions, data["positions"], batch_mask
+                    )
+                    qf2_next = qf2_target(
+                        data["next_observations"], next_actions, data["positions"], batch_mask
+                    )
+                    min_qf_next = torch.min(qf1_next, qf2_next) - alpha * next_log_pi
+                    
+                    # Bellman target
+                    target_q = data["rewards"] + (1 - data["dones"]) * args.gamma * min_qf_next
+                
+                # Current Q-values
+                qf1_value = qf1(data["observations"], data["actions"], data["positions"], batch_mask)
+                qf2_value = qf2(data["observations"], data["actions"], data["positions"], batch_mask)
+                
+                # Critic loss
+                qf1_loss = F.mse_loss(qf1_value, target_q)
+                qf2_loss = F.mse_loss(qf2_value, target_q)
+                qf_loss = qf1_loss + qf2_loss
+                
+                # Update critics
+                q_optimizer.zero_grad()
+                qf_loss.backward()
+                if args.grad_clip:
+                    torch.nn.utils.clip_grad_norm_(
+                        list(qf1.parameters()) + list(qf2.parameters()),
+                        max_norm=args.grad_clip_max_norm
+                    )
+                q_optimizer.step()
+                
+                # Accumulate losses for logging
+                loss_accumulator['qf1_loss'].append(qf1_loss.item())
+                loss_accumulator['qf2_loss'].append(qf2_loss.item())
+
+                # -----------------------------------------------------------------
+                # Update Actor (delayed based on total gradient steps)
+                # -----------------------------------------------------------------
+                if total_gradient_steps % args.policy_frequency == 0:
                     # Get actions from current policy
                     actions_pi, log_pi, _, _ = actor.get_action(
                         data["observations"], data["positions"], batch_mask
@@ -1803,6 +1827,8 @@ def main():
                         )
                     actor_optimizer.step()
                     
+                    loss_accumulator['actor_loss'].append(actor_loss.item())
+                    
                     # -------------------------------------------------------------
                     # Update Alpha (entropy coefficient)
                     # -------------------------------------------------------------
@@ -1825,20 +1851,24 @@ def main():
                         alpha_loss.backward()
                         alpha_optimizer.step()
                         alpha = log_alpha.exp().item()
-            
-            # -----------------------------------------------------------------
-            # Update Target Networks
-            # -----------------------------------------------------------------
-            if update % args.target_network_frequency == 0:
-                for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
-                    target_param.data.copy_(
-                        args.tau * param.data + (1 - args.tau) * target_param.data
-                    )
-                for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
-                    target_param.data.copy_(
-                        args.tau * param.data + (1 - args.tau) * target_param.data
-                    )
-            
+                        
+                        loss_accumulator['alpha_loss'].append(alpha_loss.item())
+                
+                # -----------------------------------------------------------------
+                # Update Target Networks
+                # -----------------------------------------------------------------
+                if total_gradient_steps % args.target_network_frequency == 0:
+                    for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
+                        target_param.data.copy_(
+                            args.tau * param.data + (1 - args.tau) * target_param.data
+                        )
+                    for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
+                        target_param.data.copy_(
+                            args.tau * param.data + (1 - args.tau) * target_param.data
+                        )
+                
+                total_gradient_steps += 1
+
             # -----------------------------------------------------------------
             # Logging
             # -----------------------------------------------------------------
@@ -1846,17 +1876,25 @@ def main():
                 sps = int(global_step / (time.time() - start_time))
                 mean_reward = float(np.mean(step_reward_window)) if step_reward_window else 0.0
                 
-                writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
-                writer.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
-                writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
+                # Average losses over the UTD updates
+                mean_qf1_loss = np.mean(loss_accumulator['qf1_loss']) if loss_accumulator['qf1_loss'] else 0
+                mean_qf2_loss = np.mean(loss_accumulator['qf2_loss']) if loss_accumulator['qf2_loss'] else 0
+                mean_actor_loss = np.mean(loss_accumulator['actor_loss']) if loss_accumulator['actor_loss'] else 0
+                
+                writer.add_scalar("losses/qf1_loss", mean_qf1_loss, global_step)
+                writer.add_scalar("losses/qf2_loss", mean_qf2_loss, global_step)
+                writer.add_scalar("losses/actor_loss", mean_actor_loss, global_step)
                 writer.add_scalar("losses/alpha", alpha, global_step)
                 writer.add_scalar("charts/SPS", sps, global_step)
                 writer.add_scalar("charts/step_reward_mean_1000", mean_reward, global_step)
                 writer.add_scalar("debug/mean_wind_direction", float(np.mean(wind_dirs)), global_step)
+                writer.add_scalar("debug/total_gradient_steps", total_gradient_steps, global_step)
+                writer.add_scalar("debug/gradient_updates_per_iter", num_gradient_updates, global_step)
                 
-                print(f"Step {global_step}: SPS={sps}, qf_loss={qf_loss.item():.4f}, "
-                      f"actor_loss={actor_loss.item():.4f}, alpha={alpha:.4f}, "
-                      f"reward_mean={mean_reward:.4f}")
+                print(f"Step {global_step}: SPS={sps}, qf_loss={mean_qf1_loss + mean_qf2_loss:.4f}, "
+                      f"actor_loss={mean_actor_loss:.4f}, alpha={alpha:.4f}, "
+                      f"reward_mean={mean_reward:.4f}, grad_steps={total_gradient_steps}")
+        
         
         # =====================================================================
         # CHECKPOINTING

@@ -1,0 +1,56 @@
+{
+  "n_samples": 3000,
+  "n_bins": 2,
+  "binned_results": {
+    "2": {
+      "label": "180\u00b0-270\u00b0 (SW)",
+      "mean_wind_direction": 215.28862937911194,
+      "n_samples": 900,
+      "upwind_mean": 0.4908912479877472,
+      "downwind_mean": 0.5279783606529236,
+      "ratio": 0.9297564029693604,
+      "reference_turbine": 0,
+      "most_downwind": 0
+    },
+    "3": {
+      "label": "270\u00b0-360\u00b0 (NW)",
+      "mean_wind_direction": 304.8510264197747,
+      "n_samples": 2100,
+      "upwind_mean": 0.5844537019729614,
+      "downwind_mean": 0.3386935293674469,
+      "ratio": 1.7256122827529907,
+      "reference_turbine": 1,
+      "most_downwind": 0
+    }
+  },
+  "head_analysis": {
+    "0": {
+      "focus_turbine": 1,
+      "focus_score": 0.5479004383087158,
+      "nn_preference": Infinity,
+      "uniformity": 0.9965080670047168
+    },
+    "1": {
+      "focus_turbine": 1,
+      "focus_score": 0.5517300367355347,
+      "nn_preference": Infinity,
+      "uniformity": 0.9953808067196366
+    },
+    "2": {
+      "focus_turbine": 1,
+      "focus_score": 0.516153872013092,
+      "nn_preference": Infinity,
+      "uniformity": 0.9914043098577122
+    },
+    "3": {
+      "focus_turbine": 1,
+      "focus_score": 0.7060291767120361,
+      "nn_preference": Infinity,
+      "uniformity": 0.936747707465559
+    }
+  },
+  "rotation_analysis": {
+    "pct_matches_downwind": 50.0,
+    "pct_matches_upwind": 50.0
+  }
+}
