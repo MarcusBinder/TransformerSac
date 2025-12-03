@@ -35,6 +35,15 @@ PHASE 1: CORE IMPLEMENTATION (CURRENT)
 [ ] Debug attention patterns
 [x] Verify wind direction index detection in EnhancedPerTurbineWrapper
 
+POSITIONAL ENCODING NOTES:
+- The current positional encoding uses a small MLP on (x, y) coordinates.
+Alternatives could be:
+- Sinusoidal encoding of (x, y)
+- Polar coordinates (r, theta) instead of Cartesian
+- Relative positional encoding based on pairwise distances. 
+rel_pos[i,j] = position[j] - position[i]  
+- Rotary Position Embeddings (RoPE) 
+
 PHASE 2: VALIDATION & DEBUGGING
 [ ] Attention visualization during evaluation
 [x] Compare with baseline (greedy yaw controller)
@@ -90,7 +99,7 @@ from collections import deque
 # WindGym imports (adjust path as needed for your setup)
 from WindGym import WindFarmEnv
 from WindGym.wrappers import RecordEpisodeVals, PerTurbineObservationWrapper
-from WindGym.utils.generate_layouts import generate_square_grid, generate_cirular_farm
+from WindGym.utils.generate_layouts import generate_square_grid, generate_cirular_farm, generate_right_triangle_grid
 from collections import deque
 from MultiLayoutEnv import MultiLayoutEnv, LayoutConfig, create_layout_configs
 
@@ -1275,7 +1284,7 @@ def make_env_config() -> Dict[str, Any]:
         "wind": {
             "ws_min": 10, "ws_max": 10,
             "TI_min": 0.07, "TI_max": 0.07,
-            "wd_min": 190, "wd_max": 350,
+            "wd_min": 260, "wd_max": 280,
         },
         "act_pen": {"action_penalty": 0.0, "action_penalty_type": "Change"},
         "power_def": {"Power_reward": "Baseline", "Power_avg": 1, "Power_scaling": 1.0},
@@ -1337,6 +1346,7 @@ def get_layout_positions(layout_type: str, wind_turbine) -> Tuple[np.ndarray, np
     layouts = {
         "test_layout": lambda: generate_square_grid(turbine=wind_turbine, nx=2, ny=1, xDist=5, yDist=5),
         "square_2x2": lambda: generate_square_grid(turbine=wind_turbine, nx=2, ny=2, xDist=5, yDist=5),
+        "small_triangle": lambda: generate_right_triangle_grid(turbine=wind_turbine, nx=2, ny=3, xDist=5, yDist=5),
         "square_3x3": lambda: generate_square_grid(turbine=wind_turbine, nx=3, ny=3, xDist=5, yDist=5),
         "circular_6": lambda: generate_cirular_farm(n_list=[1, 5], turbine=wind_turbine, r_dist=5),
         "circular_10": lambda: generate_cirular_farm(n_list=[3, 7], turbine=wind_turbine, r_dist=5),

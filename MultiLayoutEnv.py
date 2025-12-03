@@ -10,6 +10,7 @@ Key features:
 - Reinitializes environment on reset (no pre-created environment pool)
 - Handles observation/action padding for variable farm sizes
 - Provides attention masks for transformer architectures
+- Pads info dict arrays for AsyncVectorEnv compatibility
 """
 
 import gymnasium as gym
@@ -54,6 +55,7 @@ class MultiLayoutEnv(gym.Env):
         env_factory: Callable[[np.ndarray, np.ndarray], gym.Env],
         per_turbine_wrapper: Callable[[gym.Env], gym.Env],
         seed: int = 0,
+        pad_value: float = 0.0,
     ):
         """
         Args:
@@ -63,6 +65,7 @@ class MultiLayoutEnv(gym.Env):
                         Should return the unwrapped environment.
             per_turbine_wrapper: Callable that wraps the env with per-turbine observations.
             seed: Random seed for layout sampling.
+            pad_value: Value to use for padding (default: 0.0).
         """
         super().__init__()
         
@@ -75,6 +78,7 @@ class MultiLayoutEnv(gym.Env):
         self.per_turbine_wrapper = per_turbine_wrapper
         self.seed_value = seed
         self.rng = np.random.default_rng(seed)
+        self.pad_value = pad_value
         
         # Determine max turbines from layouts
         self.max_turbines = max(l.n_turbines for l in layouts)
@@ -149,6 +153,101 @@ class MultiLayoutEnv(gym.Env):
         mask = np.ones(self.max_turbines, dtype=bool)
         mask[:self.n_turbines] = False
         return mask
+    
+    # =========================================================================
+    # Info Dict Padding (fixes AsyncVectorEnv compatibility)
+    # =========================================================================
+    
+    def _pad_info(self, info: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Handle info dict arrays for AsyncVectorEnv compatibility.
+        
+        Uses shape-based detection to identify per-turbine arrays:
+        - Shape (n_turb,) → pad to (max_turb,)
+        - Shape (T, n_turb) → pad to (T, max_turb)
+        - Shape (n_turb * k,) for integer k → reshape, pad, flatten
+        - Other arrays → convert to list (safe fallback)
+        
+        Converting to list prevents AsyncVectorEnv from trying to stack.
+        """
+        padded_info = {}
+        n_turb = self.n_turbines
+        
+        for key, value in info.items():
+            if not isinstance(value, np.ndarray):
+                # Non-arrays pass through unchanged
+                padded_info[key] = value
+            else:
+                # Try to pad based on shape, fall back to list if can't
+                padded_info[key] = self._pad_or_convert(value, n_turb)
+                
+        return padded_info
+    
+    def _pad_or_convert(self, arr: np.ndarray, n_turb: int) -> Any:
+        """
+        Attempt to pad array if it's a per-turbine array, otherwise convert to list.
+        
+        Returns padded numpy array if padding is possible, otherwise a Python list.
+        """
+        if arr.ndim == 1:
+            return self._handle_1d_array(arr, n_turb)
+        elif arr.ndim == 2:
+            return self._handle_2d_array(arr, n_turb)
+        else:
+            # Higher dimensional arrays: convert to list
+            return arr.tolist()
+    
+    def _handle_1d_array(self, arr: np.ndarray, n_turb: int) -> Any:
+        """Handle 1D arrays - either pad or convert to list."""
+        arr_len = arr.shape[0]
+        
+        if arr_len == n_turb:
+            # Simple per-turbine array: (n_turb,) → (max_turb,)
+            if n_turb < self.max_turbines:
+                pad_width = self.max_turbines - n_turb
+                return np.pad(arr, (0, pad_width), constant_values=self.pad_value)
+            return arr
+            
+        elif arr_len > n_turb and arr_len % n_turb == 0:
+            # Flattened per-turbine array: (n_turb * features,) → (max_turb * features,)
+            features_per_turb = arr_len // n_turb
+            
+            # Reshape to (n_turb, features)
+            reshaped = arr.reshape(n_turb, features_per_turb)
+            
+            # Pad in turbine dimension
+            if n_turb < self.max_turbines:
+                pad_width = self.max_turbines - n_turb
+                padded = np.pad(reshaped, ((0, pad_width), (0, 0)), 
+                               constant_values=self.pad_value)
+            else:
+                padded = reshaped
+            
+            # Flatten back to 1D
+            return padded.flatten()
+        else:
+            # Unknown structure: convert to list
+            return arr.tolist()
+    
+    def _handle_2d_array(self, arr: np.ndarray, n_turb: int) -> Any:
+        """Handle 2D arrays - either pad or convert to list."""
+        # Check if second dimension matches n_turb: (T, n_turb)
+        if arr.shape[1] == n_turb:
+            if n_turb < self.max_turbines:
+                pad_width = self.max_turbines - n_turb
+                return np.pad(arr, ((0, 0), (0, pad_width)), constant_values=self.pad_value)
+            return arr
+        
+        # Check if first dimension matches n_turb: (n_turb, features)
+        elif arr.shape[0] == n_turb:
+            if n_turb < self.max_turbines:
+                pad_width = self.max_turbines - n_turb
+                return np.pad(arr, ((0, pad_width), (0, 0)), constant_values=self.pad_value)
+            return arr
+        
+        else:
+            # Unknown structure: convert to list
+            return arr.tolist()
     
     # =========================================================================
     # Properties
@@ -238,7 +337,7 @@ class MultiLayoutEnv(gym.Env):
         
         Returns:
             obs: Padded observation of shape (max_turbines, obs_dim_per_turbine)
-            info: Dict containing layout information
+            info: Dict containing layout information (with padded arrays)
         """
         if seed is not None:
             self.rng = np.random.default_rng(seed)
@@ -273,6 +372,9 @@ class MultiLayoutEnv(gym.Env):
         # Pad observation
         padded_obs = self._pad_observation(obs)
         
+        # Pad info dict arrays for AsyncVectorEnv compatibility
+        info = self._pad_info(info)
+        
         # Add layout info to info dict
         info['n_turbines'] = self.n_turbines
         info['layout'] = self.current_layout.name
@@ -296,7 +398,7 @@ class MultiLayoutEnv(gym.Env):
             reward: Scalar reward
             terminated: Whether episode terminated
             truncated: Whether episode was truncated
-            info: Dict with additional information
+            info: Dict with additional information (with padded arrays)
         """
         # Only use actions for real turbines (ignore padding actions)
         real_action = action[:self.n_turbines]
@@ -305,6 +407,9 @@ class MultiLayoutEnv(gym.Env):
         
         # Pad observation
         padded_obs = self._pad_observation(obs)
+        
+        # Pad info dict arrays for AsyncVectorEnv compatibility
+        info = self._pad_info(info)
         
         # Add layout info
         info['n_turbines'] = self.n_turbines
