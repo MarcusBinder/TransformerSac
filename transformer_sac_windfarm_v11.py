@@ -1529,6 +1529,15 @@ def main():
             return env
         return _init
     
+
+    # Make a singular env 
+    single_env = make_env_fn(args.seed)()
+    obs, info = single_env.reset()
+    single_env.step(single_env.action_space.sample())
+    single_env.close()
+    single_env = None
+
+
     # Create vectorized environments
     print(f"Creating {args.num_envs} parallel environment(s)...")
     envs = gym.vector.AsyncVectorEnv(
@@ -1799,7 +1808,7 @@ def main():
             # REMOVED DUE TO SOME BUG. 
             # ep_return = infos.get("final_return", [None])[idx]
             # IndexError: list index out of range
-            
+
             # # NEW: Per-layout episode tracking
             # for i, final_info in enumerate(infos.get("final_info", [])):
             #     if final_info is not None and i < len(current_layouts):
