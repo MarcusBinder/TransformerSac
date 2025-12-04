@@ -1795,15 +1795,19 @@ def main():
             writer.add_scalar("charts/episodic_return", ep_return, global_step)
             writer.add_scalar("charts/episodic_length", ep_length, global_step)
             writer.add_scalar("charts/episodic_power", ep_power, global_step)
-        
-            # NEW: Per-layout episode tracking
-            for i, final_info in enumerate(infos.get("final_info", [])):
-                if final_info is not None and i < len(current_layouts):
-                    layout_name = current_layouts[i]
-                    ep_ret = final_info.get("episode", {}).get("r", ep_return)
+
+            # REMOVED DUE TO SOME BUG. 
+            # ep_return = infos.get("final_return", [None])[idx]
+            # IndexError: list index out of range
+            
+            # # NEW: Per-layout episode tracking
+            # for i, final_info in enumerate(infos.get("final_info", [])):
+            #     if final_info is not None and i < len(current_layouts):
+            #         layout_name = current_layouts[i]
+            #         ep_ret = final_info.get("episode", {}).get("r", ep_return)
                     
-                    debug_logger.log_layout_episode(layout_name, float(ep_ret))
-                    writer.add_scalar(f"charts/layout/{layout_name}/episodic_return", ep_ret, global_step)
+            #         debug_logger.log_layout_episode(layout_name, float(ep_ret))
+            #         writer.add_scalar(f"charts/layout/{layout_name}/episodic_return", ep_ret, global_step)
 
         # Handle final observations
         real_next_obs = next_obs.copy()
