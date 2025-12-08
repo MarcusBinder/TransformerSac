@@ -62,6 +62,8 @@ class Args:
     wandb_entity: Optional[str] = None
     save_model: bool = True
     save_interval: int = 25000
+    log_image: bool = False  # Log attention images to TensorBoard
+    shuffle_turbs: bool = False  # Shuffle turbine order in obs/action
     
     # === Environment Settings ===
     turbtype: str = "DTU10MW"
@@ -79,6 +81,25 @@ class Args:
     # === Observation Settings ===
     history_length: int = 15
     
+    use_farm_token: bool = False  # Add learnable farm-level token
+    wd_scale_range: float = 90.0  # Wind direction deviation range for scaling (±degrees → [-1,1])
+    # === Transformer Architecture ===
+    embed_dim: int = 128          # Transformer hidden dimension
+    num_heads: int = 4            # Number of attention heads
+    num_layers: int = 2           # Number of transformer layers
+    mlp_ratio: float = 2.0        # FFN hidden dim = embed_dim * mlp_ratio
+    dropout: float = 0.0          # Dropout rate (0 for RL typically)
+    pos_embed_dim: int = 32       # Dimension for positional encoding
+    # === Positional Encoding Settings ===
+    # Options: "absolute_mlp", "relative_mlp", "relative_mlp_shared", 
+    #          "sinusoidal_2d", "rope_2d"
+    pos_encoding_type: str = "absolute_mlp"
+    # For relative encoding: number of hidden units in the bias MLP
+    rel_pos_hidden_dim: int = 64
+    # For relative encoding: whether to use separate bias per head
+    rel_pos_per_head: bool = True
+
+
     # === MLP Architecture ===
     hidden_dim: int = 256
     num_hidden_layers: int = 2
@@ -392,6 +413,9 @@ def get_layout_positions(layout_type: str, wind_turbine) -> Tuple[np.ndarray, np
         "tri2": lambda: generate_right_triangle_grid(turbine=wind_turbine, nx=2, ny=2, xDist=5, yDist=5, orientation='lower_right'),
         "tri3": lambda: generate_right_triangle_grid(turbine=wind_turbine, nx=2, ny=2, xDist=5, yDist=5, orientation='upper_left'),
         "tri4": lambda: generate_right_triangle_grid(turbine=wind_turbine, nx=2, ny=2, xDist=5, yDist=5, orientation='upper_right'),
+        "5turb1": lambda: generate_line_dots_multiple_thetas(X=3, spacing=5, thetas=[0, 30], turbine=wind_turbine),
+        "5turb2": lambda: generate_line_dots_multiple_thetas(X=3, spacing=5, thetas=[0, -30], turbine=wind_turbine),
+        "5turb3": lambda: generate_line_dots_multiple_thetas(X=3, spacing=5, thetas=[-30, 30], turbine=wind_turbine),
     }
     
     if layout_type not in layouts:
@@ -548,6 +572,7 @@ def main():
                 env_factory=env_factory,
                 per_turbine_wrapper=per_turbine_wrapper,
                 seed=seed,
+                shuffle=args.shuffle_turbs, # Shuffle turbines within each layout
             )
             return env
         return _init

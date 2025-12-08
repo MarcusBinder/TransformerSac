@@ -109,7 +109,7 @@ from collections import deque
 # WindGym imports (adjust path as needed for your setup)
 from WindGym import WindFarmEnv
 from WindGym.wrappers import RecordEpisodeVals, PerTurbineObservationWrapper
-from WindGym.utils.generate_layouts import generate_square_grid, generate_cirular_farm, generate_right_triangle_grid
+from WindGym.utils.generate_layouts import generate_square_grid, generate_cirular_farm, generate_right_triangle_grid, generate_line_dots_multiple_thetas
 from collections import deque
 from MultiLayoutEnv import MultiLayoutEnv, LayoutConfig, create_layout_configs
 
@@ -2521,6 +2521,9 @@ def get_layout_positions(layout_type: str, wind_turbine) -> Tuple[np.ndarray, np
         "tri2": lambda: generate_right_triangle_grid(turbine=wind_turbine, nx=2, ny=2, xDist=5, yDist=5, orientation='lower_right'),
         "tri3": lambda: generate_right_triangle_grid(turbine=wind_turbine, nx=2, ny=2, xDist=5, yDist=5, orientation='upper_left'),
         "tri4": lambda: generate_right_triangle_grid(turbine=wind_turbine, nx=2, ny=2, xDist=5, yDist=5, orientation='upper_right'),
+        "5turb1": lambda: generate_line_dots_multiple_thetas(X=3, spacing=5, thetas=[0, 30], turbine=wind_turbine),
+        "5turb2": lambda: generate_line_dots_multiple_thetas(X=3, spacing=5, thetas=[0, -30], turbine=wind_turbine),
+        "5turb3": lambda: generate_line_dots_multiple_thetas(X=3, spacing=5, thetas=[-30, 30], turbine=wind_turbine),
     }
     
     if layout_type not in layouts:
