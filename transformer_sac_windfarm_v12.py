@@ -1,8 +1,11 @@
 """
-Transformer-based SAC for Wind Farm Control - V10
+Transformer-based SAC for Wind Farm Control - V12
 
-- Added utd_ratio
-- Added debug logger
+Changes in V12:
+- Modular positional encoding system with multiple options
+- Added Relative Positional Encoding (RPE) for physics-aware attention
+- Attention bias directly encodes pairwise spatial relationships
+- Scaffold for future encodings (sinusoidal, RoPE)
 
 A clean implementation of transformer-based Soft Actor-Critic for wind farm
 yaw control with the goal of generalizing across different farm layouts.
@@ -14,6 +17,7 @@ Key design principles:
 4. Shared actor/critic heads across turbines (permutation equivariant)
 5. Adaptive target entropy based on actual turbine count (not max)
 6. Optional farm-level token for global context
+7. NEW: Modular positional encoding with absolute and relative options
 
 Author: Marcus (DTU Wind Energy)
 Based on discussions about transformer architectures for wind farm control.
@@ -22,7 +26,7 @@ Based on discussions about transformer architectures for wind farm control.
 TODO LIST - ACTIVE DEVELOPMENT
 ================================================================================
 
-PHASE 1: CORE IMPLEMENTATION (CURRENT)
+PHASE 1: CORE IMPLEMENTATION (COMPLETE)
 [x] Basic transformer architecture (Actor, Critic)
 [x] Wind-relative positional encoding
 [x] Wind direction deviation calculation
@@ -33,44 +37,49 @@ PHASE 1: CORE IMPLEMENTATION (CURRENT)
 [x] Training loop with proper logging
 [x] Test on single layout (test_layout: 2x1 grid)
 [x] Verify learning signal (reward increasing)
-[ ] Debug attention patterns
 [x] Verify wind direction index detection in EnhancedPerTurbineWrapper
 
-POSITIONAL ENCODING NOTES:
-- The current positional encoding uses a small MLP on (x, y) coordinates.
-Alternatives could be:
-- Sinusoidal encoding of (x, y)
-- Polar coordinates (r, theta) instead of Cartesian
-- Relative positional encoding based on pairwise distances. 
-rel_pos[i,j] = position[j] - position[i]  
-- Rotary Position Embeddings (RoPE) 
+PHASE 2: POSITIONAL ENCODING IMPROVEMENTS (CURRENT - V12)
+[x] Modular positional encoding system with type selection
+[x] Absolute MLP encoding (original, kept as default)
+[x] Relative Positional Encoding (RPE) with attention bias
+[x] Sinusoidal 2D encoding
+[x] Wind-relative RoPE (Rotary Position Embeddings)
+[x] Polar coordinate encoding (r, theta from wind)
+[x] ALiBi and directional ALiBi
+[ ] Attention pattern analysis: verify encodings show wake physics
 
-PHASE 2: VALIDATION & DEBUGGING
+POSITIONAL ENCODING OPTIONS (--pos_encoding_type):
+- "absolute_mlp": (DEFAULT) MLP on absolute (x,y) → add to token embedding
+- "sinusoidal_2d": Multi-frequency sin/cos encoding of 2D coordinates
+- "polar_mlp": MLP on polar (r, θ) coordinates
+- "relative_mlp": MLP on pairwise relative positions → attention bias (per-head)
+- "relative_mlp_shared": Same as relative_mlp but heads share bias
+- "relative_polar": MLP on pairwise polar (Δr, Δθ) → attention bias
+- "alibi": Linear distance penalty (no learned params)
+- "alibi_directional": ALiBi with upwind/downwind asymmetry (learned slopes)
+- "absolute_plus_relative": Both absolute embedding AND relative bias
+- "rope_2d": 2D Rotary Position Embeddings (modifies Q,K directly)
+
+PHASE 3: VALIDATION & DEBUGGING
 [ ] Attention visualization during evaluation
 [x] Compare with baseline (greedy yaw controller)
 [ ] Verify wind-relative encoding is working (test with different wind dirs)
 [ ] Check that model attends to upwind turbines (physics validation)
 [ ] Hyperparameter tuning (embed_dim, num_layers, learning rates)
-[ ] We could 'split' farms into smaller sub-farms to augment data. We could treat the 2x2 farm as 2 separate 2x1 farms during training.
+[ ] We could 'split' farms into smaller sub-farms to augment data.
 
-PHASE 3: MULTI-LAYOUT GENERALIZATION
+PHASE 4: MULTI-LAYOUT GENERALIZATION
 [ ] Train on multiple layouts simultaneously
 [ ] Test zero-shot transfer to unseen layouts
 [ ] Analyze attention patterns across different farm sizes
 [ ] Compare generalization vs. layout-specific training
 
-PHASE 4: TEMPORAL EXTENSIONS (OPTION B)
+PHASE 5: TEMPORAL EXTENSIONS (OPTION B)
 [ ] Design spatio-temporal attention mechanism
 [ ] Implement SpatioTemporalTransformer class
 [ ] Add temporal attention masking (causal)
-[ ] Compare Option A (stacked history) vs Option B (temporal attention)
 [ ] Consider GTrXL for very long-range dependencies
-
-PHASE 5: ADVANCED FEATURES
-[ ] Polar coordinate positional encoding
-[ ] Rotary Position Embeddings (RoPE) for wind-relative encoding
-[ ] Hybrid GNN-Transformer architecture
-[ ] Physics-informed attention biases (wake cone priors)
 
 KNOWN ISSUES / NOTES:
 - History length of 15 may need tuning based on wake propagation time
@@ -156,6 +165,15 @@ class Args:
     mlp_ratio: float = 2.0        # FFN hidden dim = embed_dim * mlp_ratio
     dropout: float = 0.0          # Dropout rate (0 for RL typically)
     pos_embed_dim: int = 32       # Dimension for positional encoding
+    
+    # === Positional Encoding Settings ===
+    # Options: "absolute_mlp", "relative_mlp", "relative_mlp_shared", 
+    #          "sinusoidal_2d", "rope_2d"
+    pos_encoding_type: str = "absolute_mlp"
+    # For relative encoding: number of hidden units in the bias MLP
+    rel_pos_hidden_dim: int = 64
+    # For relative encoding: whether to use separate bias per head
+    rel_pos_per_head: bool = True
     
     # === SAC Hyperparameters ===
     utd_ratio: float = 1.0           # Update-to-data ratio
@@ -380,13 +398,34 @@ class EnhancedPerTurbineWrapper(gym.Wrapper):
 # POSITIONAL ENCODING
 # =============================================================================
 
-class PositionalEncoding(nn.Module):
+# Type alias for encoding type
+VALID_POS_ENCODING_TYPES = [
+    # === Additive (added to token embeddings) ===
+    "absolute_mlp",         # Original: MLP on (x,y) → add to token
+    "sinusoidal_2d",        # NeRF-style multi-frequency encoding
+    "polar_mlp",            # MLP on (r, θ) polar coordinates
+    
+    # === Attention Bias (added to attention logits) ===
+    "relative_mlp",         # MLP on pairwise rel pos → attention bias (per-head)
+    "relative_mlp_shared",  # MLP on pairwise rel pos → attention bias (shared)
+    "relative_polar",       # MLP on pairwise (Δr, Δθ) → attention bias
+    "alibi",                # Linear distance penalty (no learned params)
+    "alibi_directional",    # ALiBi with upwind/downwind asymmetry
+    
+    # === Rotary (modifies Q and K directly) ===
+    "rope_2d",              # 2D Rotary Position Embeddings
+    
+    # === Combined ===
+    "absolute_plus_relative",  # Both absolute embedding AND relative bias
+]
+
+
+class AbsolutePositionalEncoding(nn.Module):
     """
-    Learned positional encoding for turbine (x, y) coordinates.
+    Original absolute positional encoding for turbine (x, y) coordinates.
     
     Transforms 2D positions into a higher-dimensional embedding space
-    using a small MLP. This allows the model to learn complex spatial
-    relationships beyond what raw coordinates provide.
+    using a small MLP. This is ADDED to the token embedding.
     
     Input positions should be:
     1. Normalized by rotor diameter (physics-meaningful scale)
@@ -400,6 +439,7 @@ class PositionalEncoding(nn.Module):
             embed_dim: Output embedding dimension
         """
         super().__init__()
+        self.embed_dim = embed_dim
         self.encoder = nn.Sequential(
             nn.Linear(pos_dim, embed_dim),
             nn.ReLU(),
@@ -415,6 +455,840 @@ class PositionalEncoding(nn.Module):
             Position embeddings: (batch, n_turbines, embed_dim)
         """
         return self.encoder(positions)
+
+
+class RelativePositionalBias(nn.Module):
+    """
+    Relative positional bias for attention.
+    
+    Computes a learned bias for each pair of positions based on their
+    relative displacement. This bias is ADDED to attention logits.
+    
+    Physics intuition:
+    - rel_pos[i,j] = pos[j] - pos[i] tells us "j is X upwind, Y lateral from i"
+    - The learned bias can encode "pay more attention to upwind turbines"
+    - Translation invariant: same relative geometry → same bias
+    
+    For wind farm control:
+    - Positive x in wind-relative coords = upwind
+    - The model can learn that upwind turbines are important (wake sources)
+    """
+    
+    def __init__(
+        self, 
+        num_heads: int,
+        hidden_dim: int = 64,
+        per_head: bool = True,
+        pos_dim: int = 2
+    ):
+        """
+        Args:
+            num_heads: Number of attention heads
+            hidden_dim: Hidden dimension of bias MLP
+            per_head: If True, each head gets its own bias. If False, shared.
+            pos_dim: Dimension of position vectors (2 for x, y)
+        """
+        super().__init__()
+        self.num_heads = num_heads
+        self.per_head = per_head
+        
+        output_dim = num_heads if per_head else 1
+        
+        # MLP: relative_position (2D) → bias value(s)
+        self.bias_mlp = nn.Sequential(
+            nn.Linear(pos_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+    
+    def forward(
+        self, 
+        positions: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Compute relative position bias matrix.
+        
+        Args:
+            positions: (batch, n_tokens, 2) wind-relative positions
+            key_padding_mask: (batch, n_tokens) where True = padding
+        
+        Returns:
+            bias: (batch, num_heads, n_tokens, n_tokens) attention bias
+                  Add this to attention logits before softmax.
+        """
+        batch_size, n_tokens, _ = positions.shape
+        
+        # Compute pairwise relative positions
+        # pos_i: (batch, n, 1, 2), pos_j: (batch, 1, n, 2)
+        pos_i = positions.unsqueeze(2)  # (batch, n, 1, 2)
+        pos_j = positions.unsqueeze(1)  # (batch, 1, n, 2)
+        
+        # rel_pos[i,j] = pos[j] - pos[i]: "displacement from i to j"
+        # If j is upwind of i (positive x), rel_pos has positive x component
+        rel_pos = pos_j - pos_i  # (batch, n, n, 2)
+        
+        # Reshape for MLP: (batch * n * n, 2)
+        rel_pos_flat = rel_pos.reshape(-1, 2)
+        
+        # Compute bias values
+        bias_flat = self.bias_mlp(rel_pos_flat)  # (batch*n*n, num_heads or 1)
+        
+        # Reshape back
+        if self.per_head:
+            bias = bias_flat.reshape(batch_size, n_tokens, n_tokens, self.num_heads)
+            bias = bias.permute(0, 3, 1, 2)  # (batch, num_heads, n, n)
+        else:
+            bias = bias_flat.reshape(batch_size, n_tokens, n_tokens, 1)
+            bias = bias.permute(0, 3, 1, 2)  # (batch, 1, n, n)
+            bias = bias.expand(-1, self.num_heads, -1, -1)  # (batch, num_heads, n, n)
+        
+        # Apply masking: set bias to large negative for padded positions
+        if key_padding_mask is not None:
+            # Expand mask: (batch, n) → (batch, 1, 1, n) for keys
+            # and (batch, 1, n, 1) for queries
+            mask_k = key_padding_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, n)
+            mask_q = key_padding_mask.unsqueeze(1).unsqueeze(3)  # (batch, 1, n, 1)
+            
+            # Zero out bias for padded positions (they'll be masked in attention anyway)
+            # This prevents any gradient flow through padded positions
+            combined_mask = mask_k | mask_q  # (batch, 1, n, n)
+            bias = bias.masked_fill(combined_mask, 0.0)
+        
+        return bias
+
+
+class Sinusoidal2DPositionalEncoding(nn.Module):
+    """
+    Sinusoidal positional encoding extended to 2D coordinates.
+    
+    Uses multiple frequencies for both x and y dimensions, similar to
+    NeRF-style positional encoding. This captures both coarse and fine
+    spatial structure without learning the frequency bands.
+    
+    A final linear layer projects to the desired output dimension.
+    """
+    
+    def __init__(self, embed_dim: int = 32, num_frequencies: int = 8, max_freq_log2: int = 6):
+        """
+        Args:
+            embed_dim: Output embedding dimension
+            num_frequencies: Number of frequency bands
+            max_freq_log2: Log2 of maximum frequency (default: 2^6 = 64 cycles per unit)
+        """
+        super().__init__()
+        self.num_frequencies = num_frequencies
+        self.raw_dim = 4 * num_frequencies  # sin/cos for x and y
+        self.embed_dim = embed_dim
+        
+        # Frequency bands: 2^0, 2^1, ..., 2^(max_freq_log2)
+        freq_bands = 2.0 ** torch.linspace(0, max_freq_log2, num_frequencies)
+        self.register_buffer("freq_bands", freq_bands)
+        
+        # Project to desired dimension
+        self.proj = nn.Linear(self.raw_dim, embed_dim)
+    
+    def forward(self, positions: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            positions: (batch, n_turbines, 2) normalized coordinates
+        
+        Returns:
+            Sinusoidal embeddings: (batch, n_turbines, embed_dim)
+        """
+        # positions: (batch, n, 2)
+        x = positions[..., 0:1]  # (batch, n, 1)
+        y = positions[..., 1:2]  # (batch, n, 1)
+        
+        # Multiply by frequencies: (batch, n, num_freq)
+        x_freq = x * self.freq_bands * math.pi
+        y_freq = y * self.freq_bands * math.pi
+        
+        # Compute sin and cos
+        raw_embeddings = torch.cat([
+            torch.sin(x_freq),
+            torch.cos(x_freq),
+            torch.sin(y_freq),
+            torch.cos(y_freq),
+        ], dim=-1)
+        
+        return self.proj(raw_embeddings)
+
+
+class PolarPositionalEncoding(nn.Module):
+    """
+    Positional encoding using polar coordinates (r, θ).
+    
+    In wind-relative coordinates (wind from 270°):
+    - θ = 0° means directly upwind
+    - θ = 180° means directly downwind
+    - r = distance from farm centroid
+    
+    This naturally aligns with wake physics where effects depend on
+    both distance and angle relative to wind.
+    """
+    
+    def __init__(self, embed_dim: int = 32):
+        """
+        Args:
+            embed_dim: Output embedding dimension
+        """
+        super().__init__()
+        self.embed_dim = embed_dim
+        
+        # MLP on (r, θ, sin(θ), cos(θ)) for better angle representation
+        self.encoder = nn.Sequential(
+            nn.Linear(4, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+    
+    def forward(self, positions: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            positions: (batch, n_turbines, 2) wind-relative Cartesian coordinates
+        
+        Returns:
+            Polar embeddings: (batch, n_turbines, embed_dim)
+        """
+        x = positions[..., 0]
+        y = positions[..., 1]
+        
+        # Convert to polar
+        r = torch.sqrt(x**2 + y**2 + 1e-8)
+        theta = torch.atan2(y, x)  # Angle from positive x-axis (upwind direction)
+        
+        # Create input features: (r, θ, sin(θ), cos(θ))
+        polar_features = torch.stack([
+            r,
+            theta,
+            torch.sin(theta),
+            torch.cos(theta),
+        ], dim=-1)
+        
+        return self.encoder(polar_features)
+
+
+class RelativePolarBias(nn.Module):
+    """
+    Relative positional bias using polar coordinates.
+    
+    For each pair (i, j), computes:
+    - Δr = distance from i to j
+    - θ_ij = angle from i to j relative to wind direction
+    
+    The bias MLP learns how attention should depend on:
+    - How far apart turbines are
+    - Whether j is upwind/downwind/lateral from i
+    """
+    
+    def __init__(
+        self,
+        num_heads: int,
+        hidden_dim: int = 64,
+        per_head: bool = True,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.per_head = per_head
+        
+        output_dim = num_heads if per_head else 1
+        
+        # Input: (Δr, θ, sin(θ), cos(θ))
+        self.bias_mlp = nn.Sequential(
+            nn.Linear(4, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+    
+    def forward(
+        self,
+        positions: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Args:
+            positions: (batch, n_tokens, 2) wind-relative positions
+            key_padding_mask: (batch, n_tokens) where True = padding
+        
+        Returns:
+            bias: (batch, num_heads, n_tokens, n_tokens)
+        """
+        batch_size, n_tokens, _ = positions.shape
+        
+        # Compute pairwise relative positions
+        pos_i = positions.unsqueeze(2)  # (batch, n, 1, 2)
+        pos_j = positions.unsqueeze(1)  # (batch, 1, n, 2)
+        rel_pos = pos_j - pos_i  # (batch, n, n, 2)
+        
+        # Convert to polar
+        dx = rel_pos[..., 0]
+        dy = rel_pos[..., 1]
+        
+        r = torch.sqrt(dx**2 + dy**2 + 1e-8)
+        theta = torch.atan2(dy, dx)
+        
+        # Stack polar features
+        polar_features = torch.stack([
+            r,
+            theta,
+            torch.sin(theta),
+            torch.cos(theta),
+        ], dim=-1)  # (batch, n, n, 4)
+        
+        # Apply MLP
+        polar_flat = polar_features.reshape(-1, 4)
+        bias_flat = self.bias_mlp(polar_flat)
+        
+        if self.per_head:
+            bias = bias_flat.reshape(batch_size, n_tokens, n_tokens, self.num_heads)
+            bias = bias.permute(0, 3, 1, 2)
+        else:
+            bias = bias_flat.reshape(batch_size, n_tokens, n_tokens, 1)
+            bias = bias.permute(0, 3, 1, 2)
+            bias = bias.expand(-1, self.num_heads, -1, -1)
+        
+        if key_padding_mask is not None:
+            mask_k = key_padding_mask.unsqueeze(1).unsqueeze(2)
+            mask_q = key_padding_mask.unsqueeze(1).unsqueeze(3)
+            combined_mask = mask_k | mask_q
+            bias = bias.masked_fill(combined_mask, 0.0)
+        
+        return bias
+
+
+class ALiBiPositionalBias(nn.Module):
+    """
+    Attention with Linear Biases (ALiBi) for 2D spatial positions.
+    
+    Simple linear penalty based on distance:
+        bias[i,j] = -slope * distance(i, j)
+    
+    No learned parameters! Just an inductive bias that nearby turbines
+    should attend more to each other.
+    
+    Each attention head gets a different slope (geometric sequence),
+    allowing different heads to focus on different distance scales.
+    
+    Reference: Press et al., "Train Short, Test Long" (2022)
+    """
+    
+    def __init__(self, num_heads: int, max_distance: float = 20.0):
+        """
+        Args:
+            num_heads: Number of attention heads
+            max_distance: Expected maximum distance (in rotor diameters) for slope scaling
+        """
+        super().__init__()
+        self.num_heads = num_heads
+        
+        # Geometric sequence of slopes (like original ALiBi)
+        # Slopes: 2^(-8/n), 2^(-8*2/n), ..., 2^(-8)
+        slopes = torch.tensor([
+            2 ** (-8 * (i + 1) / num_heads) for i in range(num_heads)
+        ])
+        self.register_buffer("slopes", slopes.view(1, num_heads, 1, 1))
+    
+    def forward(
+        self,
+        positions: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Args:
+            positions: (batch, n_tokens, 2) normalized positions
+            key_padding_mask: (batch, n_tokens) where True = padding
+        
+        Returns:
+            bias: (batch, num_heads, n_tokens, n_tokens)
+        """
+        batch_size, n_tokens, _ = positions.shape
+        
+        # Compute pairwise distances
+        pos_i = positions.unsqueeze(2)
+        pos_j = positions.unsqueeze(1)
+        diff = pos_j - pos_i
+        distances = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-8)  # (batch, n, n)
+        
+        # Apply linear penalty with per-head slopes
+        distances = distances.unsqueeze(1)  # (batch, 1, n, n)
+        bias = -self.slopes * distances  # (batch, num_heads, n, n)
+        
+        if key_padding_mask is not None:
+            mask_k = key_padding_mask.unsqueeze(1).unsqueeze(2)
+            mask_q = key_padding_mask.unsqueeze(1).unsqueeze(3)
+            combined_mask = mask_k | mask_q
+            bias = bias.masked_fill(combined_mask, 0.0)
+        
+        return bias
+
+
+class DirectionalALiBiPositionalBias(nn.Module):
+    """
+    Directional ALiBi: Different slopes for upwind vs downwind.
+    
+    In wind-relative coordinates (wind from negative x):
+    - Upwind (positive x direction): Use upwind_slope
+    - Downwind (negative x direction): Use downwind_slope
+    
+    This encodes the physical asymmetry: upwind turbines affect
+    downwind ones, but not vice versa.
+    
+    Learned slopes allow the model to discover the right asymmetry.
+    """
+    
+    def __init__(self, num_heads: int):
+        """
+        Args:
+            num_heads: Number of attention heads
+        """
+        super().__init__()
+        self.num_heads = num_heads
+        
+        # Learnable slopes for upwind and downwind (per head)
+        # Initialize with ALiBi-style geometric sequence
+        init_slopes = torch.tensor([
+            2 ** (-8 * (i + 1) / num_heads) for i in range(num_heads)
+        ])
+        
+        self.upwind_slopes = nn.Parameter(init_slopes.clone())
+        self.downwind_slopes = nn.Parameter(init_slopes.clone() * 0.5)  # Less penalty downwind
+        self.lateral_slopes = nn.Parameter(init_slopes.clone() * 0.3)  # Even less for lateral
+    
+    def forward(
+        self,
+        positions: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Args:
+            positions: (batch, n_tokens, 2) wind-relative positions
+            key_padding_mask: (batch, n_tokens) where True = padding
+        
+        Returns:
+            bias: (batch, num_heads, n_tokens, n_tokens)
+        """
+        batch_size, n_tokens, _ = positions.shape
+        
+        # Compute pairwise relative positions
+        pos_i = positions.unsqueeze(2)
+        pos_j = positions.unsqueeze(1)
+        rel_pos = pos_j - pos_i  # (batch, n, n, 2)
+        
+        dx = rel_pos[..., 0]  # Positive = j is upwind of i
+        dy = rel_pos[..., 1]
+        
+        # Distances
+        dist = torch.sqrt(dx**2 + dy**2 + 1e-8)
+        
+        # Classify direction: upwind (dx > 0), downwind (dx < 0), lateral (|dy| > |dx|)
+        is_upwind = dx > torch.abs(dy)      # Predominantly upwind
+        is_downwind = dx < -torch.abs(dy)   # Predominantly downwind
+        is_lateral = ~is_upwind & ~is_downwind  # Lateral
+        
+        # Apply different slopes based on direction
+        slopes_upwind = self.upwind_slopes.view(1, self.num_heads, 1, 1)
+        slopes_downwind = self.downwind_slopes.view(1, self.num_heads, 1, 1)
+        slopes_lateral = self.lateral_slopes.view(1, self.num_heads, 1, 1)
+        
+        dist = dist.unsqueeze(1)  # (batch, 1, n, n)
+        is_upwind = is_upwind.unsqueeze(1).float()
+        is_downwind = is_downwind.unsqueeze(1).float()
+        is_lateral = is_lateral.unsqueeze(1).float()
+        
+        # Weighted combination of slopes
+        bias = -(
+            slopes_upwind * dist * is_upwind +
+            slopes_downwind * dist * is_downwind +
+            slopes_lateral * dist * is_lateral
+        )
+        
+        if key_padding_mask is not None:
+            mask_k = key_padding_mask.unsqueeze(1).unsqueeze(2)
+            mask_q = key_padding_mask.unsqueeze(1).unsqueeze(3)
+            combined_mask = mask_k | mask_q
+            bias = bias.masked_fill(combined_mask, 0.0)
+        
+        return bias
+
+
+class RoPE2DPositionalEncoding(nn.Module):
+    """
+    2D Rotary Position Embeddings for wind farm coordinates.
+    
+    RoPE encodes position by rotating query and key vectors. When Q·K is
+    computed, the rotation angles subtract, naturally encoding relative position.
+    
+    For 2D positions, we split the head dimension into two halves:
+    - First half: rotated by angle proportional to x-position
+    - Second half: rotated by angle proportional to y-position
+    
+    This is applied INSIDE the attention mechanism by transforming Q and K
+    before the dot product.
+    
+    Key properties:
+    - Relative position encoded in dot product (no explicit bias)
+    - Decays with distance (like a soft locality bias)
+    - No learned parameters for position encoding itself
+    
+    Reference: Su et al., "RoFormer: Enhanced Transformer with Rotary Position Embedding"
+    Extended to 2D following approaches from vision transformers.
+    """
+    
+    def __init__(
+        self, 
+        head_dim: int,
+        max_position: float = 50.0,
+        base: float = 10000.0,
+    ):
+        """
+        Args:
+            head_dim: Dimension per attention head (must be divisible by 4)
+            max_position: Maximum expected position value (in rotor diameters)
+            base: Base for frequency computation (like in standard RoPE)
+        """
+        super().__init__()
+        
+        if head_dim % 4 != 0:
+            raise ValueError(f"head_dim must be divisible by 4 for 2D RoPE, got {head_dim}")
+        
+        self.head_dim = head_dim
+        self.max_position = max_position
+        
+        # Each spatial dimension gets half the head_dim
+        # Within each half, we have pairs for rotation (so divide by 2 again)
+        dim_per_axis = head_dim // 2
+        
+        # Frequency bands for rotation (standard RoPE frequencies)
+        # Lower frequencies = longer range interactions
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim_per_axis, 2).float() / dim_per_axis))
+        self.register_buffer("inv_freq", inv_freq)
+    
+    def _compute_rotation_angles(self, positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute rotation angles for x and y positions.
+        
+        Args:
+            positions: (batch, n_tokens, 2) normalized positions
+        
+        Returns:
+            angles_x, angles_y: (batch, n_tokens, dim_per_axis/2) rotation angles
+        """
+        x = positions[..., 0]  # (batch, n)
+        y = positions[..., 1]  # (batch, n)
+        
+        # Scale positions to reasonable angle range
+        x_scaled = x / self.max_position * math.pi
+        y_scaled = y / self.max_position * math.pi
+        
+        # Compute angles: position * frequency for each frequency band
+        # (batch, n, 1) * (dim/4,) -> (batch, n, dim/4)
+        angles_x = x_scaled.unsqueeze(-1) * self.inv_freq
+        angles_y = y_scaled.unsqueeze(-1) * self.inv_freq
+        
+        return angles_x, angles_y
+    
+    def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
+        """Rotate half the hidden dims of x."""
+        x1 = x[..., ::2]   # Even indices
+        x2 = x[..., 1::2]  # Odd indices
+        return torch.stack((-x2, x1), dim=-1).flatten(-2)
+    
+    def apply_rotary_emb(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply 2D rotary embeddings to query and key tensors.
+        
+        Args:
+            q: (batch, n_heads, n_tokens, head_dim) query tensor
+            k: (batch, n_heads, n_tokens, head_dim) key tensor
+            positions: (batch, n_tokens, 2) wind-relative positions
+        
+        Returns:
+            q_rot, k_rot: Rotated query and key tensors, same shape as input
+        """
+        batch, n_heads, n_tokens, head_dim = q.shape
+        half_dim = head_dim // 2
+        
+        # Split into x and y portions
+        q_x, q_y = q[..., :half_dim], q[..., half_dim:]
+        k_x, k_y = k[..., :half_dim], k[..., half_dim:]
+        
+        # Compute rotation angles
+        angles_x, angles_y = self._compute_rotation_angles(positions)
+        
+        # Expand angles for all heads: (batch, n, dim/4) -> (batch, 1, n, dim/4)
+        angles_x = angles_x.unsqueeze(1)
+        angles_y = angles_y.unsqueeze(1)
+        
+        # Duplicate angles for sin/cos pairs: (batch, 1, n, dim/4) -> (batch, 1, n, dim/2)
+        cos_x = torch.cos(angles_x).repeat(1, 1, 1, 2)
+        sin_x = torch.sin(angles_x).repeat(1, 1, 1, 2)
+        cos_y = torch.cos(angles_y).repeat(1, 1, 1, 2)
+        sin_y = torch.sin(angles_y).repeat(1, 1, 1, 2)
+        
+        # Apply rotation: x' = x*cos - rotate(x)*sin
+        q_x_rot = q_x * cos_x + self._rotate_half(q_x) * sin_x
+        k_x_rot = k_x * cos_x + self._rotate_half(k_x) * sin_x
+        q_y_rot = q_y * cos_y + self._rotate_half(q_y) * sin_y
+        k_y_rot = k_y * cos_y + self._rotate_half(k_y) * sin_y
+        
+        # Concatenate back
+        q_rot = torch.cat([q_x_rot, q_y_rot], dim=-1)
+        k_rot = torch.cat([k_x_rot, k_y_rot], dim=-1)
+        
+        return q_rot, k_rot
+
+
+class RoPEMultiheadAttention(nn.Module):
+    """
+    Multi-head attention with 2D Rotary Position Embeddings.
+    
+    This replaces nn.MultiheadAttention when using RoPE, because RoPE
+    needs to be applied to Q and K before the attention computation.
+    """
+    
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        max_position: float = 50.0,
+    ):
+        super().__init__()
+        
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+        assert self.head_dim % 4 == 0, f"head_dim ({self.head_dim}) must be divisible by 4 for 2D RoPE"
+        
+        # Q, K, V projections
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        
+        self.dropout = nn.Dropout(dropout)
+        
+        # RoPE module
+        self.rope = RoPE2DPositionalEncoding(
+            head_dim=self.head_dim,
+            max_position=max_position,
+        )
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: (batch, n_tokens, embed_dim) input tensor
+            positions: (batch, n_tokens, 2) wind-relative positions
+            key_padding_mask: (batch, n_tokens) where True = padding
+            attn_mask: Optional additional attention mask
+        
+        Returns:
+            output: (batch, n_tokens, embed_dim)
+            attn_weights: (batch, n_heads, n_tokens, n_tokens)
+        """
+        batch, n_tokens, _ = x.shape
+        
+        # Project to Q, K, V
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        
+        # Reshape to (batch, n_heads, n_tokens, head_dim)
+        q = q.view(batch, n_tokens, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch, n_tokens, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch, n_tokens, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Apply RoPE to Q and K
+        q, k = self.rope.apply_rotary_emb(q, k, positions)
+        
+        # Compute attention scores
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        
+        # Apply masks
+        if attn_mask is not None:
+            attn_scores = attn_scores + attn_mask
+        
+        if key_padding_mask is not None:
+            # (batch, n_tokens) -> (batch, 1, 1, n_tokens)
+            mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+            attn_scores = attn_scores.masked_fill(mask, float('-inf'))
+        
+        # Softmax and dropout
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        
+        # Apply attention to values
+        output = torch.matmul(attn_weights, v)
+        
+        # Reshape back: (batch, n_heads, n_tokens, head_dim) -> (batch, n_tokens, embed_dim)
+        output = output.transpose(1, 2).contiguous().view(batch, n_tokens, self.embed_dim)
+        output = self.out_proj(output)
+        
+        return output, attn_weights
+
+
+def create_positional_encoding(
+    encoding_type: str,
+    embed_dim: int,
+    pos_embed_dim: int,
+    num_heads: int,
+    rel_pos_hidden_dim: int = 64,
+    rel_pos_per_head: bool = True,
+) -> Tuple[Optional[nn.Module], Optional[nn.Module], bool, bool]:
+    """
+    Factory function to create positional encoding modules.
+    
+    Args:
+        encoding_type: One of VALID_POS_ENCODING_TYPES
+        embed_dim: Main transformer embedding dimension
+        pos_embed_dim: Dimension for absolute position embedding
+        num_heads: Number of attention heads (for relative bias)
+        rel_pos_hidden_dim: Hidden dim for relative position MLP
+        rel_pos_per_head: Whether relative bias is per-head
+    
+    Returns:
+        (pos_encoder, rel_pos_bias, uses_additive_embedding, uses_rope)
+        - pos_encoder: Module for absolute position embedding (or None)
+        - rel_pos_bias: Module for relative position bias (or None)
+        - uses_additive_embedding: Whether pos embedding is added to tokens
+        - uses_rope: Whether to use RoPE transformer (requires different encoder)
+    """
+    if encoding_type not in VALID_POS_ENCODING_TYPES:
+        raise ValueError(
+            f"Unknown pos_encoding_type: {encoding_type}. "
+            f"Valid options: {VALID_POS_ENCODING_TYPES}"
+        )
+    
+    uses_rope = False  # Default
+    
+    # =========================================================================
+    # Additive Encodings (added to token embeddings)
+    # =========================================================================
+    
+    if encoding_type == "absolute_mlp":
+        # Original approach: MLP embedding added to tokens
+        pos_encoder = AbsolutePositionalEncoding(pos_dim=2, embed_dim=pos_embed_dim)
+        rel_pos_bias = None
+        uses_additive_embedding = True
+        
+    elif encoding_type == "sinusoidal_2d":
+        # Sinusoidal 2D encoding (frequency bands are fixed, projection is learned)
+        pos_encoder = Sinusoidal2DPositionalEncoding(
+            embed_dim=pos_embed_dim,
+            num_frequencies=8,  # 8 frequency bands
+            max_freq_log2=6,    # Max frequency 2^6 = 64
+        )
+        rel_pos_bias = None
+        uses_additive_embedding = True
+        
+    elif encoding_type == "polar_mlp":
+        # Polar coordinate encoding
+        pos_encoder = PolarPositionalEncoding(embed_dim=pos_embed_dim)
+        rel_pos_bias = None
+        uses_additive_embedding = True
+    
+    # =========================================================================
+    # Attention Bias Encodings (added to attention logits)
+    # =========================================================================
+    
+    elif encoding_type == "relative_mlp":
+        # Relative position bias added to attention (per-head)
+        pos_encoder = None
+        rel_pos_bias = RelativePositionalBias(
+            num_heads=num_heads,
+            hidden_dim=rel_pos_hidden_dim,
+            per_head=True,
+            pos_dim=2
+        )
+        uses_additive_embedding = False
+        
+    elif encoding_type == "relative_mlp_shared":
+        # Relative position bias (shared across heads)
+        pos_encoder = None
+        rel_pos_bias = RelativePositionalBias(
+            num_heads=num_heads,
+            hidden_dim=rel_pos_hidden_dim,
+            per_head=False,
+            pos_dim=2
+        )
+        uses_additive_embedding = False
+        
+    elif encoding_type == "relative_polar":
+        # Relative position bias using polar coordinates
+        pos_encoder = None
+        rel_pos_bias = RelativePolarBias(
+            num_heads=num_heads,
+            hidden_dim=rel_pos_hidden_dim,
+            per_head=rel_pos_per_head,
+        )
+        uses_additive_embedding = False
+        
+    elif encoding_type == "alibi":
+        # ALiBi: Simple linear distance penalty (no learned params)
+        pos_encoder = None
+        rel_pos_bias = ALiBiPositionalBias(num_heads=num_heads)
+        uses_additive_embedding = False
+        
+    elif encoding_type == "alibi_directional":
+        # Directional ALiBi with upwind/downwind asymmetry
+        pos_encoder = None
+        rel_pos_bias = DirectionalALiBiPositionalBias(num_heads=num_heads)
+        uses_additive_embedding = False
+    
+    # =========================================================================
+    # Rotary Position Embeddings (modifies Q and K)
+    # =========================================================================
+    
+    elif encoding_type == "rope_2d":
+        # RoPE: Rotary embeddings applied inside attention
+        # No separate encoder or bias - handled by RoPETransformerEncoder
+        pos_encoder = None
+        rel_pos_bias = None
+        uses_additive_embedding = False
+        uses_rope = True
+    
+    # =========================================================================
+    # Combined Encodings
+    # =========================================================================
+    
+    elif encoding_type == "absolute_plus_relative":
+        # Both absolute embedding AND relative bias
+        pos_encoder = AbsolutePositionalEncoding(pos_dim=2, embed_dim=pos_embed_dim)
+        rel_pos_bias = RelativePositionalBias(
+            num_heads=num_heads,
+            hidden_dim=rel_pos_hidden_dim,
+            per_head=rel_pos_per_head,
+            pos_dim=2
+        )
+        uses_additive_embedding = True
+    
+    else:
+        raise ValueError(f"Encoding type '{encoding_type}' not implemented yet.")
+    
+    return pos_encoder, rel_pos_bias, uses_additive_embedding, uses_rope
+
+
+# Backward compatibility alias
+PositionalEncoding = AbsolutePositionalEncoding
 
 
 def transform_to_wind_relative(
@@ -476,6 +1350,8 @@ class TransformerEncoderLayer(nn.Module):
     Architecture:
         x -> LayerNorm -> MultiheadAttention -> + -> LayerNorm -> FFN -> +
              (skip connection)                      (skip connection)
+    
+    Supports optional attention bias for relative positional encoding.
     """
     
     def __init__(
@@ -514,12 +1390,15 @@ class TransformerEncoderLayer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        key_padding_mask: Optional[torch.Tensor] = None
+        key_padding_mask: Optional[torch.Tensor] = None,
+        attn_bias: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             x: (batch, n_tokens, embed_dim)
             key_padding_mask: (batch, n_tokens) where True = ignore this position
+            attn_bias: (batch, n_heads, n_tokens, n_tokens) optional bias to add
+                       to attention logits (for relative positional encoding)
         
         Returns:
             x: Transformed tensor, same shape as input
@@ -527,9 +1406,21 @@ class TransformerEncoderLayer(nn.Module):
         """
         # Self-attention with pre-norm
         x_norm = self.norm1(x)
+        
+        # If we have attention bias, we need to use it as attn_mask
+        # PyTorch's MultiheadAttention adds attn_mask to attention logits
+        if attn_bias is not None:
+            # attn_mask in PyTorch MHA: (batch * num_heads, tgt_len, src_len) or (tgt_len, src_len)
+            # We need to reshape our bias: (batch, num_heads, n, n) → (batch * num_heads, n, n)
+            batch_size, num_heads, n, _ = attn_bias.shape
+            attn_mask = attn_bias.reshape(batch_size * num_heads, n, n)
+        else:
+            attn_mask = None
+        
         attn_out, attn_weights = self.attn(
             x_norm, x_norm, x_norm,
             key_padding_mask=key_padding_mask,
+            attn_mask=attn_mask,
             average_attn_weights=False  # Return per-head weights
         )
         x = x + attn_out
@@ -546,6 +1437,9 @@ class TransformerEncoder(nn.Module):
     
     Processes per-turbine tokens and allows each turbine to attend to
     all other turbines, learning spatial wake interaction patterns.
+    
+    Supports optional attention bias for relative positional encoding.
+    The same bias is applied to all layers (position relationships don't change).
     
     Future extension point: This could be replaced with a SpatioTemporalEncoder
     for Option B (temporal attention across timesteps).
@@ -569,11 +1463,141 @@ class TransformerEncoder(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        key_padding_mask: Optional[torch.Tensor] = None
+        key_padding_mask: Optional[torch.Tensor] = None,
+        attn_bias: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Args:
             x: (batch, n_tokens, embed_dim)
+            key_padding_mask: (batch, n_tokens) where True = padding
+            attn_bias: (batch, n_heads, n_tokens, n_tokens) optional attention bias
+        
+        Returns:
+            x: Transformed tensor
+            all_attn_weights: List of attention weights from each layer
+        """
+        all_attn_weights = []
+        
+        for layer in self.layers:
+            x, attn_weights = layer(x, key_padding_mask, attn_bias)
+            all_attn_weights.append(attn_weights)
+        
+        x = self.norm(x)
+        
+        return x, all_attn_weights
+
+
+# =============================================================================
+# RoPE-ENABLED TRANSFORMER (separate implementation for RoPE)
+# =============================================================================
+
+class RoPETransformerEncoderLayer(nn.Module):
+    """
+    Transformer encoder layer with 2D Rotary Position Embeddings.
+    
+    Uses RoPEMultiheadAttention instead of standard attention.
+    Positions are passed through to the attention mechanism.
+    """
+    
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        mlp_ratio: float = 2.0,
+        dropout: float = 0.0,
+        max_position: float = 50.0,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        
+        # Pre-norm layers
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        
+        # RoPE-enabled attention
+        self.attn = RoPEMultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            max_position=max_position,
+        )
+        
+        # Feed-forward network
+        hidden_dim = int(embed_dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, embed_dim),
+            nn.Dropout(dropout),
+        )
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: (batch, n_tokens, embed_dim)
+            positions: (batch, n_tokens, 2) wind-relative positions
+            key_padding_mask: (batch, n_tokens) where True = padding
+        
+        Returns:
+            x: Transformed tensor
+            attn_weights: (batch, n_heads, n_tokens, n_tokens)
+        """
+        # Self-attention with pre-norm and RoPE
+        x_norm = self.norm1(x)
+        attn_out, attn_weights = self.attn(
+            x_norm, positions, key_padding_mask=key_padding_mask
+        )
+        x = x + attn_out
+        
+        # FFN with pre-norm
+        x = x + self.mlp(self.norm2(x))
+        
+        return x, attn_weights
+
+
+class RoPETransformerEncoder(nn.Module):
+    """
+    Stack of RoPE-enabled transformer encoder layers.
+    
+    Unlike the standard TransformerEncoder, this requires positions
+    to be passed through for applying rotary embeddings.
+    """
+    
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        num_layers: int,
+        mlp_ratio: float = 2.0,
+        dropout: float = 0.0,
+        max_position: float = 50.0,
+    ):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            RoPETransformerEncoderLayer(
+                embed_dim, num_heads, mlp_ratio, dropout, max_position
+            )
+            for _ in range(num_layers)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """
+        Args:
+            x: (batch, n_tokens, embed_dim)
+            positions: (batch, n_tokens, 2) wind-relative positions
             key_padding_mask: (batch, n_tokens) where True = padding
         
         Returns:
@@ -583,7 +1607,7 @@ class TransformerEncoder(nn.Module):
         all_attn_weights = []
         
         for layer in self.layers:
-            x, attn_weights = layer(x, key_padding_mask)
+            x, attn_weights = layer(x, positions, key_padding_mask)
             all_attn_weights.append(attn_weights)
         
         x = self.norm(x)
@@ -605,7 +1629,10 @@ class TransformerActor(nn.Module):
     
     Architecture:
     1. Per-turbine observations → embedding via MLP
-    2. Add positional encoding (wind-relative coordinates)
+    2. Add positional encoding (method depends on pos_encoding_type):
+       - "absolute_mlp": Position embedding concatenated to token embedding
+       - "relative_mlp": Position used to compute attention bias
+       - "rope_2d": Position used to rotate Q and K in attention
     3. Optional: Prepend learnable farm token for global context
     4. Process through transformer (turbines attend to each other)
     5. Per-turbine action heads (shared weights across turbines)
@@ -627,13 +1654,17 @@ class TransformerActor(nn.Module):
         use_farm_token: bool = False,
         action_scale: float = 1.0,
         action_bias: float = 0.0,
+        # New positional encoding args
+        pos_encoding_type: str = "absolute_mlp",
+        rel_pos_hidden_dim: int = 64,
+        rel_pos_per_head: bool = True,
     ):
         """
         Args:
             obs_dim_per_turbine: Observation dimension per turbine
             action_dim_per_turbine: Action dimension per turbine (1 for yaw)
             embed_dim: Transformer hidden dimension
-            pos_embed_dim: Positional encoding dimension
+            pos_embed_dim: Positional encoding dimension (for absolute types)
             num_heads: Number of attention heads
             num_layers: Number of transformer layers
             mlp_ratio: FFN expansion ratio
@@ -641,6 +1672,9 @@ class TransformerActor(nn.Module):
             use_farm_token: Whether to use a learnable farm-level token
             action_scale: Scale for tanh output
             action_bias: Bias for tanh output
+            pos_encoding_type: Type of positional encoding (see VALID_POS_ENCODING_TYPES)
+            rel_pos_hidden_dim: Hidden dimension for relative position MLP
+            rel_pos_per_head: Whether relative bias is per-head
         """
         super().__init__()
         
@@ -648,6 +1682,18 @@ class TransformerActor(nn.Module):
         self.action_dim_per_turbine = action_dim_per_turbine
         self.embed_dim = embed_dim
         self.use_farm_token = use_farm_token
+        self.pos_encoding_type = pos_encoding_type
+        
+        # Create positional encoding modules based on type
+        self.pos_encoder, self.rel_pos_bias, self.uses_additive_embedding, self.uses_rope = \
+            create_positional_encoding(
+                encoding_type=pos_encoding_type,
+                embed_dim=embed_dim,
+                pos_embed_dim=pos_embed_dim,
+                num_heads=num_heads,
+                rel_pos_hidden_dim=rel_pos_hidden_dim,
+                rel_pos_per_head=rel_pos_per_head,
+            )
         
         # Observation encoder (shared across turbines)
         self.obs_encoder = nn.Sequential(
@@ -656,21 +1702,31 @@ class TransformerActor(nn.Module):
             nn.Linear(embed_dim, embed_dim),
         )
         
-        # Positional encoding
-        self.pos_encoder = PositionalEncoding(pos_dim=2, embed_dim=pos_embed_dim)
-        
-        # Project concatenated obs + pos to embed_dim
-        self.input_proj = nn.Linear(embed_dim + pos_embed_dim, embed_dim)
+        # Input projection depends on encoding type
+        if self.uses_additive_embedding:
+            # Absolute encoding: obs_embed + pos_embed → project to embed_dim
+            self.input_proj = nn.Linear(embed_dim + pos_embed_dim, embed_dim)
+        else:
+            # Relative/RoPE encoding: just obs_embed → embed_dim (already correct size)
+            self.input_proj = nn.Linear(embed_dim, embed_dim)
         
         # Optional farm token (prepended to sequence)
         if use_farm_token:
             self.farm_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
             nn.init.normal_(self.farm_token, std=0.02)
         
-        # Transformer encoder
-        self.transformer = TransformerEncoder(
-            embed_dim, num_heads, num_layers, mlp_ratio, dropout
-        )
+        # Transformer encoder (choose based on encoding type)
+        if self.uses_rope:
+            # RoPE requires special transformer that passes positions through
+            self.transformer = RoPETransformerEncoder(
+                embed_dim, num_heads, num_layers, mlp_ratio, dropout,
+                max_position=50.0  # Max expected position in rotor diameters
+            )
+        else:
+            # Standard transformer (with optional attention bias)
+            self.transformer = TransformerEncoder(
+                embed_dim, num_heads, num_layers, mlp_ratio, dropout
+            )
         
         # Action heads (shared across turbines)
         self.fc_mean = nn.Linear(embed_dim, action_dim_per_turbine)
@@ -678,7 +1734,7 @@ class TransformerActor(nn.Module):
         
         # Action scaling
         self.register_buffer("action_scale", torch.tensor(action_scale, dtype=torch.float32))
-        self.register_buffer("action_bias", torch.tensor(action_bias, dtype=torch.float32))
+        self.register_buffer("action_bias_val", torch.tensor(action_bias, dtype=torch.float32))
     
     def forward(
         self,
@@ -704,12 +1760,22 @@ class TransformerActor(nn.Module):
         # Encode observations
         h = self.obs_encoder(obs)  # (batch, n_turb, embed_dim)
         
-        # Encode positions
-        pos_embed = self.pos_encoder(positions)  # (batch, n_turb, pos_embed_dim)
+        # Apply positional encoding based on type
+        if self.uses_additive_embedding and self.pos_encoder is not None:
+            # Absolute encoding: concatenate position embedding
+            pos_embed = self.pos_encoder(positions)  # (batch, n_turb, pos_embed_dim)
+            h = torch.cat([h, pos_embed], dim=-1)  # (batch, n_turb, embed_dim + pos_embed_dim)
         
-        # Concatenate and project
-        h = torch.cat([h, pos_embed], dim=-1)  # (batch, n_turb, embed_dim + pos_embed_dim)
+        # Project to embed_dim
         h = self.input_proj(h)  # (batch, n_turb, embed_dim)
+        
+        # Compute relative position bias if using relative encoding (not RoPE)
+        attn_bias = None
+        if self.rel_pos_bias is not None:
+            attn_bias = self.rel_pos_bias(positions, key_padding_mask)
+        
+        # Store positions for RoPE (will be extended if farm token is used)
+        positions_for_rope = positions
         
         # Optionally prepend farm token
         if self.use_farm_token:
@@ -719,10 +1785,37 @@ class TransformerActor(nn.Module):
             # Extend padding mask for farm token (farm token is never masked)
             if key_padding_mask is not None:
                 farm_mask = torch.zeros(batch_size, 1, dtype=torch.bool, device=h.device)
-                key_padding_mask = torch.cat([farm_mask, key_padding_mask], dim=1)
+                key_padding_mask_extended = torch.cat([farm_mask, key_padding_mask], dim=1)
+            else:
+                key_padding_mask_extended = None
+            
+            # Extend attention bias for farm token
+            if attn_bias is not None:
+                # Add row/column for farm token with zero bias
+                n_heads = attn_bias.shape[1]
+                n_total = h.shape[1]  # 1 + n_turb
+                
+                # Create new bias tensor with farm token
+                new_bias = torch.zeros(
+                    batch_size, n_heads, n_total, n_total,
+                    device=attn_bias.device, dtype=attn_bias.dtype
+                )
+                # Copy original bias to turbine-turbine portion
+                new_bias[:, :, 1:, 1:] = attn_bias
+                attn_bias = new_bias
+            
+            # Extend positions for RoPE (farm token at origin)
+            if self.uses_rope:
+                farm_pos = torch.zeros(batch_size, 1, 2, device=positions.device, dtype=positions.dtype)
+                positions_for_rope = torch.cat([farm_pos, positions], dim=1)
+        else:
+            key_padding_mask_extended = key_padding_mask
         
-        # Transformer
-        h, attn_weights = self.transformer(h, key_padding_mask)
+        # Transformer (different call signature for RoPE vs standard)
+        if self.uses_rope:
+            h, attn_weights = self.transformer(h, positions_for_rope, key_padding_mask_extended)
+        else:
+            h, attn_weights = self.transformer(h, key_padding_mask_extended, attn_bias)
         
         # Remove farm token from output (we only need turbine actions)
         if self.use_farm_token:
@@ -772,7 +1865,7 @@ class TransformerActor(nn.Module):
         
         # Apply tanh squashing
         y_t = torch.tanh(x_t)
-        action = y_t * self.action_scale + self.action_bias
+        action = y_t * self.action_scale + self.action_bias_val
         
         # Compute log probability with tanh correction
         log_prob = normal.log_prob(x_t)
@@ -788,7 +1881,7 @@ class TransformerActor(nn.Module):
         log_prob = log_prob.sum(dim=(-2, -1), keepdim=False).unsqueeze(-1)
         
         # Mean action (for logging)
-        mean_action = torch.tanh(mean) * self.action_scale + self.action_bias
+        mean_action = torch.tanh(mean) * self.action_scale + self.action_bias_val
         
         return action, log_prob, mean_action, attn_weights
 
@@ -804,7 +1897,7 @@ class TransformerCritic(nn.Module):
     Architecture:
     1. Concatenate per-turbine observations and actions
     2. Encode via MLP
-    3. Add positional encoding
+    3. Add positional encoding (method depends on pos_encoding_type)
     4. Optional: Prepend farm token
     5. Process through transformer
     6. Pool over turbines (masked mean) → single Q-value
@@ -824,11 +1917,27 @@ class TransformerCritic(nn.Module):
         mlp_ratio: float = 2.0,
         dropout: float = 0.0,
         use_farm_token: bool = False,
+        # New positional encoding args
+        pos_encoding_type: str = "absolute_mlp",
+        rel_pos_hidden_dim: int = 64,
+        rel_pos_per_head: bool = True,
     ):
         super().__init__()
         
         self.embed_dim = embed_dim
         self.use_farm_token = use_farm_token
+        self.pos_encoding_type = pos_encoding_type
+        
+        # Create positional encoding modules based on type
+        self.pos_encoder, self.rel_pos_bias, self.uses_additive_embedding, self.uses_rope = \
+            create_positional_encoding(
+                encoding_type=pos_encoding_type,
+                embed_dim=embed_dim,
+                pos_embed_dim=pos_embed_dim,
+                num_heads=num_heads,
+                rel_pos_hidden_dim=rel_pos_hidden_dim,
+                rel_pos_per_head=rel_pos_per_head,
+            )
         
         # Observation + action encoder
         self.obs_action_encoder = nn.Sequential(
@@ -837,21 +1946,27 @@ class TransformerCritic(nn.Module):
             nn.Linear(embed_dim, embed_dim),
         )
         
-        # Positional encoding
-        self.pos_encoder = PositionalEncoding(pos_dim=2, embed_dim=pos_embed_dim)
-        
-        # Project to embed_dim
-        self.input_proj = nn.Linear(embed_dim + pos_embed_dim, embed_dim)
+        # Input projection depends on encoding type
+        if self.uses_additive_embedding:
+            self.input_proj = nn.Linear(embed_dim + pos_embed_dim, embed_dim)
+        else:
+            self.input_proj = nn.Linear(embed_dim, embed_dim)
         
         # Optional farm token
         if use_farm_token:
             self.farm_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
             nn.init.normal_(self.farm_token, std=0.02)
         
-        # Transformer encoder
-        self.transformer = TransformerEncoder(
-            embed_dim, num_heads, num_layers, mlp_ratio, dropout
-        )
+        # Transformer encoder (choose based on encoding type)
+        if self.uses_rope:
+            self.transformer = RoPETransformerEncoder(
+                embed_dim, num_heads, num_layers, mlp_ratio, dropout,
+                max_position=50.0
+            )
+        else:
+            self.transformer = TransformerEncoder(
+                embed_dim, num_heads, num_layers, mlp_ratio, dropout
+            )
         
         # Q-value head (after pooling)
         self.q_head = nn.Sequential(
@@ -887,10 +2002,21 @@ class TransformerCritic(nn.Module):
         # Encode
         h = self.obs_action_encoder(x)
         
-        # Add positional encoding
-        pos_embed = self.pos_encoder(positions)
-        h = torch.cat([h, pos_embed], dim=-1)
+        # Apply positional encoding based on type
+        if self.uses_additive_embedding and self.pos_encoder is not None:
+            pos_embed = self.pos_encoder(positions)
+            h = torch.cat([h, pos_embed], dim=-1)
+        
+        # Project to embed_dim
         h = self.input_proj(h)
+        
+        # Compute relative position bias if using relative encoding (not RoPE)
+        attn_bias = None
+        if self.rel_pos_bias is not None:
+            attn_bias = self.rel_pos_bias(positions, key_padding_mask)
+        
+        # Store positions for RoPE
+        positions_for_rope = positions
         
         # Optional farm token
         if self.use_farm_token:
@@ -899,10 +2025,33 @@ class TransformerCritic(nn.Module):
             
             if key_padding_mask is not None:
                 farm_mask = torch.zeros(batch_size, 1, dtype=torch.bool, device=h.device)
-                key_padding_mask = torch.cat([farm_mask, key_padding_mask], dim=1)
+                key_padding_mask_extended = torch.cat([farm_mask, key_padding_mask], dim=1)
+            else:
+                key_padding_mask_extended = None
+            
+            # Extend attention bias for farm token
+            if attn_bias is not None:
+                n_heads = attn_bias.shape[1]
+                n_total = h.shape[1]
+                new_bias = torch.zeros(
+                    batch_size, n_heads, n_total, n_total,
+                    device=attn_bias.device, dtype=attn_bias.dtype
+                )
+                new_bias[:, :, 1:, 1:] = attn_bias
+                attn_bias = new_bias
+            
+            # Extend positions for RoPE (farm token at origin)
+            if self.uses_rope:
+                farm_pos = torch.zeros(batch_size, 1, 2, device=positions.device, dtype=positions.dtype)
+                positions_for_rope = torch.cat([farm_pos, positions], dim=1)
+        else:
+            key_padding_mask_extended = key_padding_mask
         
-        # Transformer
-        h, _ = self.transformer(h, key_padding_mask)
+        # Transformer (different call signature for RoPE vs standard)
+        if self.uses_rope:
+            h, _ = self.transformer(h, positions_for_rope, key_padding_mask_extended)
+        else:
+            h, _ = self.transformer(h, key_padding_mask_extended, attn_bias)
         
         # Remove farm token if used (for consistent pooling)
         if self.use_farm_token:
@@ -1610,6 +2759,7 @@ def main():
     # =========================================================================
     
     print("\nCreating networks...")
+    print(f"Positional encoding type: {args.pos_encoding_type}")
     
     actor = TransformerActor(
         obs_dim_per_turbine=obs_dim_per_turbine,
@@ -1623,6 +2773,10 @@ def main():
         use_farm_token=args.use_farm_token,
         action_scale=action_scale,
         action_bias=action_bias,
+        # Positional encoding settings
+        pos_encoding_type=args.pos_encoding_type,
+        rel_pos_hidden_dim=args.rel_pos_hidden_dim,
+        rel_pos_per_head=args.rel_pos_per_head,
     ).to(device)
     
     qf1 = TransformerCritic(
@@ -1635,6 +2789,10 @@ def main():
         mlp_ratio=args.mlp_ratio,
         dropout=args.dropout,
         use_farm_token=args.use_farm_token,
+        # Positional encoding settings
+        pos_encoding_type=args.pos_encoding_type,
+        rel_pos_hidden_dim=args.rel_pos_hidden_dim,
+        rel_pos_per_head=args.rel_pos_per_head,
     ).to(device)
     
     qf2 = TransformerCritic(
@@ -1647,6 +2805,10 @@ def main():
         mlp_ratio=args.mlp_ratio,
         dropout=args.dropout,
         use_farm_token=args.use_farm_token,
+        # Positional encoding settings
+        pos_encoding_type=args.pos_encoding_type,
+        rel_pos_hidden_dim=args.rel_pos_hidden_dim,
+        rel_pos_per_head=args.rel_pos_per_head,
     ).to(device)
     
     # Target networks
@@ -1660,6 +2822,10 @@ def main():
         mlp_ratio=args.mlp_ratio,
         dropout=args.dropout,
         use_farm_token=args.use_farm_token,
+        # Positional encoding settings
+        pos_encoding_type=args.pos_encoding_type,
+        rel_pos_hidden_dim=args.rel_pos_hidden_dim,
+        rel_pos_per_head=args.rel_pos_per_head,
     ).to(device)
     
     qf2_target = TransformerCritic(
@@ -1672,6 +2838,10 @@ def main():
         mlp_ratio=args.mlp_ratio,
         dropout=args.dropout,
         use_farm_token=args.use_farm_token,
+        # Positional encoding settings
+        pos_encoding_type=args.pos_encoding_type,
+        rel_pos_hidden_dim=args.rel_pos_hidden_dim,
+        rel_pos_per_head=args.rel_pos_per_head,
     ).to(device)
     
     qf1_target.load_state_dict(qf1.state_dict())
