@@ -39,7 +39,8 @@ from WindGym.wrappers import RecordEpisodeVals, PerTurbineObservationWrapper
 from WindGym.utils.generate_layouts import (
     generate_square_grid, 
     generate_cirular_farm, 
-    generate_right_triangle_grid
+    generate_right_triangle_grid,
+    generate_line_dots_multiple_thetas
 )
 from MultiLayoutEnv import MultiLayoutEnv, LayoutConfig
 
