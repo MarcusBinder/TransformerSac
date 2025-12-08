@@ -138,6 +138,8 @@ class Args:
     save_model: bool = True
     save_interval: int = 25000
     log_image: bool = False  # Log attention images to TensorBoard
+
+    shuffle_turbs: bool = False  # Shuffle turbine order in obs/action
     
     # === Environment Settings ===
     turbtype: str = "DTU10MW"  # Wind turbine type
@@ -2674,6 +2676,7 @@ def main():
                 env_factory=env_factory,
                 per_turbine_wrapper=combined_wrapper,  # Use combined wrapper
                 seed=seed,
+                shuffle=args.shuffle_turbs, # Shuffle turbines within each layout
             )
             return env
         return _init
