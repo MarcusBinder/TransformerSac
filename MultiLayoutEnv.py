@@ -171,17 +171,56 @@ class MultiLayoutEnv(gym.Env):
     # Info Dict Padding (fixes AsyncVectorEnv compatibility)
     # =========================================================================
     
+    # Keys that are known to be per-turbine arrays (shape n_turb,)
+    # These will be padded to max_turbines for consistency across layouts
+    _PER_TURBINE_KEYS = {
+        "yaw angles agent",
+        "Wind speed at turbines",
+        "Wind direction at turbines",
+        "Power pr turbine agent",
+        "Turbine x positions",
+        "Turbine y positions",
+        "Turbulence intensity at turbines",
+        "yaw angles base",
+        "Power pr turbine baseline",
+        "Wind speed at turbines baseline",
+    }
+    
+    # Keys that are per-turbine but flattened with history (shape n_turb * history,)
+    # These need reshaping before padding
+    _PER_TURBINE_HISTORY_KEYS = {
+        "yaw angles measured",
+        "Wind speed at turbines measured",
+        "Wind direction at turbines measured",
+    }
+    
+    # Keys that are 2D time-series arrays (shape T, n_turb)
+    _TIMESERIES_KEYS = {
+        "windspeeds",
+        "winddirs",
+        "yaws",
+        "powers",
+        "baseline_powers",
+        "yaws_baseline",
+        "windspeeds_baseline",
+    }
+    
     def _pad_info(self, info: Dict[str, Any]) -> Dict[str, Any]:
         """
         Handle info dict arrays for AsyncVectorEnv compatibility.
         
-        Uses shape-based detection to identify per-turbine arrays:
-        - Shape (n_turb,) â†’ pad to (max_turb,)
-        - Shape (T, n_turb) â†’ pad to (T, max_turb)
-        - Shape (n_turb * k,) for integer k â†’ reshape, pad, flatten
-        - Other arrays â†’ convert to list (safe fallback)
+        Uses KEY-BASED detection to identify per-turbine arrays for CONSISTENT
+        behavior across different layouts. Shape-based detection caused issues
+        when array lengths coincidentally matched n_turb for some layouts.
         
-        Converting to list prevents AsyncVectorEnv from trying to stack.
+        Strategy:
+        - Known per-turbine keys: pad to max_turbines
+        - Known per-turbine-history keys: reshape, pad, flatten
+        - Known 2D time-series keys: pad second dimension
+        - Everything else: convert to list (safe fallback)
+        
+        Converting to list prevents AsyncVectorEnv from trying to stack arrays
+        with inconsistent shapes.
         """
         padded_info = {}
         n_turb = self.n_turbines
@@ -190,77 +229,67 @@ class MultiLayoutEnv(gym.Env):
             if not isinstance(value, np.ndarray):
                 # Non-arrays pass through unchanged
                 padded_info[key] = value
+            elif key in self._PER_TURBINE_KEYS:
+                # Known per-turbine array: pad to max_turbines
+                padded_info[key] = self._pad_1d_to_max(value)
+            elif key in self._PER_TURBINE_HISTORY_KEYS:
+                # Known flattened per-turbine array with history
+                padded_info[key] = self._pad_flattened_per_turbine(value, n_turb)
+            elif key in self._TIMESERIES_KEYS and value.ndim == 2:
+                # Known 2D time-series: pad second dimension
+                padded_info[key] = self._pad_2d_timeseries(value)
             else:
-                # Try to pad based on shape, fall back to list if can't
-                padded_info[key] = self._pad_or_convert(value, n_turb)
+                # Unknown array: convert to list for safe fallback
+                # This ensures consistent behavior across layouts
+                padded_info[key] = value.tolist()
                 
         return padded_info
     
-    def _pad_or_convert(self, arr: np.ndarray, n_turb: int) -> Any:
-        """
-        Attempt to pad array if it's a per-turbine array, otherwise convert to list.
-        
-        Returns padded numpy array if padding is possible, otherwise a Python list.
-        """
-        if arr.ndim == 1:
-            return self._handle_1d_array(arr, n_turb)
-        elif arr.ndim == 2:
-            return self._handle_2d_array(arr, n_turb)
-        else:
-            # Higher dimensional arrays: convert to list
-            return arr.tolist()
+    def _pad_1d_to_max(self, arr: np.ndarray) -> np.ndarray:
+        """Pad 1D array from (n_turb,) to (max_turbines,)."""
+        if arr.shape[0] >= self.max_turbines:
+            return arr[:self.max_turbines]  # Truncate if somehow larger
+        pad_width = self.max_turbines - arr.shape[0]
+        return np.pad(arr, (0, pad_width), constant_values=self.pad_value)
     
-    def _handle_1d_array(self, arr: np.ndarray, n_turb: int) -> Any:
-        """Handle 1D arrays - either pad or convert to list."""
+    def _pad_flattened_per_turbine(self, arr: np.ndarray, n_turb: int) -> np.ndarray:
+        """
+        Pad flattened per-turbine array from (n_turb * features,) to (max_turb * features,).
+        """
+        if arr.ndim != 1 or len(arr) == 0:
+            return arr.tolist()  # Fallback
+            
         arr_len = arr.shape[0]
+        if arr_len % n_turb != 0:
+            return arr.tolist()  # Can't reshape, fallback
+            
+        features_per_turb = arr_len // n_turb
         
-        if arr_len == n_turb:
-            # Simple per-turbine array: (n_turb,) â†’ (max_turb,)
-            if n_turb < self.max_turbines:
-                pad_width = self.max_turbines - n_turb
-                return np.pad(arr, (0, pad_width), constant_values=self.pad_value)
-            return arr
-            
-        elif arr_len > n_turb and arr_len % n_turb == 0:
-            # Flattened per-turbine array: (n_turb * features,) â†’ (max_turb * features,)
-            features_per_turb = arr_len // n_turb
-            
-            # Reshape to (n_turb, features)
-            reshaped = arr.reshape(n_turb, features_per_turb)
-            
-            # Pad in turbine dimension
-            if n_turb < self.max_turbines:
-                pad_width = self.max_turbines - n_turb
-                padded = np.pad(reshaped, ((0, pad_width), (0, 0)), 
-                               constant_values=self.pad_value)
-            else:
-                padded = reshaped
-            
-            # Flatten back to 1D
-            return padded.flatten()
+        # Reshape to (n_turb, features)
+        reshaped = arr.reshape(n_turb, features_per_turb)
+        
+        # Pad in turbine dimension
+        if n_turb < self.max_turbines:
+            pad_width = self.max_turbines - n_turb
+            padded = np.pad(reshaped, ((0, pad_width), (0, 0)), 
+                           constant_values=self.pad_value)
         else:
-            # Unknown structure: convert to list
-            return arr.tolist()
+            padded = reshaped[:self.max_turbines]  # Truncate if larger
+        
+        # Flatten back to 1D
+        return padded.flatten()
     
-    def _handle_2d_array(self, arr: np.ndarray, n_turb: int) -> Any:
-        """Handle 2D arrays - either pad or convert to list."""
-        # Check if second dimension matches n_turb: (T, n_turb)
-        if arr.shape[1] == n_turb:
-            if n_turb < self.max_turbines:
-                pad_width = self.max_turbines - n_turb
-                return np.pad(arr, ((0, 0), (0, pad_width)), constant_values=self.pad_value)
-            return arr
-        
-        # Check if first dimension matches n_turb: (n_turb, features)
-        elif arr.shape[0] == n_turb:
-            if n_turb < self.max_turbines:
-                pad_width = self.max_turbines - n_turb
-                return np.pad(arr, ((0, pad_width), (0, 0)), constant_values=self.pad_value)
-            return arr
-        
-        else:
-            # Unknown structure: convert to list
-            return arr.tolist()
+    def _pad_2d_timeseries(self, arr: np.ndarray) -> np.ndarray:
+        """Pad 2D time-series array from (T, n_turb) to (T, max_turbines)."""
+        if arr.ndim != 2:
+            return arr.tolist()  # Fallback
+            
+        n_turb_actual = arr.shape[1]
+        if n_turb_actual >= self.max_turbines:
+            return arr[:, :self.max_turbines]  # Truncate if larger
+            
+        pad_width = self.max_turbines - n_turb_actual
+        return np.pad(arr, ((0, 0), (0, pad_width)), constant_values=self.pad_value)
     
     # =========================================================================
     # Properties
@@ -445,7 +474,11 @@ class MultiLayoutEnv(gym.Env):
         info['attention_mask'] = self._attention_mask.copy()
         info['max_turbines'] = self.max_turbines
         if self.shuffle:
-            info['turbine_permutation'] = self._perm.copy()
+            # Pad turbine_permutation to max_turbines for AsyncVectorEnv compatibility
+            # Use -1 for padding values (valid indices are 0 to n_turbines-1)
+            padded_perm = np.full(self.max_turbines, -1, dtype=np.int64)
+            padded_perm[:self.n_turbines] = self._perm
+            info['turbine_permutation'] = padded_perm
         
         return padded_obs, info
     
