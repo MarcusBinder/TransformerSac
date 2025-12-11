@@ -128,7 +128,7 @@ from helper_funcs import (
     make_env_config,
 )
 
-from encodings import (
+from encodings_helper import (
     AbsolutePositionalEncoding,
     RelativePositionalBias,
     Sinusoidal2DPositionalEncoding,
