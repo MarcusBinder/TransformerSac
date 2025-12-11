@@ -157,7 +157,7 @@ class Args:
     wandb_project_name: str = "transformer_windfarm"
     wandb_entity: Optional[str] = None
     save_model: bool = True
-    save_interval: int = 25000
+    save_interval: int = 10000
     log_image: bool = False  # Log attention images to TensorBoard
 
     shuffle_turbs: bool = False  # Shuffle turbine order in obs/action
@@ -2024,6 +2024,13 @@ def main():
     print(f"With {args.num_envs} envs: {int(args.num_envs * args.utd_ratio)} gradient updates per iteration")
     print("=" * 60)
     
+
+    save_checkpoint(
+        actor, qf1, qf2, actor_optimizer, q_optimizer,
+        0, run_name, args, log_alpha, alpha_optimizer
+    )
+
+
     start_time = time.time()
     global_step = 0
     total_gradient_steps = 0  # Track total gradient updates for logging

@@ -76,7 +76,7 @@ class Args:
     wandb_project_name: str = "transformer_windfarm"
     wandb_entity: Optional[str] = None
     save_model: bool = True
-    save_interval: int = 25000
+    save_interval: int = 10000
     shuffle_turbs: bool = False  # Shuffle turbine order in obs/action
     
     # === Environment Settings ===
@@ -784,6 +784,13 @@ def main():
     step_reward_window = deque(maxlen=1000)
     episode_rewards = []
     
+
+    save_checkpoint(
+        actor, qf1, qf2, actor_optimizer, q_optimizer,
+        0, run_name, args, log_alpha if args.autotune else None,
+        alpha_optimizer if args.autotune else None
+    )
+
     for update in range(1, num_updates + 1):
         global_step += args.num_envs
         
