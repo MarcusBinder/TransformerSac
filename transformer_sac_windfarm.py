@@ -92,9 +92,9 @@ KNOWN ISSUES / NOTES:
 import os
 import random
 import time
-import math
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, List, Dict, Any, Callable
+from typing import Optional, Tuple, List, Dict, Any
+from collections import deque
 
 import gymnasium as gym
 import numpy as np
@@ -104,13 +104,10 @@ import torch.nn.functional as F
 import torch.optim as optim
 import tyro
 from torch.utils.tensorboard import SummaryWriter
-from collections import deque
 
 # WindGym imports (adjust path as needed for your setup)
 from WindGym import WindFarmEnv
 from WindGym.wrappers import RecordEpisodeVals, PerTurbineObservationWrapper
-from WindGym.utils.generate_layouts import generate_square_grid, generate_cirular_farm, generate_right_triangle_grid, generate_line_dots_multiple_thetas
-from collections import deque
 from MultiLayoutEnv import MultiLayoutEnv, LayoutConfig, create_layout_configs
 
 # Logging utilities for multi-layout training
@@ -125,7 +122,11 @@ from helper_funcs import (
     get_env_raw_positions,
     get_env_attention_masks,
     save_checkpoint,
+    load_checkpoint,
     make_env_config,
+    transform_to_wind_relative,
+    compute_wind_direction_deviation,
+    EnhancedPerTurbineWrapper,
 )
 
 from encodings_helper import (
@@ -216,205 +217,6 @@ class Args:
     # === Gradient Clipping ===
     grad_clip: bool = True
     grad_clip_max_norm: float = 1.0
-
-
-# =============================================================================
-# OBSERVATION PROCESSING
-# =============================================================================
-
-def compute_wind_direction_deviation(
-    local_wd: np.ndarray, 
-    mean_wd: float,
-    scale_range: float = 90.0
-) -> np.ndarray:
-    """
-    Compute wind direction deviation from mean, scaled to [-1, 1].
-    
-    The deviation captures local flow variations due to wakes and turbulence,
-    while being invariant to the absolute wind direction (which is encoded
-    in the positional encoding via wind-relative coordinates).
-    
-    Args:
-        local_wd: Per-turbine local wind direction in degrees, shape (n_turbines,)
-                  or (n_turbines, history_length) for history
-        mean_wd: Farm-level mean wind direction in degrees
-        scale_range: Deviation range for scaling. Deviations beyond this are clipped.
-                     Default 90° means ±90° maps to [-1, 1].
-    
-    Returns:
-        Scaled deviation in [-1, 1], same shape as input
-    """
-    # Compute raw deviation
-    deviation = local_wd - mean_wd
-    
-    # Wrap to [-180, 180]
-    deviation = ((deviation + 180) % 360) - 180
-    
-    # Scale to [-1, 1] based on scale_range (±90° -> [-1, 1])
-    scaled = np.clip(deviation / scale_range, -1.0, 1.0)
-    
-    return scaled.astype(np.float32)
-
-
-class EnhancedPerTurbineWrapper(gym.Wrapper):
-    """
-    Enhanced wrapper that transforms wind direction observations to DEVIATION from mean.
-    
-    This wrapper sits on top of PerTurbineObservationWrapper and transforms the 
-    absolute wind direction values to deviations from the farm's mean wind direction.
-    
-    Why deviation instead of absolute?
-    - With wind-relative positional encoding, absolute wind direction is redundant
-    - Deviation captures local wake effects and turbulence
-    - Makes observations invariant to global wind direction changes
-    
-    Observation order per turbine (from TurbMes.get_measurements):
-        [probes..., ws..., wd..., yaw..., TI, power...]
-    
-    We detect the WD indices by reading the TurbMes configuration directly.
-    """
-    
-    def __init__(
-        self, 
-        env: gym.Env,
-        wd_scale_range: float = 90.0,
-    ):
-        """
-        Args:
-            env: Base environment (should be wrapped with PerTurbineObservationWrapper)
-            wd_scale_range: Range for wind direction deviation scaling.
-                           ±wd_scale_range degrees maps to [-1, 1].
-                           Default 90° means ±90° deviation → [-1, 1].
-        """
-        super().__init__(env)
-        self.wd_scale_range = wd_scale_range
-        
-        # Get the base WindFarmEnv to access farm_measurements config
-        self._base_env = self._get_base_env()
-        
-        # Detect wind direction indices from the measurement configuration
-        self._wd_indices, self._wd_min, self._wd_max = self._detect_wd_indices()
-        
-        if self._wd_indices is not None:
-            print(f"EnhancedPerTurbineWrapper: Found WD at indices {self._wd_indices} "
-                  f"(scaling from [{self._wd_min}, {self._wd_max}] to deviation)")
-        else:
-            print("EnhancedPerTurbineWrapper: No wind direction in observations, "
-                  "wrapper will pass through unchanged")
-    
-    def _get_base_env(self):
-        """Unwrap to get the base WindFarmEnv."""
-        env = self.env
-        while hasattr(env, 'env'):
-            env = env.env
-        return env
-    
-    def _detect_wd_indices(self) -> Tuple[Optional[List[int]], float, float]:
-        """
-        Detect which observation indices correspond to wind direction.
-        
-        Reads directly from TurbMes configuration to determine:
-        1. How many probe features come first
-        2. How many WS features 
-        3. Where WD features start and how many there are
-        
-        Returns:
-            (wd_indices, wd_min, wd_max) or (None, 0, 360) if WD not in obs
-        """
-        try:
-            fm = self._base_env.farm_measurements
-            turb_mes = fm.turb_mes[0]  # All turbines have same structure
-            
-            # Check if wind direction is enabled
-            if not fm.turb_wd:
-                return None, 0, 360
-            
-            # Count features before wind direction
-            offset = 0
-            
-            # 1. Probes (if any)
-            if hasattr(turb_mes, 'n_probes') and turb_mes.n_probes > 0:
-                offset += turb_mes.n_probes
-            
-            # 2. Wind speed features
-            ws_mes = turb_mes.ws
-            n_ws = (1 if ws_mes.current else 0) + (ws_mes.history_N if ws_mes.rolling_mean else 0)
-            offset += n_ws
-            
-            # 3. Wind direction features start at offset
-            wd_mes = turb_mes.wd
-            n_wd = (1 if wd_mes.current else 0) + (wd_mes.history_N if wd_mes.rolling_mean else 0)
-            
-            if n_wd == 0:
-                return None, 0, 360
-            
-            wd_indices = list(range(offset, offset + n_wd))
-            wd_min = turb_mes.wd_min
-            wd_max = turb_mes.wd_max
-            
-            return wd_indices, wd_min, wd_max
-            
-        except Exception as e:
-            print(f"Warning: Could not detect WD indices: {e}")
-            return None, 0, 360
-    
-    def _transform_observation(self, obs: np.ndarray) -> np.ndarray:
-        """
-        Transform wind direction values to deviations from mean.
-        
-        Args:
-            obs: Per-turbine observations, shape (n_turbines, obs_dim)
-        
-        Returns:
-            Transformed observations with same shape
-        """
-        if self._wd_indices is None:
-            return obs
-        
-        # Get mean wind direction from environment
-        mean_wd = self._base_env.wd
-        
-        # Transform wind direction columns to deviations
-        obs_transformed = obs.copy()
-        
-        for idx in self._wd_indices:
-            if idx < obs.shape[1]:
-                # Current values are scaled to [-1, 1] from [wd_min, wd_max]
-                # Unscale: val = (scaled + 1) / 2 * (max - min) + min
-                wd_scaled = obs[:, idx]
-                wd_degrees = (wd_scaled + 1) / 2 * (self._wd_max - self._wd_min) + self._wd_min
-                
-                # Compute deviation from mean and rescale
-                wd_dev_scaled = compute_wind_direction_deviation(
-                    wd_degrees, mean_wd, self.wd_scale_range
-                )
-                
-                obs_transformed[:, idx] = wd_dev_scaled
-        
-        return obs_transformed
-    
-    # Pass through all properties from the wrapped env
-    @property
-    def n_turbines(self) -> int:
-        return self.env.n_turbines
-    
-    @property 
-    def observation_space(self):
-        return self.env.observation_space
-    
-    @property
-    def action_space(self):
-        return self.env.action_space
-    
-    def reset(self, **kwargs) -> Tuple[np.ndarray, Dict[str, Any]]:
-        obs, info = self.env.reset(**kwargs)
-        obs_transformed = self._transform_observation(obs)
-        return obs_transformed, info
-    
-    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        obs_transformed = self._transform_observation(obs)
-        return obs_transformed, reward, terminated, truncated, info
 
 
 # =============================================================================
@@ -586,51 +388,6 @@ def create_positional_encoding(
 
 # Backward compatibility alias
 PositionalEncoding = AbsolutePositionalEncoding
-
-
-def transform_to_wind_relative(
-    positions: torch.Tensor,
-    wind_direction: torch.Tensor
-) -> torch.Tensor:
-    """
-    Transform positions to wind-relative coordinates.
-    
-    Rotates the coordinate system so that wind effectively comes from 270°
-    (negative x direction). This makes the learning problem invariant to
-    absolute wind direction - the model only needs to learn wake patterns
-    in a canonical reference frame.
-    
-    Physics intuition:
-    - After transformation, "upwind" always means positive x direction
-    - Wake effects always propagate in positive x direction
-    - Lateral offset is always in y direction
-    
-    Args:
-        positions: (batch, n_turbines, 2) raw positions in meters
-        wind_direction: (batch,) wind direction in degrees (meteorological convention)
-    
-    Returns:
-        Rotated positions with same shape as input
-    """
-    # Rotation angle: how much to rotate to align wind with 270°
-    angle_offset = wind_direction - 270.0
-    theta = angle_offset * (math.pi / 180.0)
-    
-    # Handle dimensions for broadcasting
-    if theta.dim() == 1:
-        theta = theta.unsqueeze(-1).unsqueeze(-1)  # (batch, 1, 1)
-    
-    cos_theta = torch.cos(theta)
-    sin_theta = torch.sin(theta)
-    
-    x = positions[..., 0:1]
-    y = positions[..., 1:2]
-    
-    # Standard 2D rotation matrix
-    x_rot = cos_theta * x - sin_theta * y
-    y_rot = sin_theta * x + cos_theta * y
-    
-    return torch.cat([x_rot, y_rot], dim=-1)
 
 
 # =============================================================================
@@ -1529,45 +1286,6 @@ def compute_adaptive_target_entropy(
 
 
 
-
-
-def load_checkpoint(
-    checkpoint_path: str,
-    actor: nn.Module,
-    qf1: nn.Module,
-    qf2: nn.Module,
-    qf1_target: nn.Module,
-    qf2_target: nn.Module,
-    actor_optimizer: optim.Optimizer,
-    q_optimizer: optim.Optimizer,
-    device: torch.device,
-    log_alpha: Optional[torch.Tensor] = None,
-    alpha_optimizer: Optional[optim.Optimizer] = None,
-) -> int:
-    """
-    Load training checkpoint.
-    
-    Returns:
-        Step number from checkpoint
-    """
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    actor.load_state_dict(checkpoint["actor_state_dict"])
-    qf1.load_state_dict(checkpoint["qf1_state_dict"])
-    qf2.load_state_dict(checkpoint["qf2_state_dict"])
-    qf1_target.load_state_dict(checkpoint["qf1_state_dict"])
-    qf2_target.load_state_dict(checkpoint["qf2_state_dict"])
-    actor_optimizer.load_state_dict(checkpoint["actor_optimizer_state_dict"])
-    q_optimizer.load_state_dict(checkpoint["q_optimizer_state_dict"])
-    
-    if log_alpha is not None and "log_alpha" in checkpoint:
-        log_alpha.data = checkpoint["log_alpha"].to(device)
-    if alpha_optimizer is not None and "alpha_optimizer_state_dict" in checkpoint:
-        alpha_optimizer.load_state_dict(checkpoint["alpha_optimizer_state_dict"])
-    
-    print(f"Loaded checkpoint from {checkpoint_path} at step {checkpoint['step']}")
-    
-    return checkpoint["step"]
 
 
 def get_env_current_layout(envs) -> List[str]:

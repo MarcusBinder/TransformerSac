@@ -26,7 +26,6 @@ Based on transformer_sac_windfarm_v12.py position handling
 import os
 import random
 import time
-import math
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict, Any
 from collections import deque
@@ -43,12 +42,6 @@ from torch.utils.tensorboard import SummaryWriter
 # WindGym imports
 from WindGym import WindFarmEnv
 from WindGym.wrappers import RecordEpisodeVals, PerTurbineObservationWrapper
-from WindGym.utils.generate_layouts import (
-    generate_square_grid, 
-    generate_cirular_farm, 
-    generate_right_triangle_grid,
-    generate_line_dots_multiple_thetas
-)
 from MultiLayoutEnv import MultiLayoutEnv, LayoutConfig
 from helper_funcs import (
     get_layout_positions,
@@ -57,6 +50,8 @@ from helper_funcs import (
     get_env_attention_masks,
     save_checkpoint,
     make_env_config,
+    transform_to_wind_relative_numpy,
+    prepare_observation_with_positions,
 )
 
 # =============================================================================
@@ -118,90 +113,6 @@ class Args:
     # === Gradient Clipping ===
     grad_clip: bool = True
     grad_clip_max_norm: float = 1.0
-
-
-# =============================================================================
-# POSITION PROCESSING
-# =============================================================================
-
-def transform_to_wind_relative_numpy(
-    positions: np.ndarray,
-    wind_direction: np.ndarray
-) -> np.ndarray:
-    """
-    Transform positions to wind-relative coordinates (NumPy version).
-    
-    Rotates coordinates so wind comes from 270° (negative x direction).
-    This makes wake patterns consistent regardless of actual wind direction.
-    
-    Args:
-        positions: (batch, n_turbines, 2) or (n_turbines, 2) raw positions
-        wind_direction: (batch,) or scalar wind direction in degrees
-    
-    Returns:
-        Rotated positions with same shape as input
-    """
-    # Handle scalar wind direction
-    wind_direction = np.atleast_1d(wind_direction).astype(np.float32)
-    
-    # Rotation angle to align wind with 270°
-    angle_offset = wind_direction - 270.0
-    theta = np.deg2rad(angle_offset)
-    
-    # Handle batched vs single sample
-    if positions.ndim == 2:
-        # Single sample: (n_turb, 2)
-        theta = theta[0]
-        x = positions[:, 0]
-        y = positions[:, 1]
-        
-        x_rot = np.cos(theta) * x - np.sin(theta) * y
-        y_rot = np.sin(theta) * x + np.cos(theta) * y
-        
-        return np.stack([x_rot, y_rot], axis=-1).astype(np.float32)
-    else:
-        # Batched: (batch, n_turb, 2)
-        theta = theta[:, None]  # (batch, 1)
-        x = positions[..., 0]  # (batch, n_turb)
-        y = positions[..., 1]  # (batch, n_turb)
-        
-        x_rot = np.cos(theta) * x - np.sin(theta) * y
-        y_rot = np.sin(theta) * x + np.cos(theta) * y
-        
-        return np.stack([x_rot, y_rot], axis=-1).astype(np.float32)
-
-
-def transform_to_wind_relative_torch(
-    positions: torch.Tensor,
-    wind_direction: torch.Tensor
-) -> torch.Tensor:
-    """
-    Transform positions to wind-relative coordinates (PyTorch version).
-    
-    Args:
-        positions: (batch, n_turbines, 2) raw positions
-        wind_direction: (batch,) wind direction in degrees
-    
-    Returns:
-        Rotated positions with same shape
-    """
-    # Rotation angle to align wind with 270°
-    angle_offset = wind_direction - 270.0
-    theta = angle_offset * (math.pi / 180.0)
-    
-    # Expand for broadcasting: (batch,) -> (batch, 1, 1)
-    theta = theta.unsqueeze(-1).unsqueeze(-1)
-    
-    cos_theta = torch.cos(theta)
-    sin_theta = torch.sin(theta)
-    
-    x = positions[..., 0:1]
-    y = positions[..., 1:2]
-    
-    x_rot = cos_theta * x - sin_theta * y
-    y_rot = sin_theta * x + cos_theta * y
-    
-    return torch.cat([x_rot, y_rot], dim=-1)
 
 
 # =============================================================================
@@ -477,45 +388,6 @@ class PositionAwareReplayBuffer:
     
     def __len__(self) -> int:
         return len(self.buffer)
-
-
-# =============================================================================
-# ENVIRONMENT FACTORY
-# =============================================================================
-
-
-def prepare_observation_with_positions(
-    obs: np.ndarray,
-    raw_positions: np.ndarray,
-    wind_directions: np.ndarray,
-    rotor_diameter: float,
-    include_positions: bool = True,
-) -> np.ndarray:
-    """
-    Prepare observations with position features for the MLP.
-    
-    Args:
-        obs: (num_envs, max_turb, obs_dim) per-turbine observations
-        raw_positions: (num_envs, max_turb, 2) raw positions
-        wind_directions: (num_envs,) wind directions
-        rotor_diameter: For normalization
-        include_positions: Whether to include positions
-    
-    Returns:
-        Flattened observations: (num_envs, total_dim)
-    """
-    if include_positions:
-        # Normalize and transform positions
-        positions_norm = raw_positions / rotor_diameter
-        positions_transformed = transform_to_wind_relative_numpy(
-            positions_norm, wind_directions
-        )
-        
-        # Concatenate and flatten
-        obs_with_pos = np.concatenate([obs, positions_transformed], axis=-1)
-        return obs_with_pos.reshape(obs.shape[0], -1).astype(np.float32)
-    else:
-        return obs.reshape(obs.shape[0], -1).astype(np.float32)
 
 
 # =============================================================================
