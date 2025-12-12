@@ -57,6 +57,7 @@ class MultiLayoutEnv(gym.Env):
         seed: int = 0,
         pad_value: float = 0.0,
         shuffle: bool = False,
+        max_turbines: Optional[int] = None,
     ):
         """
         Args:
@@ -70,12 +71,14 @@ class MultiLayoutEnv(gym.Env):
             shuffle: If True, randomly permute turbine indices on each reset.
                     This tests whether the model learns spatial relationships
                     through attention rather than memorizing index-based patterns.
+            max_turbines: Override max turbines for padding. If None, computed from layouts.
+                         Use this to train on small farms but size network for larger farms.
         """
         super().__init__()
-        
+
         if not layouts:
             raise ValueError("Must provide at least one layout configuration")
-        
+
         self.layouts = layouts
         self.layout_names = [l.name for l in layouts]
         self.env_factory = env_factory
@@ -84,9 +87,17 @@ class MultiLayoutEnv(gym.Env):
         self.rng = np.random.default_rng(seed)
         self.pad_value = pad_value
         self.shuffle = shuffle
-        
-        # Determine max turbines from layouts
-        self.max_turbines = max(l.n_turbines for l in layouts)
+
+        # Determine max turbines from layouts (or use override)
+        layout_max = max(l.n_turbines for l in layouts)
+        if max_turbines is not None:
+            if max_turbines < layout_max:
+                raise ValueError(
+                    f"max_turbines ({max_turbines}) must be >= largest layout ({layout_max})"
+                )
+            self.max_turbines = max_turbines
+        else:
+            self.max_turbines = layout_max
         
         # Initialize with first layout to get observation dimensions
         self.current_layout: LayoutConfig = layouts[0]
