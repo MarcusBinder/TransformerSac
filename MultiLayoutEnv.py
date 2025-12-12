@@ -91,6 +91,7 @@ class MultiLayoutEnv(gym.Env):
         # Determine max turbines from layouts (or use override)
         layout_max = max(l.n_turbines for l in layouts)
         if max_turbines is not None:
+            # print("Overriding max_turbines for padding")
             if max_turbines < layout_max:
                 raise ValueError(
                     f"max_turbines ({max_turbines}) must be >= largest layout ({layout_max})"
