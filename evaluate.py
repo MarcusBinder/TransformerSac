@@ -45,9 +45,19 @@ def create_eval_env(layout: str, args: dict, seed: int = 42):
 
     wind_turbine = WT()
 
+    layout_names = [l.strip() for l in layout.split(",")]
+    print("Creating eval env for layouts:", layout_names)
+    layouts = []
+    for name in layout_names:
+        x_pos, y_pos = get_layout_positions(name, wind_turbine)
+        layouts.append(LayoutConfig(name=name, x_pos=x_pos, y_pos=y_pos))
+    print("Created layouts:", [l.name for l in layouts])
+
     # Get layout positions
-    x_pos, y_pos = get_layout_positions(layout, wind_turbine)
-    layouts = [LayoutConfig(name=layout, x_pos=x_pos, y_pos=y_pos)]
+    # x_pos, y_pos = get_layout_positions(layout, wind_turbine)
+    # layouts = [LayoutConfig(name=layout, x_pos=x_pos, y_pos=y_pos)]
+
+
 
     # Environment config
     config = make_env_config()
@@ -98,6 +108,7 @@ def evaluate(
     checkpoint_path: str,
     layout: str,
     num_episodes: int = 5,
+    num_steps: int = 200,
     deterministic: bool = True,
     seed: int = 42,
     verbose: bool = True,
@@ -109,6 +120,7 @@ def evaluate(
         checkpoint_path: Path to checkpoint .pt file
         layout: Layout name (e.g., "test_layout", "square_3x3")
         num_episodes: Number of episodes to run
+        num_steps: Max steps per episode
         deterministic: Use deterministic actions (mean of policy)
         seed: Random seed
         verbose: Print progress
@@ -176,7 +188,6 @@ def evaluate(
         episode_return = 0.0
         episode_length = 0
         powers = []
-
         done = False
         while not done:
             # Get positions and wind direction
@@ -204,6 +215,9 @@ def evaluate(
 
             episode_return += reward
             episode_length += 1
+
+            if episode_length >= num_steps:
+                done = True
 
             if "Power agent" in info:
                 powers.append(info["Power agent"])
@@ -245,6 +259,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint file")
     parser.add_argument("--layout", type=str, required=True, help="Layout to evaluate on")
     parser.add_argument("--episodes", type=int, default=5, help="Number of episodes")
+    parser.add_argument("--steps", type=int, default=200, help="Max steps per episode")
     parser.add_argument("--deterministic", action="store_true", default=True, help="Use deterministic actions")
     parser.add_argument("--stochastic", action="store_true", help="Use stochastic actions")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -257,6 +272,7 @@ if __name__ == "__main__":
         checkpoint_path=args.checkpoint,
         layout=args.layout,
         num_episodes=args.episodes,
+        num_steps=args.steps,
         deterministic=deterministic,
         seed=args.seed,
     )
