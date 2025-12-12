@@ -178,7 +178,7 @@ class MLPActor(nn.Module):
     def get_action(
         self,
         obs: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        action_mask: Optional[torch.Tensor] = None,
         deterministic: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -186,7 +186,7 @@ class MLPActor(nn.Module):
 
         Args:
             obs: (batch, obs_dim)
-            attention_mask: (batch, max_turbines) boolean mask where True = padding (ignore).
+            action_mask: (batch, max_turbines) boolean mask where True = padding (ignore).
                            If None, all turbines are considered valid.
             deterministic: If True, return mean action
 
@@ -212,9 +212,9 @@ class MLPActor(nn.Module):
         log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
 
         # Mask out padded turbines before summing
-        if attention_mask is not None:
-            # attention_mask: True = padding (ignore), False = valid
-            valid_mask = ~attention_mask  # True = valid turbine
+        if action_mask is not None:
+            # action_mask: True = padding (ignore), False = valid
+            valid_mask = ~action_mask  # True = valid turbine
             log_prob = log_prob * valid_mask.float()  # Zero out padded turbine log probs
 
         log_prob = log_prob.sum(dim=-1, keepdim=True)
@@ -310,11 +310,11 @@ class PositionAwareReplayBuffer:
         reward: float,
         done: bool,
         raw_positions: np.ndarray,
-        attention_mask: np.ndarray,
+        action_mask: np.ndarray,
         wind_direction: float
     ) -> None:
         """Store a transition."""
-        data = (obs, next_obs, action, reward, done, raw_positions, attention_mask, wind_direction)
+        data = (obs, next_obs, action, reward, done, raw_positions, action_mask, wind_direction)
         
         if len(self.buffer) < self.capacity:
             self.buffer.append(data)
@@ -382,7 +382,7 @@ class PositionAwareReplayBuffer:
             "observations": torch.tensor(obs_flat, device=self.device, dtype=torch.float32),
             "next_observations": torch.tensor(next_obs_flat, device=self.device, dtype=torch.float32),
             "actions": torch.tensor(actions_flat, device=self.device, dtype=torch.float32),
-            "attention_mask": torch.tensor(np.stack(mask_list), device=self.device, dtype=torch.bool),
+            "action_mask": torch.tensor(np.stack(mask_list), device=self.device, dtype=torch.bool),
             "rewards": torch.tensor(rewards, device=self.device, dtype=torch.float32).unsqueeze(-1),
             "dones": torch.tensor(dones, device=self.device, dtype=torch.float32).unsqueeze(-1),
         }
@@ -486,7 +486,7 @@ def main():
         """Wrapper for per-turbine observations."""
         return PerTurbineObservationWrapper(env)
     
-    def make_env_fn(seed):
+    def make_env_fn(args, seed):
         def _init():
             env = MultiLayoutEnv(
                 layouts=layouts,
@@ -502,13 +502,13 @@ def main():
     # Create vectorized environments
     print(f"Creating {args.num_envs} parallel environment(s)...")
     envs = gym.vector.AsyncVectorEnv(
-        [make_env_fn(args.seed + i) for i in range(args.num_envs)],
+        [make_env_fn(args, args.seed + i) for i in range(args.num_envs)],
         autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,
     )
     envs = RecordEpisodeVals(envs)
     
     # Get dimensions from sample env (wrapper handles max_turb override)
-    sample_env = make_env_fn(args.seed)()
+    sample_env = make_env_fn(args, args.seed)()
     sample_obs, sample_info = sample_env.reset()
 
     n_turbines_max = sample_env.max_turbines  # Already includes max_turb override if specified
@@ -676,12 +676,13 @@ def main():
         alpha_optimizer if args.autotune else None
     )
 
-    for update in range(1, num_updates + 1):
+    for update in range(1, num_updates + 2):
         global_step += args.num_envs
         
         # Get environment info for position processing
         wind_dirs = get_env_wind_directions(envs, args.num_envs)
         raw_positions = get_env_raw_positions(envs, args.num_envs, n_turbines_max)
+        # Note that for the SAC without attention, this mask is more an action mask, but we reuse the function
         current_masks = get_env_attention_masks(envs, args.num_envs, n_turbines_max)
         
         # Prepare observation with positions
@@ -702,7 +703,7 @@ def main():
             with torch.no_grad():
                 obs_tensor = torch.tensor(obs_flat, device=device, dtype=torch.float32)
                 mask_tensor = torch.tensor(current_masks, device=device, dtype=torch.bool)
-                actions_flat, _, _ = actor.get_action(obs_tensor, attention_mask=mask_tensor)
+                actions_flat, _, _ = actor.get_action(obs_tensor, action_mask=mask_tensor)
                 actions_flat = actions_flat.cpu().numpy()
         
         # Reshape actions for environment (wrapper handles slicing for actual turbines)
@@ -763,7 +764,7 @@ def main():
                 # ---------------------------------------------------------
                 with torch.no_grad():
                     next_actions, next_log_pi, _ = actor.get_action(
-                        data["next_observations"], attention_mask=data["attention_mask"]
+                        data["next_observations"], action_mask=data["action_mask"]
                     )
                     qf1_next = qf1_target(data["next_observations"], next_actions)
                     qf2_next = qf2_target(data["next_observations"], next_actions)
@@ -791,7 +792,7 @@ def main():
                 # ---------------------------------------------------------
                 if total_gradient_steps % args.policy_frequency == 0:
                     actions_pi, log_pi, _ = actor.get_action(
-                        data["observations"], attention_mask=data["attention_mask"]
+                        data["observations"], action_mask=data["action_mask"]
                     )
                     qf1_pi = qf1(data["observations"], actions_pi)
                     qf2_pi = qf2(data["observations"], actions_pi)
@@ -812,12 +813,12 @@ def main():
                     if args.autotune:
                         with torch.no_grad():
                             _, log_pi, _ = actor.get_action(
-                                data["observations"], attention_mask=data["attention_mask"]
+                                data["observations"], action_mask=data["action_mask"]
                             )
 
                         # Compute per-sample target entropy based on actual turbine count
-                        # attention_mask: True = padding, False = valid turbine
-                        actual_turbines = (~data["attention_mask"]).sum(dim=-1).float()  # (batch,)
+                        # action_mask: True = padding, False = valid turbine
+                        actual_turbines = (~data["action_mask"]).sum(dim=-1).float()  # (batch,)
                         target_entropy = -actual_turbines  # (batch,)
 
                         # log_pi: (batch, 1), target_entropy: (batch,)
@@ -861,7 +862,7 @@ def main():
                 writer.add_scalar("debug/mean_wind_direction", float(np.mean(wind_dirs)), global_step)
 
                 # Log masking info for multi-layout debugging
-                mean_actual_turbs = float((~data["attention_mask"]).sum(dim=-1).float().mean())
+                mean_actual_turbs = float((~data["action_mask"]).sum(dim=-1).float().mean())
                 writer.add_scalar("debug/mean_actual_turbines", mean_actual_turbs, global_step)
                 if args.autotune:
                     writer.add_scalar("debug/mean_target_entropy", -mean_actual_turbs, global_step)
