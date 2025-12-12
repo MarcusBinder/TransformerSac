@@ -90,6 +90,7 @@ class Args:
     history_length: int = 15
     wd_scale_range: float = 90.0  # Wind direction deviation range for scaling
     include_positions: bool = False  # NEW: Include position features in observations
+    max_turb: Optional[int] = None  # Override max turbines (for training on small farms, evaluating on larger)
     
     # === MLP Architecture ===
     hidden_dim: int = 256
@@ -508,11 +509,23 @@ def main():
     # Get dimensions from sample env
     sample_env = make_env_fn(args.seed)()
     sample_obs, sample_info = sample_env.reset()
-    
-    n_turbines_max = sample_env.max_turbines
+
+    env_max_turbines = sample_env.max_turbines  # Actual max from training layouts
     obs_dim_per_turbine = sample_obs.shape[1]
     action_dim_per_turbine = 1
     rotor_diameter = sample_env.rotor_diameter
+
+    # Override max turbines if specified (for future evaluation on larger farms)
+    if args.max_turb is not None:
+        if args.max_turb < env_max_turbines:
+            raise ValueError(
+                f"max_turb ({args.max_turb}) must be >= actual max turbines "
+                f"in training layouts ({env_max_turbines})"
+            )
+        n_turbines_max = args.max_turb
+        print(f"Using override max_turb={n_turbines_max} (training layouts have max {env_max_turbines})")
+    else:
+        n_turbines_max = env_max_turbines
     
     # Position features: 2 per turbine (x, y)
     pos_dim_per_turbine = 2 if args.include_positions else 0
@@ -522,8 +535,19 @@ def main():
     action_dim = n_turbines_max * action_dim_per_turbine
     
     sample_env.close()
-    
-    print(f"Max turbines: {n_turbines_max}")
+
+    # Helper to pad observations when using override max_turb
+    def pad_obs_to_max(obs: np.ndarray) -> np.ndarray:
+        """Pad observations from env shape to n_turbines_max."""
+        if obs.shape[1] == n_turbines_max:
+            return obs
+        # obs: (num_envs, env_max_turbines, obs_dim) -> (num_envs, n_turbines_max, obs_dim)
+        pad_width = ((0, 0), (0, n_turbines_max - obs.shape[1]), (0, 0))
+        return np.pad(obs, pad_width, mode='constant', constant_values=0)
+
+    print(f"Max turbines (network): {n_turbines_max}")
+    if args.max_turb is not None:
+        print(f"Max turbines (training layouts): {env_max_turbines}")
     print(f"Obs dim per turbine: {obs_dim_per_turbine}")
     print(f"Position dim per turbine: {pos_dim_per_turbine}")
     print(f"Total obs dim (flattened): {obs_dim}")
@@ -551,6 +575,7 @@ def main():
                 "layout_names": layout_names,
                 "is_multi_layout": is_multi_layout,
                 "max_turbines": n_turbines_max,
+                "env_max_turbines": env_max_turbines,
                 "architecture": "MLP_with_positions" if args.include_positions else "MLP",
                 "rotor_diameter": rotor_diameter,
             },
@@ -656,7 +681,8 @@ def main():
     start_time = time.time()
     
     obs, _ = envs.reset(seed=args.seed)
-    
+    obs = pad_obs_to_max(obs)  # Pad to n_turbines_max if using override
+
     global_step = 0
     total_gradient_steps = 0
     next_save_step = args.save_interval
@@ -705,10 +731,13 @@ def main():
         
         # Reshape actions for environment
         actions = actions_flat.reshape(args.num_envs, n_turbines_max, action_dim_per_turbine)
-        
+        # Slice to env_max_turbines (extra padded actions are ignored)
+        actions_for_env = actions[:, :env_max_turbines, :]
+
         # Environment step
-        next_obs, rewards, terminations, truncations, infos = envs.step(actions)
-        
+        next_obs, rewards, terminations, truncations, infos = envs.step(actions_for_env)
+        next_obs = pad_obs_to_max(next_obs)  # Pad to n_turbines_max if using override
+
         # Log episode info
         if "final_info" in infos:
             if hasattr(envs, 'return_queue') and len(envs.return_queue) > 0:
@@ -728,7 +757,12 @@ def main():
         real_next_obs = next_obs.copy()
         for idx, trunc in enumerate(truncations):
             if trunc and "final_obs" in infos:
-                real_next_obs[idx] = infos["final_obs"][idx]
+                final_obs_single = infos["final_obs"][idx]
+                # Pad final_obs if using override max_turb
+                if final_obs_single.shape[0] < n_turbines_max:
+                    pad_width = ((0, n_turbines_max - final_obs_single.shape[0]), (0, 0))
+                    final_obs_single = np.pad(final_obs_single, pad_width, mode='constant', constant_values=0)
+                real_next_obs[idx] = final_obs_single
         
         # Add to replay buffer (store raw positions and wind direction)
         for i in range(args.num_envs):
