@@ -2,13 +2,33 @@
 Simple evaluation script for trained transformer SAC agents.
 
 Usage:
+    # Single checkpoint
     python evaluate.py --checkpoint runs/.../checkpoints/step_X.pt --layout test_layout --episodes 5
+
+    # Entire checkpoints folder (results as function of training steps)
+    python evaluate.py --checkpoint-dir runs/.../checkpoints/ --layout test_layout --episodes 5
+
+    # Parallel evaluation with multiple workers (uses pathos if available)
+    python evaluate.py --checkpoint-dir runs/.../checkpoints/ --layout test_layout --workers 4
 """
 
 import argparse
+import os
+import re
+from functools import partial
+from pathlib import Path
+
 import numpy as np
 import torch
+import xarray as xr
 import gymnasium as gym
+
+try:
+    from pathos.multiprocessing import ProcessingPool as Pool
+    HAS_PATHOS = True
+except ImportError:
+    from multiprocessing import Pool
+    HAS_PATHOS = False
 
 from transformer_sac_windfarm import TransformerActor
 from helper_funcs import (
@@ -20,6 +40,38 @@ from helper_funcs import (
 from MultiLayoutEnv import MultiLayoutEnv, LayoutConfig
 from WindGym import WindFarmEnv
 from WindGym.wrappers import PerTurbineObservationWrapper
+
+
+def find_checkpoints(checkpoint_dir: str) -> list[tuple[int, str]]:
+    """
+    Find all checkpoint files in a directory and return them sorted by step.
+
+    Args:
+        checkpoint_dir: Path to checkpoints directory
+
+    Returns:
+        List of (step, filepath) tuples sorted by step
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoints = []
+
+    # Look for .pt files with step numbers in the name
+    for filepath in checkpoint_dir.glob("*.pt"):
+        # Try to extract step number from filename (e.g., "step_1000.pt", "checkpoint_1000.pt")
+        match = re.search(r"(?:step|checkpoint)[_-]?(\d+)", filepath.stem, re.IGNORECASE)
+        if match:
+            step = int(match.group(1))
+            checkpoints.append((step, str(filepath)))
+        else:
+            # Try to extract just a number from the filename
+            match = re.search(r"(\d+)", filepath.stem)
+            if match:
+                step = int(match.group(1))
+                checkpoints.append((step, str(filepath)))
+
+    # Sort by step number
+    checkpoints.sort(key=lambda x: x[0])
+    return checkpoints
 
 
 def load_actor_from_checkpoint(checkpoint_path: str, device: torch.device):
@@ -52,12 +104,6 @@ def create_eval_env(layout: str, args: dict, seed: int = 42):
         x_pos, y_pos = get_layout_positions(name, wind_turbine)
         layouts.append(LayoutConfig(name=name, x_pos=x_pos, y_pos=y_pos))
     print("Created layouts:", [l.name for l in layouts])
-
-    # Get layout positions
-    # x_pos, y_pos = get_layout_positions(layout, wind_turbine)
-    # layouts = [LayoutConfig(name=layout, x_pos=x_pos, y_pos=y_pos)]
-
-
 
     # Environment config
     config = make_env_config()
@@ -254,25 +300,281 @@ def evaluate(
     return results
 
 
+def _evaluate_single_checkpoint(checkpoint_info, layout, num_episodes, num_steps, deterministic, seed):
+    """
+    Worker function to evaluate a single checkpoint.
+    Designed to be called in parallel by multiprocessing pool.
+
+    Args:
+        checkpoint_info: Tuple of (step, checkpoint_path)
+        layout: Layout name to evaluate on
+        num_episodes: Number of episodes
+        num_steps: Max steps per episode
+        deterministic: Use deterministic actions
+        seed: Base random seed (will be offset by step for reproducibility)
+
+    Returns:
+        Tuple of (step, results_dict)
+    """
+    step, checkpoint_path = checkpoint_info
+
+    # Use step-based seed offset for reproducibility across parallel runs
+    worker_seed = seed + step % 1000
+
+    try:
+        results = evaluate(
+            checkpoint_path=checkpoint_path,
+            layout=layout,
+            num_episodes=num_episodes,
+            num_steps=num_steps,
+            deterministic=deterministic,
+            seed=worker_seed,
+            verbose=False,
+        )
+        return (step, results, None)
+    except Exception as e:
+        return (step, None, str(e))
+
+
+def evaluate_checkpoint_dir(
+    checkpoint_dir: str,
+    layout: str,
+    num_episodes: int = 5,
+    num_steps: int = 200,
+    deterministic: bool = True,
+    seed: int = 42,
+    output_file: str = None,
+    num_workers: int = 1,
+    verbose: bool = True,
+):
+    """
+    Evaluate all checkpoints in a directory and track results as a function of training steps.
+
+    Args:
+        checkpoint_dir: Path to directory containing checkpoint files
+        layout: Layout name to evaluate on
+        num_episodes: Number of episodes per checkpoint
+        num_steps: Max steps per episode
+        deterministic: Use deterministic actions
+        seed: Random seed
+        output_file: Optional path to save results (JSON format)
+        num_workers: Number of parallel workers (1 = sequential)
+        verbose: Print progress
+
+    Returns:
+        dict with results per checkpoint step
+    """
+    checkpoints = find_checkpoints(checkpoint_dir)
+
+    if not checkpoints:
+        raise ValueError(f"No checkpoint files found in {checkpoint_dir}")
+
+    if verbose:
+        print(f"Found {len(checkpoints)} checkpoints in {checkpoint_dir}")
+        print(f"Steps: {[step for step, _ in checkpoints]}")
+        print(f"Evaluating on layout: {layout}")
+        if num_workers > 1:
+            pool_type = "pathos" if HAS_PATHOS else "multiprocessing"
+            print(f"Using {num_workers} parallel workers ({pool_type})")
+        print("-" * 60)
+
+    all_results = {
+        "checkpoint_dir": checkpoint_dir,
+        "layout": layout,
+        "num_episodes": num_episodes,
+        "num_steps": num_steps,
+        "deterministic": deterministic,
+        "steps": [],
+        "mean_returns": [],
+        "std_returns": [],
+        "mean_lengths": [],
+        "mean_powers": [],
+        "per_checkpoint": [],
+    }
+
+    if num_workers > 1:
+        # Parallel evaluation
+        worker_fn = partial(
+            _evaluate_single_checkpoint,
+            layout=layout,
+            num_episodes=num_episodes,
+            num_steps=num_steps,
+            deterministic=deterministic,
+            seed=seed,
+        )
+
+        with Pool(num_workers) as pool:
+            if HAS_PATHOS:
+                # pathos uses map directly
+                results_list = pool.map(worker_fn, checkpoints)
+            else:
+                # standard multiprocessing
+                results_list = pool.map(worker_fn, checkpoints)
+
+        # Sort results by step and process
+        results_list.sort(key=lambda x: x[0])
+
+        for step, results, error in results_list:
+            if error:
+                if verbose:
+                    print(f"  Step {step}: FAILED - {error}")
+                continue
+
+            all_results["steps"].append(step)
+            all_results["mean_returns"].append(results["mean_return"])
+            all_results["std_returns"].append(results["std_return"])
+            all_results["mean_lengths"].append(results["mean_length"])
+            all_results["mean_powers"].append(results["mean_power"])
+            all_results["per_checkpoint"].append(results)
+
+            if verbose:
+                power_str = f", power={results['mean_power']:.2f}" if results['mean_power'] else ""
+                print(f"  Step {step}: return={results['mean_return']:.2f} +/- {results['std_return']:.2f}{power_str}")
+    else:
+        # Sequential evaluation (original behavior)
+        for i, (step, checkpoint_path) in enumerate(checkpoints):
+            if verbose:
+                print(f"\n[{i+1}/{len(checkpoints)}] Evaluating checkpoint at step {step}")
+
+            results = evaluate(
+                checkpoint_path=checkpoint_path,
+                layout=layout,
+                num_episodes=num_episodes,
+                num_steps=num_steps,
+                deterministic=deterministic,
+                seed=seed,
+                verbose=False,
+            )
+
+            all_results["steps"].append(step)
+            all_results["mean_returns"].append(results["mean_return"])
+            all_results["std_returns"].append(results["std_return"])
+            all_results["mean_lengths"].append(results["mean_length"])
+            all_results["mean_powers"].append(results["mean_power"])
+            all_results["per_checkpoint"].append(results)
+
+            if verbose:
+                power_str = f", power={results['mean_power']:.2f}" if results['mean_power'] else ""
+                print(f"  Step {step}: return={results['mean_return']:.2f} +/- {results['std_return']:.2f}{power_str}")
+
+    # Print summary table
+    if verbose:
+        print("\n" + "=" * 60)
+        print("SUMMARY: Results as a function of training steps")
+        print("=" * 60)
+        print(f"{'Step':>10} | {'Mean Return':>14} | {'Std Return':>12} | {'Mean Power':>12}")
+        print("-" * 60)
+        for i, step in enumerate(all_results["steps"]):
+            power_str = f"{all_results['mean_powers'][i]:.2f}" if all_results['mean_powers'][i] else "N/A"
+            print(f"{step:>10} | {all_results['mean_returns'][i]:>14.2f} | {all_results['std_returns'][i]:>12.2f} | {power_str:>12}")
+        print("=" * 60)
+
+        # Best checkpoint
+        best_idx = np.argmax(all_results["mean_returns"])
+        best_step = all_results["steps"][best_idx]
+        best_return = all_results["mean_returns"][best_idx]
+        print(f"\nBest checkpoint: step {best_step} with mean return {best_return:.2f}")
+
+    # Save results to file if requested
+    if output_file:
+        # Build per-episode returns array (step x episode)
+        episode_returns_2d = np.array([
+            res["episode_returns"] for res in all_results["per_checkpoint"]
+        ])
+        episode_lengths_2d = np.array([
+            res["episode_lengths"] for res in all_results["per_checkpoint"]
+        ])
+
+        # Create xarray Dataset
+        ds = xr.Dataset(
+            data_vars={
+                "mean_return": (["step"], np.array(all_results["mean_returns"])),
+                "std_return": (["step"], np.array(all_results["std_returns"])),
+                "mean_length": (["step"], np.array(all_results["mean_lengths"])),
+                "mean_power": (["step"], np.array([
+                    p if p is not None else np.nan for p in all_results["mean_powers"]
+                ])),
+                "episode_returns": (["step", "episode"], episode_returns_2d),
+                "episode_lengths": (["step", "episode"], episode_lengths_2d),
+            },
+            coords={
+                "step": all_results["steps"],
+                "episode": np.arange(num_episodes),
+            },
+            attrs={
+                "checkpoint_dir": str(all_results["checkpoint_dir"]),
+                "layout": all_results["layout"],
+                "num_episodes": all_results["num_episodes"],
+                "num_steps": all_results["num_steps"],
+                "deterministic": all_results["deterministic"],
+            },
+        )
+
+        # Ensure .nc extension
+        if not output_file.endswith(".nc"):
+            output_file = output_file.rsplit(".", 1)[0] + ".nc" if "." in output_file else output_file + ".nc"
+
+        ds.to_netcdf(output_file)
+        if verbose:
+            print(f"\nResults saved to {output_file}")
+
+    return all_results
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate trained transformer SAC agent")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint file")
+    parser = argparse.ArgumentParser(
+        description="Evaluate trained transformer SAC agent",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Evaluate single checkpoint
+  python evaluate.py --checkpoint runs/exp1/checkpoints/step_10000.pt --layout test_layout
+
+  # Evaluate all checkpoints in a directory (results vs training steps)
+  python evaluate.py --checkpoint-dir runs/exp1/checkpoints/ --layout test_layout
+
+  # Parallel evaluation with 4 workers (requires pathos or uses multiprocessing)
+  python evaluate.py --checkpoint-dir runs/exp1/checkpoints/ --layout test_layout --workers 4
+
+  # Save results to NetCDF file (xarray Dataset)
+  python evaluate.py --checkpoint-dir runs/exp1/checkpoints/ --layout test_layout --output results.nc
+        """,
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--checkpoint", type=str, help="Path to single checkpoint file")
+    group.add_argument("--checkpoint-dir", type=str, help="Path to checkpoints directory (evaluates all)")
     parser.add_argument("--layout", type=str, required=True, help="Layout to evaluate on")
     parser.add_argument("--episodes", type=int, default=5, help="Number of episodes")
     parser.add_argument("--steps", type=int, default=200, help="Max steps per episode")
     parser.add_argument("--deterministic", action="store_true", default=True, help="Use deterministic actions")
     parser.add_argument("--stochastic", action="store_true", help="Use stochastic actions")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--output", type=str, help="Output file path for results (NetCDF format, only for --checkpoint-dir)")
+    parser.add_argument("--workers", type=int, default=1, help="Number of parallel workers for --checkpoint-dir (default: 1)")
 
     args = parser.parse_args()
 
     deterministic = not args.stochastic
 
-    results = evaluate(
-        checkpoint_path=args.checkpoint,
-        layout=args.layout,
-        num_episodes=args.episodes,
-        num_steps=args.steps,
-        deterministic=deterministic,
-        seed=args.seed,
-    )
+    if args.checkpoint_dir:
+        # Evaluate all checkpoints in directory
+        results = evaluate_checkpoint_dir(
+            checkpoint_dir=args.checkpoint_dir,
+            layout=args.layout,
+            num_episodes=args.episodes,
+            num_steps=args.steps,
+            deterministic=deterministic,
+            seed=args.seed,
+            output_file=args.output,
+            num_workers=args.workers,
+        )
+    else:
+        # Evaluate single checkpoint
+        results = evaluate(
+            checkpoint_path=args.checkpoint,
+            layout=args.layout,
+            num_episodes=args.episodes,
+            num_steps=args.steps,
+            deterministic=deterministic,
+            seed=args.seed,
+        )
