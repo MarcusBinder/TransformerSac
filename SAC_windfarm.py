@@ -723,6 +723,16 @@ def main():
             if hasattr(envs, 'mean_power_queue') and len(envs.mean_power_queue) > 0:
                 writer.add_scalar("charts/episodic_power", np.mean(envs.mean_power_queue), global_step)
         
+        # if "final_info" in infos:
+        #     episodes_over = np.nonzero(infos["final_info"]["_episode"])[0]
+        #     episodic_returns = infos["final_info"]["episode"]["r"][episodes_over]
+        #     episodic_lengths = infos["final_info"]["episode"]["l"][episodes_over]
+        #     for episodic_return, episodic_length in zip(episodic_returns, episodic_lengths):
+        #         print(f"global_step={global_step}, episodic_return={episodic_return}")
+        #         writer.add_scalar("charts/episodic_return", episodic_return, global_step)
+        #         writer.add_scalar("charts/episodic_length", episodic_length, global_step)
+
+
         # Track step rewards
         for r in rewards:
             step_reward_window.append(r)
