@@ -266,39 +266,49 @@ class MLPActor(nn.Module):
     def get_action(
         self,
         obs: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
         deterministic: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Sample action from policy.
-        
+
         Args:
             obs: (batch, obs_dim)
+            attention_mask: (batch, max_turbines) boolean mask where True = padding (ignore).
+                           If None, all turbines are considered valid.
             deterministic: If True, return mean action
-        
+
         Returns:
             action: (batch, action_dim)
-            log_prob: (batch, 1)
+            log_prob: (batch, 1) - sum of log probs for VALID turbines only
             mean_action: (batch, action_dim)
         """
         mean, log_std = self.forward(obs)
         std = log_std.exp()
-        
+
         normal = torch.distributions.Normal(mean, std)
         if deterministic:
             x_t = mean
         else:
             x_t = normal.rsample()
-        
+
         y_t = torch.tanh(x_t)
         action = y_t * self.action_scale + self.action_bias
-        
+
         # Log probability with tanh correction
         log_prob = normal.log_prob(x_t)
         log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
+
+        # Mask out padded turbines before summing
+        if attention_mask is not None:
+            # attention_mask: True = padding (ignore), False = valid
+            valid_mask = ~attention_mask  # True = valid turbine
+            log_prob = log_prob * valid_mask.float()  # Zero out padded turbine log probs
+
         log_prob = log_prob.sum(dim=-1, keepdim=True)
-        
+
         mean_action = torch.tanh(mean) * self.action_scale + self.action_bias
-        
+
         return action, log_prob, mean_action
 
 
@@ -744,8 +754,9 @@ def main():
     )
     
     # Entropy tuning
+    # Note: target_entropy is computed per-sample based on actual turbine count
+    # to handle variable-size layouts correctly
     if args.autotune:
-        target_entropy = -action_dim
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
         alpha = log_alpha.exp().item()
         alpha_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
@@ -816,7 +827,8 @@ def main():
             # Sample from policy
             with torch.no_grad():
                 obs_tensor = torch.tensor(obs_flat, device=device, dtype=torch.float32)
-                actions_flat, _, _ = actor.get_action(obs_tensor)
+                mask_tensor = torch.tensor(current_masks, device=device, dtype=torch.bool)
+                actions_flat, _, _ = actor.get_action(obs_tensor, attention_mask=mask_tensor)
                 actions_flat = actions_flat.cpu().numpy()
         
         # Reshape actions for environment
@@ -876,7 +888,9 @@ def main():
                 # Update Critics
                 # ---------------------------------------------------------
                 with torch.no_grad():
-                    next_actions, next_log_pi, _ = actor.get_action(data["next_observations"])
+                    next_actions, next_log_pi, _ = actor.get_action(
+                        data["next_observations"], attention_mask=data["attention_mask"]
+                    )
                     qf1_next = qf1_target(data["next_observations"], next_actions)
                     qf2_next = qf2_target(data["next_observations"], next_actions)
                     min_qf_next = torch.min(qf1_next, qf2_next) - alpha * next_log_pi
@@ -902,11 +916,13 @@ def main():
                 # Update Actor (delayed)
                 # ---------------------------------------------------------
                 if total_gradient_steps % args.policy_frequency == 0:
-                    actions_pi, log_pi, _ = actor.get_action(data["observations"])
+                    actions_pi, log_pi, _ = actor.get_action(
+                        data["observations"], attention_mask=data["attention_mask"]
+                    )
                     qf1_pi = qf1(data["observations"], actions_pi)
                     qf2_pi = qf2(data["observations"], actions_pi)
                     min_qf_pi = torch.min(qf1_pi, qf2_pi)
-                    
+
                     actor_loss = (alpha * log_pi - min_qf_pi).mean()
                     
                     actor_optimizer.zero_grad()
@@ -921,10 +937,18 @@ def main():
                     # Update Alpha
                     if args.autotune:
                         with torch.no_grad():
-                            _, log_pi, _ = actor.get_action(data["observations"])
-                        
-                        alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
-                        
+                            _, log_pi, _ = actor.get_action(
+                                data["observations"], attention_mask=data["attention_mask"]
+                            )
+
+                        # Compute per-sample target entropy based on actual turbine count
+                        # attention_mask: True = padding, False = valid turbine
+                        actual_turbines = (~data["attention_mask"]).sum(dim=-1).float()  # (batch,)
+                        target_entropy = -actual_turbines  # (batch,)
+
+                        # log_pi: (batch, 1), target_entropy: (batch,)
+                        alpha_loss = (-log_alpha.exp() * (log_pi.squeeze(-1) + target_entropy)).mean()
+
                         alpha_optimizer.zero_grad()
                         alpha_loss.backward()
                         alpha_optimizer.step()
@@ -961,10 +985,16 @@ def main():
                 writer.add_scalar("charts/step_reward_mean_1000", mean_reward, global_step)
                 writer.add_scalar("debug/total_gradient_steps", total_gradient_steps, global_step)
                 writer.add_scalar("debug/mean_wind_direction", float(np.mean(wind_dirs)), global_step)
-                
+
+                # Log masking info for multi-layout debugging
+                mean_actual_turbs = float((~data["attention_mask"]).sum(dim=-1).float().mean())
+                writer.add_scalar("debug/mean_actual_turbines", mean_actual_turbs, global_step)
+                if args.autotune:
+                    writer.add_scalar("debug/mean_target_entropy", -mean_actual_turbs, global_step)
+
                 print(f"Step {global_step}: SPS={sps}, qf_loss={qf_loss.item()/2:.4f}, "
                       f"actor_loss={actor_loss.item():.4f}, alpha={alpha:.4f}, "
-                      f"reward_mean={mean_reward:.4f}")
+                      f"reward_mean={mean_reward:.4f}, turbs={mean_actual_turbs:.1f}")
         
         # =====================================================================
         # CHECKPOINTING
