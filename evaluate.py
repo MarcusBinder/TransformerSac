@@ -288,6 +288,7 @@ def evaluate(
         "checkpoint_step": checkpoint["step"],
         "layout": layout,
         "num_episodes": num_episodes,
+        "deterministic": deterministic,
     }
 
     if verbose:
@@ -546,8 +547,7 @@ Examples:
     parser.add_argument("--layout", type=str, required=True, help="Layout to evaluate on")
     parser.add_argument("--episodes", type=int, default=5, help="Number of episodes")
     parser.add_argument("--steps", type=int, default=200, help="Max steps per episode")
-    parser.add_argument("--deterministic", action="store_true", default=True, help="Use deterministic actions")
-    parser.add_argument("--stochastic", action="store_true", help="Use stochastic actions")
+    parser.add_argument("--stochastic", action="store_true", help="Use stochastic actions (default: deterministic)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--output", type=str, help="Output file path for results (NetCDF format, only for --checkpoint-dir)")
     parser.add_argument("--workers", type=int, default=1, help="Number of parallel workers for --checkpoint-dir (default: 1)")
