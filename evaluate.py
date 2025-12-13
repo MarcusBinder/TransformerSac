@@ -155,7 +155,7 @@ def evaluate(
     layout: str,
     num_episodes: int = 5,
     num_steps: int = 200,
-    deterministic: bool = True,
+    deterministic: bool = False,
     seed: int = 42,
     verbose: bool = True,
 ):
@@ -288,7 +288,6 @@ def evaluate(
         "checkpoint_step": checkpoint["step"],
         "layout": layout,
         "num_episodes": num_episodes,
-        "deterministic": deterministic,
     }
 
     if verbose:
@@ -342,7 +341,7 @@ def evaluate_checkpoint_dir(
     layout: str,
     num_episodes: int = 5,
     num_steps: int = 200,
-    deterministic: bool = True,
+    deterministic: bool = False,
     seed: int = 42,
     output_file: str = None,
     num_workers: int = 1,
@@ -384,7 +383,6 @@ def evaluate_checkpoint_dir(
         "layout": layout,
         "num_episodes": num_episodes,
         "num_steps": num_steps,
-        "deterministic": deterministic,
         "steps": [],
         "mean_returns": [],
         "std_returns": [],
@@ -405,12 +403,7 @@ def evaluate_checkpoint_dir(
         )
 
         with Pool(num_workers) as pool:
-            if HAS_PATHOS:
-                # pathos uses map directly
-                results_list = pool.map(worker_fn, checkpoints)
-            else:
-                # standard multiprocessing
-                results_list = pool.map(worker_fn, checkpoints)
+            results_list = pool.map(worker_fn, checkpoints)
 
         # Sort results by step and process
         results_list.sort(key=lambda x: x[0])
@@ -507,7 +500,6 @@ def evaluate_checkpoint_dir(
                 "layout": all_results["layout"],
                 "num_episodes": all_results["num_episodes"],
                 "num_steps": all_results["num_steps"],
-                "deterministic": all_results["deterministic"],
             },
         )
 
@@ -547,14 +539,12 @@ Examples:
     parser.add_argument("--layout", type=str, required=True, help="Layout to evaluate on")
     parser.add_argument("--episodes", type=int, default=5, help="Number of episodes")
     parser.add_argument("--steps", type=int, default=200, help="Max steps per episode")
-    parser.add_argument("--stochastic", action="store_true", help="Use stochastic actions (default: deterministic)")
+    parser.add_argument("--deterministic", action="store_true", help="Use deterministic actions (default: stochastic)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--output", type=str, help="Output file path for results (NetCDF format, only for --checkpoint-dir)")
     parser.add_argument("--workers", type=int, default=1, help="Number of parallel workers for --checkpoint-dir (default: 1)")
 
     args = parser.parse_args()
-
-    deterministic = not args.stochastic
 
     if args.checkpoint_dir:
         # Evaluate all checkpoints in directory
@@ -563,7 +553,7 @@ Examples:
             layout=args.layout,
             num_episodes=args.episodes,
             num_steps=args.steps,
-            deterministic=deterministic,
+            deterministic=args.deterministic,
             seed=args.seed,
             output_file=args.output,
             num_workers=args.workers,
@@ -575,6 +565,6 @@ Examples:
             layout=args.layout,
             num_episodes=args.episodes,
             num_steps=args.steps,
-            deterministic=deterministic,
+            deterministic=args.deterministic,
             seed=args.seed,
         )
