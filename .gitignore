@@ -6,3 +6,4 @@
 */events.*
 runs/
 *.sh
+logs/

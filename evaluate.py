@@ -76,7 +76,7 @@ def find_checkpoints(checkpoint_dir: str) -> list[tuple[int, str]]:
 
 def load_actor_from_checkpoint(checkpoint_path: str, device: torch.device):
     """Load actor network from checkpoint."""
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     args = checkpoint["args"]
 
     # We need obs_dim_per_turbine - will get from env later
@@ -98,12 +98,12 @@ def create_eval_env(layout: str, args: dict, seed: int = 42):
     wind_turbine = WT()
 
     layout_names = [l.strip() for l in layout.split(",")]
-    print("Creating eval env for layouts:", layout_names)
+    # print("Creating eval env for layouts:", layout_names)
     layouts = []
     for name in layout_names:
         x_pos, y_pos = get_layout_positions(name, wind_turbine)
         layouts.append(LayoutConfig(name=name, x_pos=x_pos, y_pos=y_pos))
-    print("Created layouts:", [l.name for l in layouts])
+    # print("Created layouts:", [l.name for l in layouts])
 
     # Environment config
     config = make_env_config()
@@ -157,7 +157,7 @@ def evaluate(
     num_steps: int = 200,
     deterministic: bool = False,
     seed: int = 42,
-    verbose: bool = True,
+    verbose: bool = False,
 ):
     """
     Evaluate a trained agent on a specific layout.
@@ -345,7 +345,7 @@ def evaluate_checkpoint_dir(
     seed: int = 42,
     output_file: str = None,
     num_workers: int = 1,
-    verbose: bool = True,
+    verbose: bool = False,
 ):
     """
     Evaluate all checkpoints in a directory and track results as a function of training steps.
