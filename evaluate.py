@@ -36,52 +36,12 @@ from helper_funcs import (
     make_env_config,
     transform_to_wind_relative,
     EnhancedPerTurbineWrapper,
+    find_checkpoints,
+    load_actor_from_checkpoint,
 )
 from MultiLayoutEnv import MultiLayoutEnv, LayoutConfig
 from WindGym import WindFarmEnv
 from WindGym.wrappers import PerTurbineObservationWrapper
-
-
-def find_checkpoints(checkpoint_dir: str) -> list[tuple[int, str]]:
-    """
-    Find all checkpoint files in a directory and return them sorted by step.
-
-    Args:
-        checkpoint_dir: Path to checkpoints directory
-
-    Returns:
-        List of (step, filepath) tuples sorted by step
-    """
-    checkpoint_dir = Path(checkpoint_dir)
-    checkpoints = []
-
-    # Look for .pt files with step numbers in the name
-    for filepath in checkpoint_dir.glob("*.pt"):
-        # Try to extract step number from filename (e.g., "step_1000.pt", "checkpoint_1000.pt")
-        match = re.search(r"(?:step|checkpoint)[_-]?(\d+)", filepath.stem, re.IGNORECASE)
-        if match:
-            step = int(match.group(1))
-            checkpoints.append((step, str(filepath)))
-        else:
-            # Try to extract just a number from the filename
-            match = re.search(r"(\d+)", filepath.stem)
-            if match:
-                step = int(match.group(1))
-                checkpoints.append((step, str(filepath)))
-
-    # Sort by step number
-    checkpoints.sort(key=lambda x: x[0])
-    return checkpoints
-
-
-def load_actor_from_checkpoint(checkpoint_path: str, device: torch.device):
-    """Load actor network from checkpoint."""
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    args = checkpoint["args"]
-
-    # We need obs_dim_per_turbine - will get from env later
-    # For now return checkpoint and args
-    return checkpoint, args
 
 
 def create_eval_env(layout: str, args: dict, seed: int = 42):
