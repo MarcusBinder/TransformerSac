@@ -56,6 +56,8 @@ class MultiLayoutEnv(gym.Env):
         per_turbine_wrapper: Callable[[gym.Env], gym.Env],
         seed: int = 0,
         pad_value: float = 0.0,
+        shuffle: bool = False,
+        max_turbines: Optional[int] = None,
     ):
         """
         Args:
@@ -66,12 +68,17 @@ class MultiLayoutEnv(gym.Env):
             per_turbine_wrapper: Callable that wraps the env with per-turbine observations.
             seed: Random seed for layout sampling.
             pad_value: Value to use for padding (default: 0.0).
+            shuffle: If True, randomly permute turbine indices on each reset.
+                    This tests whether the model learns spatial relationships
+                    through attention rather than memorizing index-based patterns.
+            max_turbines: Override max turbines for padding. If None, computed from layouts.
+                         Use this to train on small farms but size network for larger farms.
         """
         super().__init__()
-        
+
         if not layouts:
             raise ValueError("Must provide at least one layout configuration")
-        
+
         self.layouts = layouts
         self.layout_names = [l.name for l in layouts]
         self.env_factory = env_factory
@@ -79,14 +86,28 @@ class MultiLayoutEnv(gym.Env):
         self.seed_value = seed
         self.rng = np.random.default_rng(seed)
         self.pad_value = pad_value
-        
-        # Determine max turbines from layouts
-        self.max_turbines = max(l.n_turbines for l in layouts)
+        self.shuffle = shuffle
+
+        # Determine max turbines from layouts (or use override)
+        layout_max = max(l.n_turbines for l in layouts)
+        if max_turbines is not None:
+            # print("Overriding max_turbines for padding")
+            if max_turbines < layout_max:
+                raise ValueError(
+                    f"max_turbines ({max_turbines}) must be >= largest layout ({layout_max})"
+                )
+            self.max_turbines = max_turbines
+        else:
+            self.max_turbines = layout_max
         
         # Initialize with first layout to get observation dimensions
         self.current_layout: LayoutConfig = layouts[0]
         self._current_env: Optional[gym.Env] = None
         self._create_env(self.current_layout)
+        
+        # Initialize permutation arrays (identity until first reset with shuffle)
+        self._perm = np.arange(self.current_layout.n_turbines)
+        self._inv_perm = np.arange(self.current_layout.n_turbines)
         
         # Get observation dimensions from the wrapped env
         sample_obs, _ = self._current_env.reset()
@@ -125,6 +146,10 @@ class MultiLayoutEnv(gym.Env):
         base_env = self.env_factory(layout.x_pos, layout.y_pos)
         self._current_env = self.per_turbine_wrapper(base_env)
         self.current_layout = layout
+        
+        # Reset permutation to identity (will be shuffled on reset if shuffle=True)
+        self._perm = np.arange(layout.n_turbines)
+        self._inv_perm = np.arange(layout.n_turbines)
     
     def _get_rotor_diameter(self) -> float:
         """Get rotor diameter from the current environment."""
@@ -158,17 +183,56 @@ class MultiLayoutEnv(gym.Env):
     # Info Dict Padding (fixes AsyncVectorEnv compatibility)
     # =========================================================================
     
+    # Keys that are known to be per-turbine arrays (shape n_turb,)
+    # These will be padded to max_turbines for consistency across layouts
+    _PER_TURBINE_KEYS = {
+        "yaw angles agent",
+        "Wind speed at turbines",
+        "Wind direction at turbines",
+        "Power pr turbine agent",
+        "Turbine x positions",
+        "Turbine y positions",
+        "Turbulence intensity at turbines",
+        "yaw angles base",
+        "Power pr turbine baseline",
+        "Wind speed at turbines baseline",
+    }
+    
+    # Keys that are per-turbine but flattened with history (shape n_turb * history,)
+    # These need reshaping before padding
+    _PER_TURBINE_HISTORY_KEYS = {
+        "yaw angles measured",
+        "Wind speed at turbines measured",
+        "Wind direction at turbines measured",
+    }
+    
+    # Keys that are 2D time-series arrays (shape T, n_turb)
+    _TIMESERIES_KEYS = {
+        "windspeeds",
+        "winddirs",
+        "yaws",
+        "powers",
+        "baseline_powers",
+        "yaws_baseline",
+        "windspeeds_baseline",
+    }
+    
     def _pad_info(self, info: Dict[str, Any]) -> Dict[str, Any]:
         """
         Handle info dict arrays for AsyncVectorEnv compatibility.
         
-        Uses shape-based detection to identify per-turbine arrays:
-        - Shape (n_turb,) → pad to (max_turb,)
-        - Shape (T, n_turb) → pad to (T, max_turb)
-        - Shape (n_turb * k,) for integer k → reshape, pad, flatten
-        - Other arrays → convert to list (safe fallback)
+        Uses KEY-BASED detection to identify per-turbine arrays for CONSISTENT
+        behavior across different layouts. Shape-based detection caused issues
+        when array lengths coincidentally matched n_turb for some layouts.
         
-        Converting to list prevents AsyncVectorEnv from trying to stack.
+        Strategy:
+        - Known per-turbine keys: pad to max_turbines
+        - Known per-turbine-history keys: reshape, pad, flatten
+        - Known 2D time-series keys: pad second dimension
+        - Everything else: convert to list (safe fallback)
+        
+        Converting to list prevents AsyncVectorEnv from trying to stack arrays
+        with inconsistent shapes.
         """
         padded_info = {}
         n_turb = self.n_turbines
@@ -177,77 +241,67 @@ class MultiLayoutEnv(gym.Env):
             if not isinstance(value, np.ndarray):
                 # Non-arrays pass through unchanged
                 padded_info[key] = value
+            elif key in self._PER_TURBINE_KEYS:
+                # Known per-turbine array: pad to max_turbines
+                padded_info[key] = self._pad_1d_to_max(value)
+            elif key in self._PER_TURBINE_HISTORY_KEYS:
+                # Known flattened per-turbine array with history
+                padded_info[key] = self._pad_flattened_per_turbine(value, n_turb)
+            elif key in self._TIMESERIES_KEYS and value.ndim == 2:
+                # Known 2D time-series: pad second dimension
+                padded_info[key] = self._pad_2d_timeseries(value)
             else:
-                # Try to pad based on shape, fall back to list if can't
-                padded_info[key] = self._pad_or_convert(value, n_turb)
+                # Unknown array: convert to list for safe fallback
+                # This ensures consistent behavior across layouts
+                padded_info[key] = value.tolist()
                 
         return padded_info
     
-    def _pad_or_convert(self, arr: np.ndarray, n_turb: int) -> Any:
-        """
-        Attempt to pad array if it's a per-turbine array, otherwise convert to list.
-        
-        Returns padded numpy array if padding is possible, otherwise a Python list.
-        """
-        if arr.ndim == 1:
-            return self._handle_1d_array(arr, n_turb)
-        elif arr.ndim == 2:
-            return self._handle_2d_array(arr, n_turb)
-        else:
-            # Higher dimensional arrays: convert to list
-            return arr.tolist()
+    def _pad_1d_to_max(self, arr: np.ndarray) -> np.ndarray:
+        """Pad 1D array from (n_turb,) to (max_turbines,)."""
+        if arr.shape[0] >= self.max_turbines:
+            return arr[:self.max_turbines]  # Truncate if somehow larger
+        pad_width = self.max_turbines - arr.shape[0]
+        return np.pad(arr, (0, pad_width), constant_values=self.pad_value)
     
-    def _handle_1d_array(self, arr: np.ndarray, n_turb: int) -> Any:
-        """Handle 1D arrays - either pad or convert to list."""
+    def _pad_flattened_per_turbine(self, arr: np.ndarray, n_turb: int) -> np.ndarray:
+        """
+        Pad flattened per-turbine array from (n_turb * features,) to (max_turb * features,).
+        """
+        if arr.ndim != 1 or len(arr) == 0:
+            return arr.tolist()  # Fallback
+            
         arr_len = arr.shape[0]
+        if arr_len % n_turb != 0:
+            return arr.tolist()  # Can't reshape, fallback
+            
+        features_per_turb = arr_len // n_turb
         
-        if arr_len == n_turb:
-            # Simple per-turbine array: (n_turb,) → (max_turb,)
-            if n_turb < self.max_turbines:
-                pad_width = self.max_turbines - n_turb
-                return np.pad(arr, (0, pad_width), constant_values=self.pad_value)
-            return arr
-            
-        elif arr_len > n_turb and arr_len % n_turb == 0:
-            # Flattened per-turbine array: (n_turb * features,) → (max_turb * features,)
-            features_per_turb = arr_len // n_turb
-            
-            # Reshape to (n_turb, features)
-            reshaped = arr.reshape(n_turb, features_per_turb)
-            
-            # Pad in turbine dimension
-            if n_turb < self.max_turbines:
-                pad_width = self.max_turbines - n_turb
-                padded = np.pad(reshaped, ((0, pad_width), (0, 0)), 
-                               constant_values=self.pad_value)
-            else:
-                padded = reshaped
-            
-            # Flatten back to 1D
-            return padded.flatten()
+        # Reshape to (n_turb, features)
+        reshaped = arr.reshape(n_turb, features_per_turb)
+        
+        # Pad in turbine dimension
+        if n_turb < self.max_turbines:
+            pad_width = self.max_turbines - n_turb
+            padded = np.pad(reshaped, ((0, pad_width), (0, 0)), 
+                           constant_values=self.pad_value)
         else:
-            # Unknown structure: convert to list
-            return arr.tolist()
+            padded = reshaped[:self.max_turbines]  # Truncate if larger
+        
+        # Flatten back to 1D
+        return padded.flatten()
     
-    def _handle_2d_array(self, arr: np.ndarray, n_turb: int) -> Any:
-        """Handle 2D arrays - either pad or convert to list."""
-        # Check if second dimension matches n_turb: (T, n_turb)
-        if arr.shape[1] == n_turb:
-            if n_turb < self.max_turbines:
-                pad_width = self.max_turbines - n_turb
-                return np.pad(arr, ((0, 0), (0, pad_width)), constant_values=self.pad_value)
-            return arr
-        
-        # Check if first dimension matches n_turb: (n_turb, features)
-        elif arr.shape[0] == n_turb:
-            if n_turb < self.max_turbines:
-                pad_width = self.max_turbines - n_turb
-                return np.pad(arr, ((0, pad_width), (0, 0)), constant_values=self.pad_value)
-            return arr
-        
-        else:
-            # Unknown structure: convert to list
-            return arr.tolist()
+    def _pad_2d_timeseries(self, arr: np.ndarray) -> np.ndarray:
+        """Pad 2D time-series array from (T, n_turb) to (T, max_turbines)."""
+        if arr.ndim != 2:
+            return arr.tolist()  # Fallback
+            
+        n_turb_actual = arr.shape[1]
+        if n_turb_actual >= self.max_turbines:
+            return arr[:, :self.max_turbines]  # Truncate if larger
+            
+        pad_width = self.max_turbines - n_turb_actual
+        return np.pad(arr, ((0, 0), (0, pad_width)), constant_values=self.pad_value)
     
     # =========================================================================
     # Properties
@@ -272,24 +326,37 @@ class MultiLayoutEnv(gym.Env):
     def turbine_positions(self) -> np.ndarray:
         """
         Padded turbine positions (max_turbines, 2).
+        Positions are shuffled if shuffle=True to match observation order.
         Padding positions are zeros.
         """
         actual = np.column_stack([
             self.current_layout.x_pos,
             self.current_layout.y_pos
         ])
+        # Apply shuffle to match observation order
+        actual = actual[self._perm]
         padded = np.zeros((self.max_turbines, 2), dtype=np.float32)
         padded[:self.n_turbines] = actual
         return padded
     
     @property
     def x_pos(self) -> np.ndarray:
-        """X positions of turbines (not padded)."""
-        return self.current_layout.x_pos
+        """X positions of turbines (shuffled if shuffle=True, not padded)."""
+        return self.current_layout.x_pos[self._perm]
     
     @property
     def y_pos(self) -> np.ndarray:
-        """Y positions of turbines (not padded)."""
+        """Y positions of turbines (shuffled if shuffle=True, not padded)."""
+        return self.current_layout.y_pos[self._perm]
+    
+    @property
+    def x_pos_original(self) -> np.ndarray:
+        """Original (unshuffled) X positions of turbines."""
+        return self.current_layout.x_pos
+    
+    @property
+    def y_pos_original(self) -> np.ndarray:
+        """Original (unshuffled) Y positions of turbines."""
         return self.current_layout.y_pos
     
     @property
@@ -312,6 +379,33 @@ class MultiLayoutEnv(gym.Env):
     def is_multi_layout(self) -> bool:
         """Whether this environment has multiple layout options."""
         return len(self.layouts) > 1
+    
+    @property
+    def is_shuffled(self) -> bool:
+        """Whether turbine indices are currently shuffled."""
+        return self.shuffle and not np.array_equal(self._perm, np.arange(self.n_turbines))
+    
+    @property
+    def current_permutation(self) -> np.ndarray:
+        """
+        Current turbine permutation array.
+        
+        Maps from shuffled index to original index:
+        original_idx = current_permutation[shuffled_idx]
+        
+        If shuffle=False, this is identity [0, 1, 2, ...].
+        """
+        return self._perm.copy()
+    
+    @property
+    def inverse_permutation(self) -> np.ndarray:
+        """
+        Inverse permutation array.
+        
+        Maps from original index to shuffled index:
+        shuffled_idx = inverse_permutation[original_idx]
+        """
+        return self._inv_perm.copy()
     
     # =========================================================================
     # Core Methods
@@ -363,11 +457,22 @@ class MultiLayoutEnv(gym.Env):
         if new_layout.name != self.current_layout.name:
             self._create_env(new_layout)
         
+        # Generate new shuffle permutation if shuffle is enabled
+        if self.shuffle:
+            self._perm = self.rng.permutation(self.n_turbines)
+            self._inv_perm = np.argsort(self._perm)
+        else:
+            self._perm = np.arange(self.n_turbines)
+            self._inv_perm = np.arange(self.n_turbines)
+        
         # Update attention mask for current layout
         self._attention_mask = self._compute_attention_mask()
         
         # Reset the underlying environment
         obs, info = self._current_env.reset(seed=seed, options=options)
+        
+        # Apply shuffle to observation (permute turbine dimension)
+        obs = obs[self._perm]
         
         # Pad observation
         padded_obs = self._pad_observation(obs)
@@ -380,6 +485,12 @@ class MultiLayoutEnv(gym.Env):
         info['layout'] = self.current_layout.name
         info['attention_mask'] = self._attention_mask.copy()
         info['max_turbines'] = self.max_turbines
+        if self.shuffle:
+            # Pad turbine_permutation to max_turbines for AsyncVectorEnv compatibility
+            # Use -1 for padding values (valid indices are 0 to n_turbines-1)
+            padded_perm = np.full(self.max_turbines, -1, dtype=np.int64)
+            padded_perm[:self.n_turbines] = self._perm
+            info['turbine_permutation'] = padded_perm
         
         return padded_obs, info
     
@@ -403,7 +514,14 @@ class MultiLayoutEnv(gym.Env):
         # Only use actions for real turbines (ignore padding actions)
         real_action = action[:self.n_turbines]
         
-        obs, reward, terminated, truncated, info = self._current_env.step(real_action)
+        # Unshuffle action to match underlying env's turbine order
+        # If shuffle is off, _inv_perm is identity so this is a no-op
+        unshuffled_action = real_action[self._inv_perm]
+        
+        obs, reward, terminated, truncated, info = self._current_env.step(unshuffled_action)
+        
+        # Apply shuffle to observation (permute turbine dimension)
+        obs = obs[self._perm]
         
         # Pad observation
         padded_obs = self._pad_observation(obs)
@@ -466,6 +584,7 @@ def make_multi_layout_env(
     base_env_kwargs: Dict[str, Any],
     per_turbine_wrapper_class,
     seed: int = 0,
+    shuffle: bool = False,
 ) -> MultiLayoutEnv:
     """
     Create a MultiLayoutEnv with the given configuration.
@@ -478,6 +597,7 @@ def make_multi_layout_env(
         base_env_kwargs: Kwargs to pass to WindFarmEnv (excluding x_pos, y_pos)
         per_turbine_wrapper_class: The wrapper class for per-turbine observations
         seed: Random seed
+        shuffle: If True, randomly permute turbine indices on each reset
     
     Returns:
         MultiLayoutEnv instance
@@ -493,12 +613,14 @@ def make_multi_layout_env(
         env_factory=env_factory,
         per_turbine_wrapper=per_turbine_wrapper_class,
         seed=seed,
+        shuffle=shuffle,
     )
 
 
 # =============================================================================
 # Testing
 # =============================================================================
+
 
 def test_multi_layout_env():
     """Test the MultiLayoutEnv wrapper."""
@@ -518,8 +640,26 @@ def test_multi_layout_env():
     
     print(f"  Layout 1: {layout1.name} with {layout1.n_turbines} turbines")
     print(f"  Layout 2: {layout2.name} with {layout2.n_turbines} turbines")
-    print(f"  This test requires the actual WindGym environment to run fully.")
-    print("  ✓ MultiLayoutEnv structure is correct!")
+    
+    # Test shuffle logic (without actual env)
+    print("\n  Testing shuffle permutation logic...")
+    rng = np.random.default_rng(42)
+    n = 5
+    perm = rng.permutation(n)
+    inv_perm = np.argsort(perm)
+    
+    # Verify inverse permutation works
+    original = np.array([10, 20, 30, 40, 50])
+    shuffled = original[perm]
+    unshuffled = shuffled[inv_perm]
+    assert np.array_equal(original, unshuffled), "Inverse permutation failed!"
+    print(f"    Original:   {original}")
+    print(f"    Shuffled:   {shuffled}")
+    print(f"    Unshuffled: {unshuffled}")
+    print("    OK: Permutation/inverse permutation works correctly!")
+    
+    print("\n  This test requires the actual WindGym environment to run fully.")
+    print("  OK: MultiLayoutEnv structure is correct!")
 
 
 if __name__ == "__main__":

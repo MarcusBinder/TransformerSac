@@ -4,3 +4,6 @@
 /wandb
 *events*
 */events.*
+runs/
+*.sh
+logs/

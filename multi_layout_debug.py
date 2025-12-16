@@ -704,11 +704,15 @@ class MultiLayoutDebugLogger:
         grad_norms = {}
         
         for name, qf in [("qf1", qf1), ("qf2", qf2)]:
-            if hasattr(qf, 'obs_action_encoder'):
+            if hasattr(qf, 'obs_action_encoder') and qf.obs_action_encoder is not None:
                 grad_norms[f"{name}/obs_action_encoder"] = self._compute_grad_norm(qf.obs_action_encoder)
-            if hasattr(qf, 'transformer'):
+            if hasattr(qf, 'pos_encoder') and qf.pos_encoder is not None:
+                grad_norms[f"{name}/pos_encoder"] = self._compute_grad_norm(qf.pos_encoder)
+            if hasattr(qf, 'rel_pos_bias') and qf.rel_pos_bias is not None:
+                grad_norms[f"{name}/rel_pos_bias"] = self._compute_grad_norm(qf.rel_pos_bias)
+            if hasattr(qf, 'transformer') and qf.transformer is not None:
                 grad_norms[f"{name}/transformer"] = self._compute_grad_norm(qf.transformer)
-            if hasattr(qf, 'q_head'):
+            if hasattr(qf, 'q_head') and qf.q_head is not None:
                 grad_norms[f"{name}/q_head"] = self._compute_grad_norm(qf.q_head)
             grad_norms[f"{name}/total"] = self._compute_grad_norm(qf)
         
@@ -735,11 +739,13 @@ class MultiLayoutDebugLogger:
         grad_norms = {}
         
         # Actor components
-        if hasattr(actor, 'obs_encoder'):
+        if hasattr(actor, 'obs_encoder') and actor.obs_encoder is not None:
             grad_norms["actor/obs_encoder"] = self._compute_grad_norm(actor.obs_encoder)
-        if hasattr(actor, 'pos_encoder'):
+        if hasattr(actor, 'pos_encoder') and actor.pos_encoder is not None:
             grad_norms["actor/pos_encoder"] = self._compute_grad_norm(actor.pos_encoder)
-        if hasattr(actor, 'transformer'):
+        if hasattr(actor, 'rel_pos_bias') and actor.rel_pos_bias is not None:
+            grad_norms["actor/rel_pos_bias"] = self._compute_grad_norm(actor.rel_pos_bias)
+        if hasattr(actor, 'transformer') and actor.transformer is not None:
             grad_norms["actor/transformer"] = self._compute_grad_norm(actor.transformer)
         
         # Actor action heads
