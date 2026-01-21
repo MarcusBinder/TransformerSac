@@ -1,0 +1,10 @@
+
+/__pycache__
+*.nc
+/wandb
+*events*
+*/events.*
+runs/
+*.sh
+logs/
+/runs
