@@ -26,10 +26,23 @@ class LayoutConfig:
     name: str
     x_pos: np.ndarray
     y_pos: np.ndarray
+    receptivity_profiles: Optional[np.ndarray] = None  # Shape: (n_turbines, n_directions)
+    influence_profiles: Optional[np.ndarray] = None  # Shape: (n_turbines, n_directions)
     
     @property
     def n_turbines(self) -> int:
         return len(self.x_pos)
+
+
+    @property
+    def has_profiles(self) -> bool: # If we have one, we have both
+        return self.receptivity_profiles is not None
+    
+    @property
+    def n_profile_directions(self) -> int:
+        if self.receptivity_profiles is None:
+            return 0
+        return self.receptivity_profiles.shape[1]
 
 
 class MultiLayoutEnv(gym.Env):
@@ -138,6 +151,7 @@ class MultiLayoutEnv(gym.Env):
     
     def _create_env(self, layout: LayoutConfig) -> None:
         """Create a new environment for the given layout."""
+        # print(f"We call _create_env with layout: {layout.name}")
         # Close existing environment if any
         if self._current_env is not None:
             self._current_env.close()
@@ -407,6 +421,68 @@ class MultiLayoutEnv(gym.Env):
         """
         return self._inv_perm.copy()
     
+    @property
+    def receptivity_profiles(self) -> Optional[np.ndarray]:
+        """
+        Padded receptivity profiles for current layout.
+        
+        Returns:
+            Shape (max_turbines, n_directions) with padding rows as zeros,
+            or None if profiles not available.
+            Profiles are shuffled to match observation order if shuffle=True.
+        """
+        if not self.current_layout.has_profiles:
+            return None
+            
+        profiles = self.current_layout.receptivity_profiles
+        
+        # Apply shuffle to match observation order
+        profiles = profiles[self._perm]
+        
+        # Pad to max_turbines
+        n_dirs = profiles.shape[1]
+        padded = np.zeros((self.max_turbines, n_dirs), dtype=np.float32)
+        padded[:self.n_turbines] = profiles
+        
+        return padded
+
+    @property
+    def influence_profiles(self) -> Optional[np.ndarray]:
+        """
+        Padded influence profiles for current layout.
+        
+        Returns:
+            Shape (max_turbines, n_directions) with padding rows as zeros,
+            or None if profiles not available.
+            Profiles are shuffled to match observation order if shuffle=True.
+        """
+        if not self.current_layout.has_profiles:
+            return None
+            
+        profiles = self.current_layout.influence_profiles
+        
+        # Apply shuffle to match observation order
+        profiles = profiles[self._perm]
+        
+        # Pad to max_turbines
+        n_dirs = profiles.shape[1]
+        padded = np.zeros((self.max_turbines, n_dirs), dtype=np.float32)
+        padded[:self.n_turbines] = profiles
+        
+        return padded
+
+    @property
+    def n_profile_directions(self) -> int:
+        """Number of directions in receptivity profiles (typically 360)."""
+        if self.current_layout.has_profiles:
+            return self.current_layout.n_profile_directions
+        return 0
+    
+    @property
+    def has_receptivity_profiles(self) -> bool:
+        """Whether current layout has receptivity profiles."""
+        return self.current_layout.has_profiles
+
     # =========================================================================
     # Core Methods
     # =========================================================================
@@ -455,10 +531,12 @@ class MultiLayoutEnv(gym.Env):
         
         # Only reinitialize if layout changed (optimization for single-layout case)
         if new_layout.name != self.current_layout.name:
+            # print(f"Resetting environment with layout: {new_layout.name}")
             self._create_env(new_layout)
         
         # Generate new shuffle permutation if shuffle is enabled
         if self.shuffle:
+            # print("Shuffling turbine indices on reset")
             self._perm = self.rng.permutation(self.n_turbines)
             self._inv_perm = np.argsort(self._perm)
         else:
@@ -486,6 +564,7 @@ class MultiLayoutEnv(gym.Env):
         info['attention_mask'] = self._attention_mask.copy()
         info['max_turbines'] = self.max_turbines
         if self.shuffle:
+            # print("Adding turbine_permutation to info dict")
             # Pad turbine_permutation to max_turbines for AsyncVectorEnv compatibility
             # Use -1 for padding values (valid indices are 0 to n_turbines-1)
             padded_perm = np.full(self.max_turbines, -1, dtype=np.int64)
@@ -552,115 +631,65 @@ class MultiLayoutEnv(gym.Env):
         if self._current_env is not None:
             return self._current_env.render()
         return None
-
-
+    
 # =============================================================================
 # Factory Functions
 # =============================================================================
 
-def create_layout_configs(
-    layout_names: List[str],
-    layout_generator: Callable[[str], Tuple[np.ndarray, np.ndarray]]
-) -> List[LayoutConfig]:
-    """
-    Create LayoutConfig objects from layout names.
+# def create_layout_configs(
+#     layout_names: List[str],
+#     layout_generator: Callable[[str], Tuple[np.ndarray, np.ndarray]]
+# ) -> List[LayoutConfig]:
+#     """
+#     Create LayoutConfig objects from layout names.
     
-    Args:
-        layout_names: List of layout identifier strings (e.g., ["square_1", "circular_1"])
-        layout_generator: Function that takes a layout name and returns (x_pos, y_pos)
+#     Args:
+#         layout_names: List of layout identifier strings (e.g., ["square_1", "circular_1"])
+#         layout_generator: Function that takes a layout name and returns (x_pos, y_pos)
     
-    Returns:
-        List of LayoutConfig objects
-    """
-    configs = []
-    for name in layout_names:
-        x_pos, y_pos = layout_generator(name)
-        configs.append(LayoutConfig(name=name, x_pos=x_pos, y_pos=y_pos))
-    return configs
+#     Returns:
+#         List of LayoutConfig objects
+#     """
+#     configs = []
+#     for name in layout_names:
+#         x_pos, y_pos = layout_generator(name)
+#         configs.append(LayoutConfig(name=name, x_pos=x_pos, y_pos=y_pos))
+#     return configs
 
 
-def make_multi_layout_env(
-    layouts: List[LayoutConfig],
-    base_env_kwargs: Dict[str, Any],
-    per_turbine_wrapper_class,
-    seed: int = 0,
-    shuffle: bool = False,
-) -> MultiLayoutEnv:
-    """
-    Create a MultiLayoutEnv with the given configuration.
+# def make_multi_layout_env(
+#     layouts: List[LayoutConfig],
+#     base_env_kwargs: Dict[str, Any],
+#     per_turbine_wrapper_class,
+#     seed: int = 0,
+#     shuffle: bool = False,
+# ) -> MultiLayoutEnv:
+#     """
+#     Create a MultiLayoutEnv with the given configuration.
     
-    This is a convenience factory function that creates the env_factory callable
-    from base_env_kwargs and WindFarmEnv.
+#     This is a convenience factory function that creates the env_factory callable
+#     from base_env_kwargs and WindFarmEnv.
     
-    Args:
-        layouts: List of LayoutConfig objects
-        base_env_kwargs: Kwargs to pass to WindFarmEnv (excluding x_pos, y_pos)
-        per_turbine_wrapper_class: The wrapper class for per-turbine observations
-        seed: Random seed
-        shuffle: If True, randomly permute turbine indices on each reset
+#     Args:
+#         layouts: List of LayoutConfig objects
+#         base_env_kwargs: Kwargs to pass to WindFarmEnv (excluding x_pos, y_pos)
+#         per_turbine_wrapper_class: The wrapper class for per-turbine observations
+#         seed: Random seed
+#         shuffle: If True, randomly permute turbine indices on each reset
     
-    Returns:
-        MultiLayoutEnv instance
-    """
-    # Import here to avoid circular imports
-    from windgym.WindGym import WindFarmEnv
+#     Returns:
+#         MultiLayoutEnv instance
+#     """
+#     # Import here to avoid circular imports
+#     from windgym.WindGym import WindFarmEnv
     
-    def env_factory(x_pos: np.ndarray, y_pos: np.ndarray) -> gym.Env:
-        return WindFarmEnv(x_pos=x_pos, y_pos=y_pos, **base_env_kwargs)
+#     def env_factory(x_pos: np.ndarray, y_pos: np.ndarray) -> gym.Env:
+#         return WindFarmEnv(x_pos=x_pos, y_pos=y_pos, **base_env_kwargs)
     
-    return MultiLayoutEnv(
-        layouts=layouts,
-        env_factory=env_factory,
-        per_turbine_wrapper=per_turbine_wrapper_class,
-        seed=seed,
-        shuffle=shuffle,
-    )
-
-
-# =============================================================================
-# Testing
-# =============================================================================
-
-
-def test_multi_layout_env():
-    """Test the MultiLayoutEnv wrapper."""
-    print("Testing MultiLayoutEnv...")
-    
-    # Create mock layouts
-    layout1 = LayoutConfig(
-        name="small",
-        x_pos=np.array([0, 500, 1000]),
-        y_pos=np.array([0, 0, 0])
-    )
-    layout2 = LayoutConfig(
-        name="large", 
-        x_pos=np.array([0, 500, 1000, 1500, 2000]),
-        y_pos=np.array([0, 0, 0, 0, 0])
-    )
-    
-    print(f"  Layout 1: {layout1.name} with {layout1.n_turbines} turbines")
-    print(f"  Layout 2: {layout2.name} with {layout2.n_turbines} turbines")
-    
-    # Test shuffle logic (without actual env)
-    print("\n  Testing shuffle permutation logic...")
-    rng = np.random.default_rng(42)
-    n = 5
-    perm = rng.permutation(n)
-    inv_perm = np.argsort(perm)
-    
-    # Verify inverse permutation works
-    original = np.array([10, 20, 30, 40, 50])
-    shuffled = original[perm]
-    unshuffled = shuffled[inv_perm]
-    assert np.array_equal(original, unshuffled), "Inverse permutation failed!"
-    print(f"    Original:   {original}")
-    print(f"    Shuffled:   {shuffled}")
-    print(f"    Unshuffled: {unshuffled}")
-    print("    OK: Permutation/inverse permutation works correctly!")
-    
-    print("\n  This test requires the actual WindGym environment to run fully.")
-    print("  OK: MultiLayoutEnv structure is correct!")
-
-
-if __name__ == "__main__":
-    test_multi_layout_env()
+#     return MultiLayoutEnv(
+#         layouts=layouts,
+#         env_factory=env_factory,
+#         per_turbine_wrapper=per_turbine_wrapper_class,
+#         seed=seed,
+#         shuffle=shuffle,
+#     )

@@ -423,19 +423,69 @@ def get_layout_positions(layout_type: str, wind_turbine) -> Tuple[np.ndarray, np
     return layouts[layout_type]()
 
 
-def get_env_wind_directions(envs, num_envs: int) -> np.ndarray:
+def get_env_wind_directions(envs) -> np.ndarray:
     """Get current wind direction from each environment."""
     return np.array(envs.env.get_attr('wd'), dtype=np.float32)
 
 
-def get_env_raw_positions(envs, num_envs: int, n_turbines_max: int) -> np.ndarray:
+def get_env_raw_positions(envs) -> np.ndarray:
     """Get raw (unnormalized) turbine positions from each environment."""
     return np.array(envs.env.get_attr('turbine_positions'), dtype=np.float32)
 
+def get_env_receptivity_profiles(envs) -> np.ndarray:
+    """Get receptivity profiles from vectorized environments.
+    Returns:
+        Shape (num_envs, max_turbines, n_directions)
+    """
+    if envs.env.get_attr('receptivity_profiles')[0] is None:
+        print("The receptivity profiles are None")
+        print("I dont know if this will cause issues later, so be careful")
+    return np.array(envs.env.get_attr('receptivity_profiles'), dtype=np.float32)
 
-def get_env_attention_masks(envs, num_envs: int, n_turbines_max: int) -> np.ndarray:
+def get_env_influence_profiles(envs) -> np.ndarray:
+    """Get influence profiles from vectorized environments.
+    Returns:
+        Shape (num_envs, max_turbines, n_directions)
+    """
+    if envs.env.get_attr('influence_profiles')[0] is None:
+        print("The influence profiles are None")
+        print("I dont know if this will cause issues later, so be careful")
+    return np.array(envs.env.get_attr('influence_profiles'), dtype=np.float32)
+
+
+def get_env_attention_masks(envs) -> np.ndarray:
     """Get attention masks from each environment."""
     return np.array(envs.env.get_attr('attention_mask'), dtype=bool)
+
+def rotate_profiles_tensor(
+    profiles: torch.Tensor,
+    wind_directions: torch.Tensor,
+    # n_directions: int = 360
+) -> torch.Tensor:
+    """
+    Rotate profiles so current wind direction is at index 0.
+    
+    Args:
+        profiles: (batch, max_turb, n_directions)
+        wind_directions: (batch,) wind directions in degrees
+        n_directions: Number of directions in profile
+    
+    Returns:
+        Rotated profiles with same shape
+    """
+    batch_size = profiles.shape[0]
+    n_directions = profiles.shape[2]
+    degrees_per_index = 360.0 / n_directions
+    
+    # Calculate shifts
+    shifts = (wind_directions / degrees_per_index).round().long()
+    
+    # Roll each sample individually (torch.roll doesn't support per-sample shifts)
+    rotated = torch.empty_like(profiles)
+    for i in range(batch_size):
+        rotated[i] = torch.roll(profiles[i], shifts=-shifts[i].item(), dims=-1)
+    
+    return rotated
 
 def save_checkpoint(
     actor: nn.Module,

@@ -16,7 +16,7 @@ from torch.utils.tensorboard import SummaryWriter
 from collections import deque
 
 
-class AbsolutePositionalEncoding(nn.Module):
+class AbsolutePositionalEncoding(nn.Module): # I dont like this one
     """
     Original absolute positional encoding for turbine (x, y) coordinates.
     
@@ -52,7 +52,7 @@ class AbsolutePositionalEncoding(nn.Module):
         """
         return self.encoder(positions)
 
-class RelativePositionalBias(nn.Module):
+class RelativePositionalBias(nn.Module): # This is okay
     """
     Relative positional bias for attention.
     
@@ -154,7 +154,7 @@ class RelativePositionalBias(nn.Module):
         
         return bias
 
-class Sinusoidal2DPositionalEncoding(nn.Module):
+class Sinusoidal2DPositionalEncoding(nn.Module): # I dont like this one
     """
     Sinusoidal positional encoding extended to 2D coordinates.
     
@@ -210,7 +210,7 @@ class Sinusoidal2DPositionalEncoding(nn.Module):
         
         return self.proj(raw_embeddings)
 
-class PolarPositionalEncoding(nn.Module):
+class PolarPositionalEncoding(nn.Module): # I dont like this one
     """
     Positional encoding using polar coordinates (r, θ).
     
@@ -263,7 +263,7 @@ class PolarPositionalEncoding(nn.Module):
         
         return self.encoder(polar_features)
 
-class RelativePolarBias(nn.Module):
+class RelativePolarBias(nn.Module): # This is okay
     """
     Relative positional bias using polar coordinates.
     
@@ -352,7 +352,7 @@ class RelativePolarBias(nn.Module):
         
         return bias
 
-class ALiBiPositionalBias(nn.Module):
+class ALiBiPositionalBias(nn.Module): # Did not show good perforamnce in inital testing.
     """
     Attention with Linear Biases (ALiBi) for 2D spatial positions.
     
@@ -733,3 +733,48 @@ class RoPEMultiheadAttention(nn.Module):
         
         return output, attn_weights
 
+class PyWakeProfileEncoder(nn.Module):
+    """Simpler CNN encoder for PyWake profiles."""
+    
+    def __init__(
+        self,
+        embed_dim: int = 128,
+        hidden_channels: int = 64,
+    ):
+        super().__init__()
+        
+        self.encoder = nn.Sequential(
+            # Layer 1: capture local patterns
+            nn.Conv1d(1, hidden_channels, kernel_size=9, padding=4, padding_mode='circular'),
+            nn.ReLU(),
+            nn.MaxPool1d(4),  # 360 → 90
+            # MaxPool: Takes every 4 values and keeps the max. Reduces angular resolution from 360 to 90 (now each "position" represents ~4 degrees).
+            
+            # Layer 2: broader patterns
+            nn.Conv1d(hidden_channels, hidden_channels * 2, kernel_size=7, padding=3, padding_mode='circular'),
+            nn.ReLU(),
+            nn.MaxPool1d(3),  # 90 → 30
+            
+            # Layer 3: global patterns
+            nn.Conv1d(hidden_channels * 2, hidden_channels * 4, kernel_size=5, padding=2, padding_mode='circular'),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1),  # 30 → 1
+        )
+        
+        self.output_proj = nn.Linear(hidden_channels * 4, embed_dim)
+    
+    def forward(self, profiles: torch.Tensor) -> torch.Tensor:
+        batch_size, n_turbines, n_dirs = profiles.shape
+        
+        # (batch * n_turbines, 1, n_directions)
+        x = profiles.view(batch_size * n_turbines, 1, n_dirs)
+        
+        # CNN encoding
+        x = self.encoder(x)  # (batch * n_turbines, hidden * 4, 1)
+        x = x.squeeze(-1)     # (batch * n_turbines, hidden * 4)
+        
+        # Project to embed_dim
+        x = self.output_proj(x)
+        
+        # Reshape: (batch, n_turbines, embed_dim)
+        return x.view(batch_size, n_turbines, -1)
