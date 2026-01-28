@@ -36,32 +36,12 @@ import gymnasium as gym
 from typing import Dict, List, Any, Optional, Callable, Tuple
 from dataclasses import dataclass
 from collections import defaultdict
-
+from agent import WindFarmAgent
 from MultiLayoutEnv import MultiLayoutEnv, LayoutConfig
 from helper_funcs import (
     get_layout_positions,
     transform_to_wind_relative,
 )
-
-
-# =============================================================================
-# LOCAL HELPER FUNCTIONS
-# =============================================================================
-# These work directly with vectorized envs (without RecordEpisodeVals wrapper)
-
-def _get_env_wind_directions(envs: gym.vector.VectorEnv, num_envs: int) -> np.ndarray:
-    """Get current wind direction from each environment."""
-    return np.array(envs.get_attr('wd'), dtype=np.float32)
-
-
-def _get_env_raw_positions(envs: gym.vector.VectorEnv, num_envs: int, n_turbines_max: int) -> np.ndarray:
-    """Get raw (unnormalized) turbine positions from each environment."""
-    return np.array(envs.get_attr('turbine_positions'), dtype=np.float32)
-
-
-def _get_env_attention_masks(envs: gym.vector.VectorEnv, num_envs: int, n_turbines_max: int) -> np.ndarray:
-    """Get attention masks from each environment."""
-    return np.array(envs.get_attr('attention_mask'), dtype=bool)
 
 
 @dataclass
@@ -120,7 +100,7 @@ class PolicyEvaluator:
     
     def __init__(
         self,
-        actor: nn.Module,
+        agent: WindFarmAgent,  # Changed from actor
         eval_layouts: List[str],
         env_factory: Callable[[np.ndarray, np.ndarray], gym.Env],
         combined_wrapper: Callable[[gym.Env], gym.Env],
@@ -136,7 +116,7 @@ class PolicyEvaluator:
     ):
         """
         Args:
-            actor: The actor network to evaluate
+            agent: The agent to evaluate
             eval_layouts: List of layout names to evaluate on
             env_factory: Function that creates base WindFarmEnv given (x_pos, y_pos)
             combined_wrapper: Wrapper function to apply to each env
@@ -150,7 +130,7 @@ class PolicyEvaluator:
             max_turbines: Max turbines for padding (if None, computed from layouts)
             deterministic: If True, use deterministic actions (mean). If False, sample stochastically.
         """
-        self.actor = actor
+        self.agent = agent
         self.eval_layout_names = eval_layouts
         self.env_factory = env_factory
         self.combined_wrapper = combined_wrapper
@@ -237,7 +217,7 @@ class PolicyEvaluator:
         Returns:
             EvalMetrics object containing all evaluation statistics
         """
-        self.actor.eval()
+        self.agent.eval()
         
         # Storage for metrics - each env run is treated as an independent episode
         # So with 5 iterations × 10 envs, we get 50 episode samples
@@ -262,30 +242,9 @@ class PolicyEvaluator:
             episode_layouts = self._get_current_layouts()
             
             for step_idx in range(self.num_eval_steps):
-                # Get environment info (using local helper functions)
-                wind_dirs = _get_env_wind_directions(self.eval_envs, self.num_envs)
-                raw_positions = _get_env_raw_positions(self.eval_envs, self.num_envs, n_turbines_max)
-                current_masks = _get_env_attention_masks(self.eval_envs, self.num_envs, n_turbines_max)
-                
-                with torch.no_grad():
-                    obs_tensor = torch.tensor(obs, dtype=torch.float32, device=self.device)
-                    
-                    # Normalize and transform positions
-                    positions_norm = raw_positions / self.rotor_diameter
-                    positions_tensor = torch.tensor(positions_norm, dtype=torch.float32, device=self.device)
-                    wind_dir_tensor = torch.tensor(wind_dirs, dtype=torch.float32, device=self.device)
-                    positions_transformed = transform_to_wind_relative(positions_tensor, wind_dir_tensor)
-                    
-                    # Attention mask
-                    mask_tensor = torch.tensor(current_masks, dtype=torch.bool, device=self.device)
-                    
-                    # Get action (deterministic or stochastic based on flag)
-                    action_tensor, _, _, _ = self.actor.get_action(
-                        obs_tensor, positions_transformed, mask_tensor, 
-                        deterministic=self.deterministic
-                    )
-                    actions = action_tensor.squeeze(-1).cpu().numpy()
-                
+
+                actions = self.agent.act(self.eval_envs, obs, deterministic=self.deterministic)
+
                 # Step environment
                 next_obs, rewards, terminations, truncations, infos = self.eval_envs.step(actions)
                 
@@ -324,7 +283,7 @@ class PolicyEvaluator:
                 if episode_baseline_power:
                     layout_baseline_powers[layout_name].append(env_mean_baseline)
         
-        self.actor.train()
+        self.agent.train()
         
         # Compute aggregate metrics over ALL episodes (num_eval_episodes * num_envs)
         total_episodes = len(all_episode_rewards)
