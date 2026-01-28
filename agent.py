@@ -96,9 +96,10 @@ class BatchPreparer:
         num_envs = obs.shape[0]
         
         # Query environment state
-        wind_dirs = np.array(envs.get_attr('wd'), dtype=np.float32)
-        raw_positions = np.array(envs.get_attr('turbine_positions'), dtype=np.float32)
-        masks = np.array(envs.get_attr('attention_mask'), dtype=bool)
+        wind_dirs = np.array(envs.env.get_attr('wd'), dtype=np.float32)
+        # print("INSIDE THE ACTOR WIND DIRS:", wind_dirs)
+        raw_positions = np.array(envs.env.get_attr('turbine_positions'), dtype=np.float32)
+        masks = np.array(envs.env.get_attr('attention_mask'), dtype=bool)
         
         # Convert observations to tensor
         obs_tensor = torch.tensor(obs, dtype=torch.float32, device=self.device)
@@ -121,10 +122,10 @@ class BatchPreparer:
         if self.use_profiles:
             # Query profiles from environment
             receptivity = np.array(
-                envs.get_attr('current_receptivity_profiles'), dtype=np.float32
+                envs.env.get_attr('receptivity_profiles'), dtype=np.float32
             )
             influence = np.array(
-                envs.get_attr('current_influence_profiles'), dtype=np.float32
+                envs.env.get_attr('influence_profiles'), dtype=np.float32
             )
             
             receptivity_tensor = torch.tensor(receptivity, dtype=torch.float32, device=self.device)

@@ -650,14 +650,14 @@ class TransformerActor(nn.Module):
             # )
 
             self.recep_encoder = PyWakeProfileEncoder(
-                n_directions=n_profile_directions,
+                # n_directions=n_profile_directions,
                 embed_dim=embed_dim,  # Match transformer embed_dim for addition
-                hidden_dim=profile_encoder_hidden,
+                hidden_channels=profile_encoder_hidden,
             )
             self.influence_encoder = PyWakeProfileEncoder(
-                n_directions=n_profile_directions,
+                # n_directions=n_profile_directions,
                 embed_dim=embed_dim,  # Match transformer embed_dim for addition
-                hidden_dim=profile_encoder_hidden,
+                hidden_channels=profile_encoder_hidden,
             )
 
         else:
@@ -874,14 +874,14 @@ class TransformerCritic(nn.Module):
         # Output dim = embed_dim so we can ADD to tokens
         if use_pywake_profile:
             self.recep_encoder = PyWakeProfileEncoder(
-                n_directions=n_profile_directions,
+                # n_directions=n_profile_directions,
                 embed_dim=embed_dim,  # Match transformer embed_dim for addition
-                hidden_dim=profile_encoder_hidden,
+                hidden_channels=profile_encoder_hidden,
             )
             self.influence_encoder = PyWakeProfileEncoder(
-                n_directions=n_profile_directions,
+                # n_directions=n_profile_directions,
                 embed_dim=embed_dim,  # Match transformer embed_dim for addition
-                hidden_dim=profile_encoder_hidden,
+                hidden_channels=profile_encoder_hidden,
             )
         else:
             self.recep_encoder = None
@@ -1426,9 +1426,6 @@ def main():
             receptivity_profiles, influence_profiles = compute_layout_profiles(
                 x_pos, y_pos, wind_turbine,
                 n_directions=args.n_profile_directions,
-                n_wd=36,
-                n_ws=10,
-                ti=0.07,
                 )
             
             layout.receptivity_profiles = receptivity_profiles  # (n_turbines, n_directions)
@@ -1520,7 +1517,7 @@ def main():
 
     # Create policy evaluator
     evaluator = PolicyEvaluator(
-        actor=None,  # Will be set after actor is created
+        agent=None,  # Will be set after actor is created
         eval_layouts=eval_layout_names,
         env_factory=env_factory,
         combined_wrapper=combined_wrapper,
@@ -1830,9 +1827,9 @@ def main():
         global_step += args.num_envs
         
         # Get environment info (needed for replay buffer)
-        wind_dirs = get_env_wind_directions(envs, args.num_envs)
-        raw_positions = get_env_raw_positions(envs, args.num_envs, n_turbines_max)
-        current_masks = get_env_attention_masks(envs, args.num_envs, n_turbines_max)
+        wind_dirs = get_env_wind_directions(envs)
+        raw_positions = get_env_raw_positions(envs)
+        current_masks = get_env_attention_masks(envs)
         
         # Get profiles if using them
         if args.use_pywake_profile:
