@@ -1466,8 +1466,9 @@ def main():
     
     def env_factory(x_pos: np.ndarray, y_pos: np.ndarray) -> gym.Env:
         """Create a base WindFarmEnv with given positions."""
-        env = WindFarmEnv(x_pos=x_pos, 
-                          y_pos=y_pos, 
+        env = WindFarmEnv(x_pos=x_pos,
+                          y_pos=y_pos,
+                          reset_init=False,  # Defer reset to training loop
                           **base_env_kwargs)
         env.action_space.seed(args.seed)
         return env
@@ -1491,7 +1492,7 @@ def main():
                 env_factory=env_factory,
                 per_turbine_wrapper=combined_wrapper,  # Use combined wrapper
                 seed=seed,
-                shuffle=args.shuffle_turbs, # Shuffle turbines within each layout
+                shuffle=args.shuffle_turbs,  # Shuffle turbines within each layout
             )
             return env
         return _init
