@@ -71,6 +71,7 @@ class MultiLayoutEnv(gym.Env):
         pad_value: float = 0.0,
         shuffle: bool = False,
         max_turbines: Optional[int] = None,
+        max_episode_steps: Optional[int] = None,  
     ):
         """
         Args:
@@ -148,6 +149,9 @@ class MultiLayoutEnv(gym.Env):
         
         # Initialize attention mask
         self._attention_mask = self._compute_attention_mask()
+
+        self.max_episode_steps = max_episode_steps
+        self._elapsed_steps = 0
     
     def _create_env(self, layout: LayoutConfig) -> None:
         """Create a new environment for the given layout."""
@@ -617,6 +621,8 @@ class MultiLayoutEnv(gym.Env):
             padded_perm[:self.n_turbines] = self._perm
             info['turbine_permutation'] = padded_perm
         
+        self._elapsed_steps = 0
+
         return padded_obs, info
     
     def step(
@@ -657,7 +663,11 @@ class MultiLayoutEnv(gym.Env):
         # Add layout info
         info['n_turbines'] = self.n_turbines
         info['attention_mask'] = self._attention_mask.copy()
-        
+
+        self._elapsed_steps += 1
+        if self.max_episode_steps is not None and self._elapsed_steps >= self.max_episode_steps:
+            truncated = True
+
         return padded_obs, reward, terminated, truncated, info
     
     def _pad_observation(self, obs: np.ndarray) -> np.ndarray:

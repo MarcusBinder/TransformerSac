@@ -4,6 +4,7 @@ Transformer-based SAC for Wind Farm Control - V18
 Changes in V18:
 - Removed sample_env
 - Remove unnecessary reset at initialization of MultiLayoutEnv
+- Add max_episode_steps argument to MultiLayoutEnv from args
 
 Changes in V17:
 - Added the agent.py interface. Simplifies it a bit, and makes it easier to maintain
@@ -156,7 +157,7 @@ class Args:
     log_image: bool = False  # Log attention images to TensorBoard
 
     shuffle_turbs: bool = False  # Shuffle turbine order in obs/action
-    
+    max_episode_steps: Optional[int] = None # Max steps per episode (None = use env default)
 
     # === Receptivity Profile Settings ===
     use_pywake_profile: bool = False        # Enable profile encoding
@@ -1494,6 +1495,7 @@ def main():
                 per_turbine_wrapper=combined_wrapper,  # Use combined wrapper
                 seed=seed,
                 shuffle=args.shuffle_turbs,  # Shuffle turbines within each layout
+                max_episode_steps=args.max_episode_steps,
             )
             return env
         return _init
