@@ -3,6 +3,7 @@ Transformer-based SAC for Wind Farm Control - V18
 
 Changes in V18:
 - Removed sample_env
+- Remove unnecessary reset at initialization of MultiLayoutEnv
 
 Changes in V17:
 - Added the agent.py interface. Simplifies it a bit, and makes it easier to maintain
