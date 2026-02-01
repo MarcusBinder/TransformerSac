@@ -122,9 +122,9 @@ class MultiLayoutEnv(gym.Env):
         self._perm = np.arange(self.current_layout.n_turbines)
         self._inv_perm = np.arange(self.current_layout.n_turbines)
 
-        # Get observation dimensions from the wrapped env
-        sample_obs, _ = self._current_env.reset()
-        self.obs_dim_per_turbine = sample_obs.shape[1]
+        # Get observation dimensions
+        self.obs_dim_per_turbine = self._get_obs_dim_from_env()
+        # print("FROM INSIDE MULTILAYOUT ENV, obs_dim_per_turbine =", self.obs_dim_per_turbine)
         
         # Store rotor diameter (same for all layouts since same turbine type)
         self._rotor_diameter = self._get_rotor_diameter()
@@ -179,6 +179,27 @@ class MultiLayoutEnv(gym.Env):
             if hasattr(env, 'D'):
                 return env.D
         raise AttributeError("Could not find rotor diameter in environment")
+
+    def _get_obs_dim_from_env(self) -> int:
+        """Get observation dimension per turbine without calling reset().
+
+        Traverses wrapper chain to find _obs_dim_per_turbine (from
+        PerTurbineObservationWrapper) or get_obs_dim_per_turbine() (from
+        WindFarmEnv). This enables lazy initialization.
+        """
+        env = self._current_env
+        # Check wrapper first (PerTurbineObservationWrapper stores it)
+        while hasattr(env, 'env'):
+            if hasattr(env, '_obs_dim_per_turbine'):
+                return env._obs_dim_per_turbine
+            env = env.env
+        # Check base env
+        if hasattr(env, 'get_obs_dim_per_turbine'):
+            return env.get_obs_dim_per_turbine()
+        raise AttributeError(
+            "Cannot determine obs_dim without reset. Either provide "
+            "obs_dim_per_turbine explicitly or set skip_initial_reset=False."
+        )
     
     def _get_base_env(self) -> Any:
         """Get the unwrapped base environment."""
