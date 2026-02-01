@@ -121,8 +121,6 @@ class MultiLayoutEnv(gym.Env):
         # Initialize permutation arrays (identity until first reset with shuffle)
         self._perm = np.arange(self.current_layout.n_turbines)
         self._inv_perm = np.arange(self.current_layout.n_turbines)
-        
-        print("self._current_env:", self._current_env)
 
         # Get observation dimensions from the wrapped env
         sample_obs, _ = self._current_env.reset()
