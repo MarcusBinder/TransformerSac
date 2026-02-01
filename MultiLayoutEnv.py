@@ -388,7 +388,32 @@ class MultiLayoutEnv(gym.Env):
     def wd(self) -> float:
         """Current wind direction (alias for compatibility)."""
         return self.mean_wind_direction
-    
+
+    @property
+    def ws(self) -> float:
+        """Current wind speed from the active environment."""
+        return self._get_base_env().ws
+
+    @property
+    def ti(self) -> float:
+        """Current turbulence intensity from the active environment."""
+        return self._get_base_env().ti
+
+    @property
+    def current_yaw(self) -> np.ndarray:
+        """Current yaw angles (not padded, in original order)."""
+        return self._get_base_env().current_yaw
+
+    @property
+    def ActionMethod(self) -> str:
+        """Action method from the active environment ('wind' or 'yaw')."""
+        return self._get_base_env().ActionMethod
+
+    @property
+    def yaw_step_env(self) -> float:
+        """Yaw step per environment step (for 'yaw' ActionMethod)."""
+        return self._get_base_env().yaw_step_env
+
     @property
     def is_multi_layout(self) -> bool:
         """Whether this environment has multiple layout options."""
