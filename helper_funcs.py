@@ -399,7 +399,7 @@ def get_layout_positions(layout_type: str, wind_turbine) -> Tuple[np.ndarray, np
         "test_layout": lambda: generate_square_grid(turbine=wind_turbine, nx=2, ny=1, xDist=5, yDist=5),
         "3turb": lambda: generate_square_grid(turbine=wind_turbine, nx=3, ny=1, xDist=5, yDist=5),
         "square_2x2": lambda: generate_square_grid(turbine=wind_turbine, nx=2, ny=2, xDist=5, yDist=5),
-        "BIG": lambda: generate_square_grid(turbine=wind_turbine, nx=4, ny=4, xDist=5, yDist=5),
+        "BIG": lambda: generate_square_grid(turbine=wind_turbine, nx=4, ny=4, xDist=6, yDist=6),
         "small_triangle": lambda: generate_right_triangle_grid(turbine=wind_turbine, nx=2, ny=3, xDist=5, yDist=5),
         "square_3x3": lambda: generate_square_grid(turbine=wind_turbine, nx=3, ny=3, xDist=5, yDist=5),
         "circular_6": lambda: generate_cirular_farm(n_list=[1, 5], turbine=wind_turbine, r_dist=5),
@@ -643,6 +643,67 @@ def make_env_config() -> Dict[str, Any]:
         },
     }
 
+def make_BIG_config() -> Dict[str, Any]:
+    """
+    Create base environment configuration.
+    
+    This configuration is designed for transformer-based control:
+    - Per-turbine measurements enabled (ws, wd, yaw)
+    - History stacking for temporal context
+    - Baseline comparison for reward calculation
+    """
+    return {
+        "yaw_init": "Random",
+        "BaseController": "PyWake",
+        "ActionMethod": "yaw",
+        "Track_power": False,
+        "farm": {"yaw_min": -30, "yaw_max": 30},
+        "wind": {
+            "ws_min": 9, "ws_max": 9,
+            "TI_min": 0.07, "TI_max": 0.07,
+            "wd_min": 225, "wd_max": 315,
+        },
+        "act_pen": {"action_penalty": 0.0, "action_penalty_type": "Change"},
+        "power_def": {"Power_reward": "Baseline", "Power_avg": 1, "Power_scaling": 1.0},
+        "mes_level": {
+            "turb_ws": True,
+            "turb_wd": True,  # Will be converted to deviation
+            "turb_TI": False,
+            "turb_power": True,  # Include power
+            "farm_ws": False,
+            "farm_wd": False,
+            "farm_TI": False,
+            "farm_power": False,
+        },
+        "ws_mes": {
+            "ws_current": False,
+            "ws_rolling_mean": True,
+            "ws_history_N": 15,  # History length
+            "ws_history_length": 15,
+            "ws_window_length": 1,
+        },
+        "wd_mes": {
+            "wd_current": False,
+            "wd_rolling_mean": True,
+            "wd_history_N": 15,
+            "wd_history_length": 15,
+            "wd_window_length": 1,
+        },
+        "yaw_mes": {
+            "yaw_current": False,
+            "yaw_rolling_mean": True,
+            "yaw_history_N": 15,
+            "yaw_history_length": 15,
+            "yaw_window_length": 1,
+        },
+        "power_mes": {
+            "power_current": False,
+            "power_rolling_mean": True,
+            "power_history_N": 15,
+            "power_history_length": 15,
+            "power_window_length": 1,
+        },
+    }
 
 def load_checkpoint(
     checkpoint_path: str,
