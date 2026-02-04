@@ -110,6 +110,7 @@ from helper_funcs import (
     save_checkpoint,
     load_checkpoint,
     make_env_config,
+    make_BIG_config,
     transform_to_wind_relative,
     compute_wind_direction_deviation,
     EnhancedPerTurbineWrapper,
@@ -1441,7 +1442,8 @@ def main():
 
 
     # Environment configuration
-    config = make_env_config()
+    # config = make_env_config()
+    config = make_BIG_config()
     
     mes_prefixes = {
         "ws_mes": "ws",
