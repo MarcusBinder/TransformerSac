@@ -43,6 +43,7 @@ from helper_funcs import (
     transform_to_wind_relative,
 )
 
+from WindGym.wrappers import RecordEpisodeVals
 
 @dataclass
 class EvalMetrics:
@@ -183,6 +184,7 @@ class PolicyEvaluator:
                     seed=seed,
                     shuffle=False,  # No shuffling during evaluation for consistency
                     max_turbines=effective_max_turbines,
+                    max_episode_steps=self.num_eval_steps+1000, #Just to be safe.
                 )
                 return env
             return _init
@@ -191,7 +193,7 @@ class PolicyEvaluator:
         envs = gym.vector.AsyncVectorEnv(
             [make_eval_env_fn(self.seed + i) for i in range(self.num_envs)]
         )
-        
+        envs = RecordEpisodeVals(envs)
         return envs
     
     @property
@@ -203,7 +205,7 @@ class PolicyEvaluator:
     
     def _get_current_layouts(self) -> List[str]:
         """Get current layout name for each environment."""
-        names_tuple = self.eval_envs.get_attr('current_layout')
+        names_tuple = self.eval_envs.env.get_attr('current_layout')
         return [names_tuple[x].name for x in range(len(names_tuple))]
     
     def evaluate(self) -> EvalMetrics:
