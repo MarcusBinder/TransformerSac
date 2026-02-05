@@ -1596,7 +1596,10 @@ def main():
     
         layouts.append(layout)
 
-
+    if args.profile_encoding_type is not None:
+        use_profiles = True
+    else:
+        use_profiles = False
 
     # Environment configuration
     # config = make_env_config()
@@ -1694,6 +1697,8 @@ def main():
         seed=args.eval_seed,
         max_turbines=n_turbines_max,
         deterministic=False,
+        use_profiles=use_profiles,  # NEW: Pass profile setting
+        n_profile_directions=args.n_profile_directions,  # NEW: Pass profile resolution
     )
 
 
@@ -1781,11 +1786,6 @@ def main():
         "n_profile_directions": args.n_profile_directions,
         "profile_fusion_type": args.profile_fusion_type,
     }
-
-    if args.profile_encoding_type is not None:
-        use_profiles = True
-    else:
-        use_profiles = False
         
 
     # Actor has additional action scaling params

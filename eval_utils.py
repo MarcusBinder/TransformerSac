@@ -97,6 +97,7 @@ class PolicyEvaluator:
     - Fixed step count (doesn't wait for termination)
     - Deterministic action selection
     - Tracks both agent and baseline power for comparison
+    - Computes receptivity/influence profiles when needed
     """
     
     def __init__(
@@ -114,6 +115,8 @@ class PolicyEvaluator:
         seed: int = 42,
         max_turbines: Optional[int] = None,
         deterministic: bool = True,
+        use_profiles: bool = False,
+        n_profile_directions: int = 360,
     ):
         """
         Args:
@@ -130,6 +133,8 @@ class PolicyEvaluator:
             seed: Random seed for evaluation environments
             max_turbines: Max turbines for padding (if None, computed from layouts)
             deterministic: If True, use deterministic actions (mean). If False, sample stochastically.
+            use_profiles: Whether to compute receptivity/influence profiles for layouts
+            n_profile_directions: Number of directions in profile (default 360)
         """
         self.agent = agent
         self.eval_layout_names = eval_layouts
@@ -144,6 +149,8 @@ class PolicyEvaluator:
         self.seed = seed
         self.max_turbines = max_turbines
         self.deterministic = deterministic
+        self.use_profiles = use_profiles
+        self.n_profile_directions = n_profile_directions
         
         # Create layout configs
         self.eval_layouts = self._create_layout_configs()
@@ -152,12 +159,26 @@ class PolicyEvaluator:
         self._eval_envs: Optional[gym.vector.VectorEnv] = None
         
     def _create_layout_configs(self) -> List[LayoutConfig]:
-        """Create LayoutConfig objects for evaluation layouts."""
+        """Create LayoutConfig objects for evaluation layouts, including profiles if needed."""
         configs = []
         for name in self.eval_layout_names:
             x_pos, y_pos = get_layout_positions(name, self.wind_turbine)
-            configs.append(LayoutConfig(name=name, x_pos=x_pos, y_pos=y_pos))
+            config = LayoutConfig(name=name, x_pos=x_pos, y_pos=y_pos)
+            
+            # Compute profiles if enabled
+            if self.use_profiles:
+                from receptivity_profiles import compute_layout_profiles
+                print(f"[Evaluator] Computing profiles for layout: {name}")
+                receptivity_profiles, influence_profiles = compute_layout_profiles(
+                    x_pos, y_pos, self.wind_turbine,
+                    n_directions=self.n_profile_directions,
+                )
+                config.receptivity_profiles = receptivity_profiles
+                config.influence_profiles = influence_profiles
+            
+            configs.append(config)
         return configs
+    
     
     def _create_eval_envs(self) -> gym.vector.VectorEnv:
         """Create vectorized evaluation environments."""
@@ -245,7 +266,8 @@ class PolicyEvaluator:
             
             for step_idx in range(self.num_eval_steps):
 
-                actions = self.agent.act(self.eval_envs, obs, deterministic=self.deterministic)
+                actions = self.agent.act(self.eval_envs, obs, 
+                                         deterministic=self.deterministic)
 
                 # Step environment
                 next_obs, rewards, terminations, truncations, infos = self.eval_envs.step(actions)
