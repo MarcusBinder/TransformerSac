@@ -736,3 +736,299 @@ class RoPEMultiheadAttention(nn.Module):
         output = self.out_proj(output)
         
         return output, attn_weights
+
+class RelativePositionalBiasAdvanced(nn.Module):
+    """
+    Improved relative position bias for wind farm attention.
+    
+    Key insight: In wind-relative coordinates, the relative position (dx, dy) 
+    has clear physical meaning:
+    - dx > 0: j is downwind of i (j in i's wake)
+    - dx < 0: j is upwind of i (i in j's wake)
+    - |dy|: lateral separation
+    
+    This encoder explicitly decomposes into:
+    1. Distance component: How much to attend based on distance
+    2. Angular component: How much to attend based on direction
+    3. Asymmetry: Upwind/downwind relationships
+    
+    Improvements over vanilla RelativePositionalBias:
+    - Richer feature representation (not just raw dx, dy)
+    - Separate pathways for distance and angle
+    - Physics-motivated asymmetry
+    - Proper normalization
+    """
+    
+    def __init__(
+        self, 
+        num_heads: int, 
+        hidden_dim: int = 64,
+        characteristic_distance: float = 5.0,  # In rotor diameters
+        use_physics_asymmetry: bool = True,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.characteristic_distance = characteristic_distance
+        self.use_physics_asymmetry = use_physics_asymmetry
+        
+        # Feature dimension for MLP input
+        # (dx_norm, dy_norm, dist_norm, angle, sin, cos, dist_decay)
+        self.feature_dim = 7
+        if use_physics_asymmetry:
+            # Add asymmetry features: (is_upwind, is_downwind, is_lateral)
+            self.feature_dim += 3
+        
+        # Main bias MLP (per-head output)
+        self.bias_mlp = nn.Sequential(
+            nn.Linear(self.feature_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_heads),
+        )
+        
+        # Initialize final layer to small values (start with weak bias)
+        nn.init.zeros_(self.bias_mlp[-1].weight)
+        nn.init.zeros_(self.bias_mlp[-1].bias)
+        
+        # Learnable distance decay slopes (ALiBi-inspired, but learned)
+        # Different heads can learn different distance sensitivities
+        init_slopes = torch.tensor([
+            2 ** (-8 * (i + 1) / num_heads) for i in range(num_heads)
+        ])
+        self.distance_slopes = nn.Parameter(init_slopes)
+    
+    def forward(
+        self, 
+        positions: torch.Tensor, 
+        key_padding_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Args:
+            positions: (batch, n_tokens, 2) - wind-relative positions in rotor diameters
+            key_padding_mask: (batch, n_tokens) where True = padding
+        
+        Returns:
+            bias: (batch, num_heads, n_tokens, n_tokens)
+        """
+        batch_size, n_tokens, _ = positions.shape
+        device = positions.device
+        
+        # Compute pairwise relative positions: rel_pos[i,j] = pos[j] - pos[i]
+        # "From i's perspective, where is j?"
+        pos_i = positions.unsqueeze(2)  # (batch, n, 1, 2)
+        pos_j = positions.unsqueeze(1)  # (batch, 1, n, 2)
+        rel_pos = pos_j - pos_i         # (batch, n, n, 2)
+        
+        dx = rel_pos[..., 0]  # Positive = j is downwind of i
+        dy = rel_pos[..., 1]  # Lateral displacement
+        
+        # Distance (with epsilon for numerical stability)
+        dist = torch.sqrt(dx**2 + dy**2 + 1e-8)
+        
+        # Normalized features
+        dx_norm = dx / (dist + 1e-8)  # Unit direction x
+        dy_norm = dy / (dist + 1e-8)  # Unit direction y
+        dist_norm = dist / self.characteristic_distance  # Normalized distance
+        
+        # Angular features
+        angle = torch.atan2(dy, dx)  # Angle from i to j
+        sin_angle = torch.sin(angle)
+        cos_angle = torch.cos(angle)
+        
+        # Soft distance decay (log scale, bounded)
+        dist_decay = torch.log1p(dist_norm)  # Smooth, bounded
+        
+        # Stack features
+        features = [dx_norm, dy_norm, dist_norm, angle, sin_angle, cos_angle, dist_decay]
+        
+        if self.use_physics_asymmetry:
+            # Soft asymmetry indicators (smooth approximation)
+            # is_upwind: j is upwind of i (dx < 0 and mostly aligned with wind)
+            # is_downwind: j is downwind of i (dx > 0 and mostly aligned)
+            # is_lateral: j is roughly perpendicular to wind
+            
+            # Use tanh for smooth transitions
+            upwind_score = torch.tanh(-dx_norm * 3)  # High when dx < 0
+            downwind_score = torch.tanh(dx_norm * 3)  # High when dx > 0
+            lateral_score = 1 - torch.abs(dx_norm)    # High when |dy| >> |dx|
+            
+            features.extend([upwind_score, downwind_score, lateral_score])
+        
+        # Stack: (batch, n, n, feature_dim)
+        features = torch.stack(features, dim=-1)
+        
+        # Flatten for MLP: (batch * n * n, feature_dim)
+        features_flat = features.reshape(-1, self.feature_dim)
+        
+        # MLP: (batch * n * n, num_heads)
+        bias_flat = self.bias_mlp(features_flat)
+        
+        # Reshape: (batch, n, n, num_heads) -> (batch, num_heads, n, n)
+        bias = bias_flat.reshape(batch_size, n_tokens, n_tokens, self.num_heads)
+        bias = bias.permute(0, 3, 1, 2)
+        
+        # Add learned distance decay (ALiBi-style)
+        dist_expanded = dist.unsqueeze(1)  # (batch, 1, n, n)
+        distance_bias = -self.distance_slopes.view(1, -1, 1, 1) * dist_expanded
+        bias = bias + distance_bias
+        
+        # Zero out padded positions
+        if key_padding_mask is not None:
+            mask_k = key_padding_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, n)
+            mask_q = key_padding_mask.unsqueeze(1).unsqueeze(3)  # (batch, 1, n, 1)
+            bias = bias.masked_fill(mask_k | mask_q, 0.0)
+        
+        return bias
+
+class RelativePositionalBiasFactorized(nn.Module):
+    """
+    Alternative: Factorized relative bias with separate distance and angle networks.
+    
+    bias(i,j) = distance_bias(dist_ij) * angle_weight(angle_ij)
+    
+    This factorization makes it easier to learn interpretable patterns:
+    - Distance network: "Closer turbines are more relevant"
+    - Angle network: "Upwind turbines are more relevant"
+    """
+    
+    def __init__(
+        self, 
+        num_heads: int, 
+        hidden_dim: int = 32,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        
+        # Distance network: dist -> per-head bias
+        self.distance_net = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_heads),
+        )
+        
+        # Angle network: (sin, cos) -> per-head weight
+        self.angle_net = nn.Sequential(
+            nn.Linear(2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_heads),
+            nn.Sigmoid(),  # Output in [0, 1] as a multiplicative weight
+        )
+        
+        # Learnable base decay (per head)
+        self.base_decay = nn.Parameter(torch.ones(num_heads) * 0.1)
+    
+    def forward(
+        self, 
+        positions: torch.Tensor, 
+        key_padding_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        batch_size, n_tokens, _ = positions.shape
+        
+        pos_i = positions.unsqueeze(2)
+        pos_j = positions.unsqueeze(1)
+        rel_pos = pos_j - pos_i
+        
+        dx, dy = rel_pos[..., 0], rel_pos[..., 1]
+        dist = torch.sqrt(dx**2 + dy**2 + 1e-8)
+        
+        # Distance features
+        dist_input = dist.unsqueeze(-1)  # (batch, n, n, 1)
+        dist_bias = self.distance_net(dist_input.reshape(-1, 1))
+        dist_bias = dist_bias.reshape(batch_size, n_tokens, n_tokens, self.num_heads)
+        
+        # Angle features
+        sin_angle = dy / (dist + 1e-8)
+        cos_angle = dx / (dist + 1e-8)
+        angle_input = torch.stack([sin_angle, cos_angle], dim=-1)  # (batch, n, n, 2)
+        angle_weight = self.angle_net(angle_input.reshape(-1, 2))
+        angle_weight = angle_weight.reshape(batch_size, n_tokens, n_tokens, self.num_heads)
+        
+        # Combine: base decay + learned adjustment, modulated by angle
+        base = -self.base_decay.view(1, 1, 1, -1) * dist.unsqueeze(-1)
+        bias = (base + dist_bias) * angle_weight
+        
+        # Reshape to (batch, heads, n, n)
+        bias = bias.permute(0, 3, 1, 2)
+        
+        if key_padding_mask is not None:
+            mask = key_padding_mask.unsqueeze(1).unsqueeze(2) | key_padding_mask.unsqueeze(1).unsqueeze(3)
+            bias = bias.masked_fill(mask, 0.0)
+        
+        return bias
+
+class RelativePositionalBiasWithWind(nn.Module):
+    """
+    Variant that takes wind direction as explicit input.
+    
+    Useful if positions are NOT pre-transformed to wind-relative frame.
+    The network learns to interpret positions given the current wind direction.
+    """
+    
+    def __init__(
+        self, 
+        num_heads: int, 
+        hidden_dim: int = 64,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        
+        # Wind direction embedding
+        self.wind_embed_dim = 16
+        self.wind_embed = nn.Sequential(
+            nn.Linear(2, self.wind_embed_dim),  # (sin, cos)
+            nn.GELU(),
+        )
+        
+        # Relative position MLP (takes wind embedding as context)
+        # Input: (dx, dy, dist, sin, cos, wind_embed)
+        self.bias_mlp = nn.Sequential(
+            nn.Linear(5 + self.wind_embed_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_heads),
+        )
+    
+    def forward(
+        self, 
+        positions: torch.Tensor,          # (batch, n, 2) - global frame
+        wind_direction: torch.Tensor,     # (batch,) - degrees
+        key_padding_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        batch_size, n_tokens, _ = positions.shape
+        
+        # Wind direction embedding
+        wd_rad = wind_direction * math.pi / 180
+        wd_features = torch.stack([torch.sin(wd_rad), torch.cos(wd_rad)], dim=-1)
+        wd_embed = self.wind_embed(wd_features)  # (batch, wind_embed_dim)
+        
+        # Expand wind embedding for all pairs
+        wd_embed = wd_embed.unsqueeze(1).unsqueeze(1).expand(-1, n_tokens, n_tokens, -1)
+        
+        # Relative positions
+        pos_i = positions.unsqueeze(2)
+        pos_j = positions.unsqueeze(1)
+        rel_pos = pos_j - pos_i
+        
+        dx, dy = rel_pos[..., 0], rel_pos[..., 1]
+        dist = torch.sqrt(dx**2 + dy**2 + 1e-8)
+        sin_angle = dy / (dist + 1e-8)
+        cos_angle = dx / (dist + 1e-8)
+        
+        # Combine features
+        features = torch.stack([dx, dy, dist, sin_angle, cos_angle], dim=-1)
+        features = torch.cat([features, wd_embed], dim=-1)
+        
+        # MLP
+        bias_flat = self.bias_mlp(features.reshape(-1, 5 + self.wind_embed_dim))
+        bias = bias_flat.reshape(batch_size, n_tokens, n_tokens, self.num_heads)
+        bias = bias.permute(0, 3, 1, 2)
+        
+        if key_padding_mask is not None:
+            mask = key_padding_mask.unsqueeze(1).unsqueeze(2) | key_padding_mask.unsqueeze(1).unsqueeze(3)
+            bias = bias.masked_fill(mask, 0.0)
+        
+        return bias
