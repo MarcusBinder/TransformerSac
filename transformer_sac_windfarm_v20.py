@@ -1,7 +1,10 @@
 """
-Transformer-based SAC for Wind Farm Control - V19
+Transformer-based SAC for Wind Farm Control - V20
 
-Changes in V19_
+Changes in V20:
+- Added share_profile_encoder -> 
+
+Changes in V19:
 - Renamed encodings_helper to positional_encodings_helper
 - Made profile_encodings_helper
 - Add profile_fusion_type, joint or add
@@ -184,6 +187,8 @@ class Args:
     rotate_profiles: bool = True            # Rotate profiles to wind-relative frame
     n_profile_directions: int = 360         # Number of directions in profile
     profile_fusion_type: str = "add"       # "add" or "joint" fusion of receptivity and influence profiles
+    share_profile_encoder: bool = False         # Whether to share weights between actor and critic for profile encoder
+
     # === Environment Settings ===
     turbtype: str = "DTU10MW"  # Wind turbine type
     TI_type: str = "Random"   # Turbulence intensity sampling
@@ -637,12 +642,13 @@ class TransformerEncoderLayer(nn.Module):
         x: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
         attn_bias: Optional[torch.Tensor] = None,
+        need_weights: bool = False,  # NEW
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             x: (batch, n_tokens, embed_dim)
             key_padding_mask: (batch, n_tokens) where True = ignore this position
-            attn_bias: (batch, n_heads, n_tokens, n_tokens) optional bias to add
+            atstn_bias: (batch, n_heads, n_tokens, n_tokens) optional bias to add
                        to attention logits (for relative positional encoding)
         
         Returns:
@@ -666,7 +672,8 @@ class TransformerEncoderLayer(nn.Module):
             x_norm, x_norm, x_norm,
             key_padding_mask=key_padding_mask,
             attn_mask=attn_mask,
-            average_attn_weights=False  # Return per-head weights
+            average_attn_weights=False,  # Return per-head weights
+            need_weights=need_weights,  # Only compute if needed!
         )
         x = x + attn_out
         
@@ -778,6 +785,9 @@ class TransformerActor(nn.Module):
         profile_encoder_hidden: int = 128,
         n_profile_directions: int = 360,
         profile_fusion_type: str = "add",  # "add" or "joint"
+        # Shared profile encoders (optional - if None, creates own)
+        shared_recep_encoder: Optional[nn.Module] = None,
+        shared_influence_encoder: Optional[nn.Module] = None,
     ):
         """
         Args:
@@ -821,14 +831,21 @@ class TransformerActor(nn.Module):
                 rel_pos_per_head=rel_pos_per_head,
             )
         
+
         # Receptivity profile encoder (optional)
-        # Output dim = embed_dim so we can ADD to tokens
-        self.recep_encoder, self.influence_encoder = \
-            create_profile_encoding(
-                profile_type=profile_encoding,
-                embed_dim=embed_dim,
-                hidden_channels=profile_encoder_hidden,
-            )
+        # Use shared encoders if provided, otherwise create new ones
+        if shared_recep_encoder is not None and shared_influence_encoder is not None:
+            self.recep_encoder = shared_recep_encoder
+            self.influence_encoder = shared_influence_encoder
+        else:
+            self.recep_encoder, self.influence_encoder = \
+                create_profile_encoding(
+                    profile_type=profile_encoding,
+                    embed_dim=embed_dim,
+                    hidden_channels=profile_encoder_hidden,
+                )
+
+
 
         if profile_encoding is not None and profile_fusion_type == "joint":
             self.profile_fusion = nn.Sequential(
@@ -1032,6 +1049,9 @@ class TransformerCritic(nn.Module):
         profile_encoder_hidden: int = 128,
         n_profile_directions: int = 360,
         profile_fusion_type: str = "add",  # "add" or "joint"
+        # Shared profile encoders (optional - if None, creates own)
+        shared_recep_encoder: Optional[nn.Module] = None,
+        shared_influence_encoder: Optional[nn.Module] = None,
     ):
         super().__init__()
         
@@ -1050,15 +1070,19 @@ class TransformerCritic(nn.Module):
                 rel_pos_hidden_dim=rel_pos_hidden_dim,
                 rel_pos_per_head=rel_pos_per_head,
             )
-        
+
         # PyWake profile encoder (optional)
-        # Output dim = embed_dim so we can ADD to tokens
-        self.recep_encoder, self.influence_encoder = \
-            create_profile_encoding(
-                profile_type=profile_encoding,
-                embed_dim=embed_dim,
-                hidden_channels=profile_encoder_hidden,
-            )
+        # Use shared encoders if provided, otherwise create new ones
+        if shared_recep_encoder is not None and shared_influence_encoder is not None:
+            self.recep_encoder = shared_recep_encoder
+            self.influence_encoder = shared_influence_encoder
+        else:
+            self.recep_encoder, self.influence_encoder = \
+                create_profile_encoding(
+                    profile_type=profile_encoding,
+                    embed_dim=embed_dim,
+                    hidden_channels=profile_encoder_hidden,
+                )
 
 
         # Observation + action encoder
@@ -1180,6 +1204,9 @@ class TransformerReplayBuffer:
     Wind-relative transformation is applied at sample time to ensure
     correct positional encoding regardless of when the transition was collected.
     
+    Profiles are looked up at sample time and permuted according to the
+    stored permutation, rather than storing full profiles per-transition.
+
     This is important because:
     1. Wind direction may change within an episode
     2. Different episodes have different wind directions
@@ -1206,6 +1233,7 @@ class TransformerReplayBuffer:
         use_wind_relative: bool = True,
         use_profiles: bool = False,
         rotate_profiles: bool = False,
+        layout_profiles: Optional[Dict[str, Tuple[np.ndarray, np.ndarray]]] = None,
     ):
         """
         Args:
@@ -1215,6 +1243,8 @@ class TransformerReplayBuffer:
             use_wind_relative: Whether to transform positions to wind-relative frame
             use_profiles: Whether to store and return receptivity profiles
             rotate_profiles: Whether to rotate profiles to wind-relative frame at sample time
+            layout_profiles: Dict mapping layout_name -> (receptivity, influence)
+                        where each is (n_turbines, n_directions)
         """
         self.capacity = capacity
         self.device = device
@@ -1224,6 +1254,11 @@ class TransformerReplayBuffer:
         self.position = 0
         self.use_profiles = use_profiles
         self.rotate_profiles = rotate_profiles
+        self.layout_profiles = layout_profiles or {}
+
+        if use_profiles and not layout_profiles:
+            raise ValueError("use_profiles=True requires layout_profiles dict")
+
         
 
     
@@ -1237,8 +1272,10 @@ class TransformerReplayBuffer:
         raw_positions: np.ndarray,
         attention_mask: np.ndarray,
         wind_direction: float,
-        receptivity: Optional[np.ndarray] = None,
-        influence: Optional[np.ndarray] = None,
+        # receptivity: Optional[np.ndarray] = None,
+        # influence: Optional[np.ndarray] = None,
+        layout_name: Optional[str] = None,
+        permutation: Optional[np.ndarray] = None,  # NEW: store the shuffle permutation
     ) -> None:
         """
         Store a transition.
@@ -1252,14 +1289,16 @@ class TransformerReplayBuffer:
             raw_positions: (max_turbines, 2)
             attention_mask: (max_turbines,)
             wind_direction: scalar
-            receptivity: (max_turbines, n_directions) or None
-            influence: (max_turbines, max_turbines) or None
+            layout_name: Name of current layout (for profile lookup)
+            permutation: Turbine permutation array (for shuffled profiles)
         """
         data = (
             obs, next_obs, action, reward, done,
             raw_positions, attention_mask, wind_direction,
-            receptivity, influence  # Can be None if not using profiles
+            layout_name,  # 
+            permutation,  # 
         )
+
 
         if len(self.buffer) < self.capacity:
             self.buffer.append(data)
@@ -1291,12 +1330,11 @@ class TransformerReplayBuffer:
         obs_list, next_obs_list, action_list = [], [], []
         raw_positions_list, mask_list, wind_dirs = [], [], []
         rewards, dones = [], []
-        receptivity_list, influence_list = [], []
-        
+        layout_names, permutations = [], []
 
         for item in batch:
             (obs, next_obs, action, reward, done,
-             raw_pos, mask, wind_dir, receptivity, influence) = item
+             raw_pos, mask, wind_dir, layout_name, perm) = item
             
             obs_list.append(obs)
             next_obs_list.append(next_obs)
@@ -1306,10 +1344,8 @@ class TransformerReplayBuffer:
             wind_dirs.append(wind_dir)
             rewards.append(reward)
             dones.append(done)
-
-            if self.use_profiles:
-                receptivity_list.append(receptivity)
-                influence_list.append(influence)
+            layout_names.append(layout_name)
+            permutations.append(perm)
 
         # Stack to arrays
         raw_positions = np.stack(raw_positions_list)  # (batch, max_turb, 2)
@@ -1339,10 +1375,38 @@ class TransformerReplayBuffer:
         }
 
 
-        # Add profiles if enabled
+        # Look up and permute profiles
         if self.use_profiles:
-            receptivity_array = np.stack(receptivity_list)  # (batch, max_turb, n_dirs)
-            influence_array = np.stack(influence_list)  # (batch, max_turb, max_turb)
+            receptivity_list = []
+            influence_list = []
+            
+            for layout_name, perm in zip(layout_names, permutations):
+                # Get base (unshuffled, unpadded) profiles
+                base_recep, base_influ = self.layout_profiles[layout_name]
+                n_turb = base_recep.shape[0]
+                n_dirs = base_recep.shape[1]
+                
+                # Apply permutation if present
+                if perm is not None:
+                    # perm maps shuffled_idx -> original_idx
+                    # So base_recep[perm] reorders to match shuffled observation order
+                    recep = base_recep[perm]
+                    influ = base_influ[perm]
+                else:
+                    recep = base_recep
+                    influ = base_influ
+                
+                # Pad to max_turbines
+                padded_recep = np.zeros((self.max_turbines, n_dirs), dtype=np.float32)
+                padded_influ = np.zeros((self.max_turbines, n_dirs), dtype=np.float32)
+                padded_recep[:n_turb] = recep
+                padded_influ[:n_turb] = influ
+                
+                receptivity_list.append(padded_recep)
+                influence_list.append(padded_influ)
+            
+            receptivity_array = np.stack(receptivity_list)
+            influence_array = np.stack(influence_list)
             
             # Optionally rotate profiles to wind-relative frame
             if self.rotate_profiles:
@@ -1624,6 +1688,19 @@ def main():
     else:
         use_profiles = False
 
+    # Build profile lookup dict - store UNPADDED, UNSHUFFLED profiles
+    layout_profiles = {}
+    if args.profile_encoding_type is not None:
+        for layout in layouts:
+            # Store raw profiles - padding and shuffling happens at sample time
+            layout_profiles[layout.name] = (
+                layout.receptivity_profiles.astype(np.float32),  # (n_turbines, n_directions)
+                layout.influence_profiles.astype(np.float32),
+            )
+        print(f"Built profile lookup for {len(layout_profiles)} layouts")
+
+
+
     # Environment configuration
     config = make_env_config()
     # config = make_BIG_config()
@@ -1784,8 +1861,34 @@ def main():
     
     print("\nCreating networks...")
     print(f"Positional encoding type: {args.pos_encoding_type}")
+
+    # ==========================================================================
+    # Create SHARED profile encoders (if using profiles)
+    # ==========================================================================
     if args.profile_encoding_type is not None:
-        print(f"PyWake profiles: enabled")
+        if args.share_profile_encoder:
+            print(f"Creating shared profile encoders: {args.profile_encoding_type}")
+            shared_recep_encoder, shared_influence_encoder = create_profile_encoding(
+                profile_type=args.profile_encoding_type,
+                embed_dim=args.embed_dim,
+                hidden_channels=args.profile_encoder_hidden,
+            )
+            # Move to device
+            shared_recep_encoder = shared_recep_encoder.to(device)
+            shared_influence_encoder = shared_influence_encoder.to(device)
+        
+            # Count shared encoder parameters
+            recep_params = sum(p.numel() for p in shared_recep_encoder.parameters())
+            influence_params = sum(p.numel() for p in shared_influence_encoder.parameters())
+            print(f"Shared receptivity encoder parameters: {recep_params:,}")
+            print(f"Shared influence encoder parameters: {influence_params:,}")
+        else:
+            print(f"Using separate profile encoders for each network, handled internally in the critic and actor classes")
+            shared_recep_encoder = None  # 
+            shared_influence_encoder = None  # 
+    else:
+        shared_recep_encoder = None
+        shared_influence_encoder = None
 
 
     # Common profile args (to avoid repetition)
@@ -1808,6 +1911,9 @@ def main():
         "profile_encoder_hidden": args.profile_encoder_hidden,
         "n_profile_directions": args.n_profile_directions,
         "profile_fusion_type": args.profile_fusion_type,
+        # SHARED encoders
+        "shared_recep_encoder": shared_recep_encoder,
+        "shared_influence_encoder": shared_influence_encoder,
     }
         
 
@@ -1848,11 +1954,41 @@ def main():
     
     # Optimizers
     actor_optimizer = optim.Adam(actor.parameters(), lr=args.policy_lr)
+    # q_optimizer = optim.Adam(
+    #     list(qf1.parameters()) + list(qf2.parameters()),
+    #     lr=args.q_lr
+    # )
+    
+    # Get critic parameters, excluding shared profile encoders
+    def get_critic_params_excluding_shared(critic, shared_recep, shared_influence):
+        '''Get critic parameters, excluding shared modules.'''
+        shared_param_ids = set()
+        if shared_recep is not None:
+            shared_param_ids.update(id(p) for p in shared_recep.parameters())
+        if shared_influence is not None:
+            shared_param_ids.update(id(p) for p in shared_influence.parameters())
+        
+        return [p for p in critic.parameters() if id(p) not in shared_param_ids]
+    
+    qf1_params = get_critic_params_excluding_shared(qf1, shared_recep_encoder, shared_influence_encoder)
+    qf2_params = get_critic_params_excluding_shared(qf2, shared_recep_encoder, shared_influence_encoder)
+    
     q_optimizer = optim.Adam(
-        list(qf1.parameters()) + list(qf2.parameters()),
+        qf1_params + qf2_params,
         lr=args.q_lr
     )
     
+    # Verify parameter counts
+    if shared_recep_encoder is not None:
+        actor_unique = sum(p.numel() for p in actor.parameters())
+        critic_unique = sum(p.numel() for p in qf1_params)
+        shared_total = sum(p.numel() for p in shared_recep_encoder.parameters()) + \
+                       sum(p.numel() for p in shared_influence_encoder.parameters())
+        print(f"Actor parameters (includes shared): {actor_unique:,}")
+        print(f"Critic parameters (excluding shared): {critic_unique:,} (x2)")
+        print(f"Shared encoder parameters: {shared_total:,}")
+
+
     # Entropy tuning
     if args.autotune:
         # Initial target entropy (will be adapted per-batch)
