@@ -1,5 +1,5 @@
 """
-Containts various positional encoding and bias modules.
+Contains various positional encoding and bias modules.
 Only related to the profiles.
 
 Currently split into 2 types:
@@ -11,6 +11,8 @@ CNN based encoders:
 Fourier based encoders:
 - FourierProfileEncoder -> Fourier decomposition of profiles
 - FourierProfileEncoderWithContext -> Fourier + wind direction context
+
+All encoders now support arbitrary n_profile_directions (not just 360).
 """
 
 import os
@@ -36,7 +38,6 @@ from collections import deque
 
 class ResidualConvBlock(nn.Module):
     """Residual block with circular padding for 1D angular data."""
-    
     def __init__(
         self, 
         in_channels: int, 
@@ -83,10 +84,10 @@ class PyWakeProfileEncoder(nn.Module):
     1. Multi-scale pyramid: Extract features at multiple resolutions
     2. Residual connections: Better gradient flow
     3. Don't pool all the way to 1: Keep some angular bins
-    4. Dilated convolutions: Larger receptive field without excessive pooling
+    4. Adaptive pooling: Works with ANY n_profile_directions
     
     Architecture:
-        Input (360) → ResBlock → Pool (90) → ResBlock → Pool (30) → ResBlock → Pool (8)
+        Input (N) → ResBlock → Pool (N/4) → ResBlock → Pool (N/12) → ResBlock → Pool (n_angular_bins)
         Features from each scale are projected and combined
     """
     
@@ -99,7 +100,7 @@ class PyWakeProfileEncoder(nn.Module):
         super().__init__()
         self.n_angular_bins = n_angular_bins
         
-        # Scale 1: Full resolution (360)
+        # Scale 1: Full resolution
         self.conv1 = nn.Sequential(
             nn.Conv1d(1, hidden_channels, kernel_size=9, padding=4, padding_mode='circular'),
             nn.BatchNorm1d(hidden_channels),
@@ -107,19 +108,18 @@ class PyWakeProfileEncoder(nn.Module):
         )
         self.res1 = ResidualConvBlock(hidden_channels, hidden_channels, kernel_size=5)
         
-        # Scale 2: 1/4 resolution (90)
-        self.pool1 = nn.MaxPool1d(4)  # 360 → 90
+        # Scale 2: ~1/4 resolution (use adaptive pooling)
+        self.pool1 = nn.AdaptiveAvgPool1d(None)  # Will be set dynamically
         self.res2 = ResidualConvBlock(hidden_channels, hidden_channels * 2, kernel_size=5)
         
-        # Scale 3: 1/12 resolution (30)
-        self.pool2 = nn.MaxPool1d(3)  # 90 → 30
+        # Scale 3: ~1/12 resolution (use adaptive pooling)
+        self.pool2 = nn.AdaptiveAvgPool1d(None)  # Will be set dynamically
         self.res3 = ResidualConvBlock(hidden_channels * 2, hidden_channels * 4, kernel_size=5)
         
         # Final pooling to n_angular_bins
-        self.final_pool = nn.AdaptiveAvgPool1d(n_angular_bins)  # 30 → 8
+        self.final_pool = nn.AdaptiveAvgPool1d(n_angular_bins)
         
         # Multi-scale feature projections
-        # Project each scale to a fixed size, then combine
         self.proj1 = nn.Linear(hidden_channels * n_angular_bins, embed_dim)
         self.proj2 = nn.Linear(hidden_channels * 2 * n_angular_bins, embed_dim)
         self.proj3 = nn.Linear(hidden_channels * 4 * n_angular_bins, embed_dim)
@@ -135,32 +135,38 @@ class PyWakeProfileEncoder(nn.Module):
     def forward(self, profiles: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            profiles: (batch, n_turbines, n_directions) e.g., (32, 10, 360)
+            profiles: (batch, n_turbines, n_directions) e.g., (32, 10, 72)
         
         Returns:
             embeddings: (batch, n_turbines, embed_dim)
         """
         batch_size, n_turbines, n_dirs = profiles.shape
         
+        # Compute adaptive pool sizes based on actual input size
+        # Scale 2: ~1/4 of input, minimum 8
+        scale2_size = max(n_dirs // 4, self.n_angular_bins)
+        # Scale 3: ~1/3 of scale2, minimum n_angular_bins
+        scale3_size = max(scale2_size // 3, self.n_angular_bins)
+        
         # Flatten batch and turbines: (batch * n_turbines, 1, n_directions)
         x = profiles.view(batch_size * n_turbines, 1, n_dirs)
         
-        # Scale 1: (batch * n_turb, hidden, 360)
+        # Scale 1: (batch * n_turb, hidden, n_dirs)
         x1 = self.conv1(x)
         x1 = self.res1(x1)
         
-        # Scale 2: (batch * n_turb, hidden * 2, 90)
-        x2 = self.pool1(x1)
+        # Scale 2: (batch * n_turb, hidden * 2, scale2_size)
+        x2 = F.adaptive_avg_pool1d(x1, scale2_size)
         x2 = self.res2(x2)
         
-        # Scale 3: (batch * n_turb, hidden * 4, 30)
-        x3 = self.pool2(x2)
+        # Scale 3: (batch * n_turb, hidden * 4, scale3_size)
+        x3 = F.adaptive_avg_pool1d(x2, scale3_size)
         x3 = self.res3(x3)
         
         # Pool each scale to same number of bins
-        x1_pooled = self.final_pool(x1)  # (batch * n_turb, hidden, 8)
-        x2_pooled = self.final_pool(x2)  # (batch * n_turb, hidden * 2, 8)
-        x3_pooled = self.final_pool(x3)  # (batch * n_turb, hidden * 4, 8)
+        x1_pooled = self.final_pool(x1)  # (batch * n_turb, hidden, n_angular_bins)
+        x2_pooled = self.final_pool(x2)  # (batch * n_turb, hidden * 2, n_angular_bins)
+        x3_pooled = self.final_pool(x3)  # (batch * n_turb, hidden * 4, n_angular_bins)
         
         # Flatten and project each scale
         f1 = self.proj1(x1_pooled.flatten(1))  # (batch * n_turb, embed_dim)
@@ -179,13 +185,12 @@ class PyWakeProfileEncoderDilated(nn.Module):
     """
     Alternative: Dilated convolutions for large receptive field without pooling.
     
-    Uses exponentially increasing dilation rates to cover the full 360° with
-    fewer layers and no intermediate pooling.
+    Uses exponentially increasing dilation rates to cover the full angular range
+    with fewer layers and no intermediate pooling.
     
-    Receptive field with dilations [1, 2, 4, 8, 16]:
-    - Each layer adds (kernel_size - 1) * dilation to receptive field
-    - With kernel=5: 4 + 8 + 16 + 32 + 64 = 124 per side = 248 total
-    - Covers most of 360° profile
+    This encoder naturally works with any input size since it uses:
+    - Circular padding (handles wraparound)
+    - Global adaptive pooling at the end
     """
     
     def __init__(
@@ -238,6 +243,8 @@ class PyWakeProfileEncoderWithAttention(nn.Module):
     
     After initial CNN processing, use self-attention to capture
     long-range angular dependencies (e.g., two peaks 180° apart).
+    
+    Now supports arbitrary n_profile_directions through adaptive pooling.
     """
     
     def __init__(
@@ -245,24 +252,29 @@ class PyWakeProfileEncoderWithAttention(nn.Module):
         embed_dim: int = 128,
         hidden_channels: int = 32,
         n_attention_heads: int = 4,
+        n_attention_tokens: int = 16,  # Number of angular tokens after pooling
     ):
         super().__init__()
+        self.n_attention_tokens = n_attention_tokens
+        self.hidden_channels = hidden_channels
         
-        # CNN to reduce dimensionality: 360 → 36
+        # CNN to reduce dimensionality adaptively
         self.cnn = nn.Sequential(
-            nn.Conv1d(1, hidden_channels, kernel_size=9, padding=4, padding_mode='circular'),
+            nn.Conv1d(1, hidden_channels, kernel_size=7, padding=3, padding_mode='circular'),
             nn.BatchNorm1d(hidden_channels),
             nn.GELU(),
-            nn.MaxPool1d(5),  # 360 → 72
             nn.Conv1d(hidden_channels, hidden_channels, kernel_size=5, padding=2, padding_mode='circular'),
             nn.BatchNorm1d(hidden_channels),
             nn.GELU(),
-            nn.MaxPool1d(2),  # 72 → 36
         )
         
+        # Adaptive pooling to fixed number of tokens
+        self.adaptive_pool = nn.AdaptiveAvgPool1d(n_attention_tokens)
+        
+        # Learnable position embedding for the fixed number of tokens
+        self.pos_embed = nn.Parameter(torch.randn(1, n_attention_tokens, hidden_channels) * 0.02)
+        
         # Self-attention over angular positions
-        # Each of the 36 positions becomes a token
-        self.pos_embed = nn.Parameter(torch.randn(1, 36, hidden_channels) * 0.02)
         self.attention = nn.MultiheadAttention(
             hidden_channels, n_attention_heads, batch_first=True
         )
@@ -270,8 +282,8 @@ class PyWakeProfileEncoderWithAttention(nn.Module):
         
         # Output projection
         self.output = nn.Sequential(
-            nn.Flatten(),  # (batch * n_turb, 36 * hidden)
-            nn.Linear(36 * hidden_channels, embed_dim),
+            nn.Flatten(),
+            nn.Linear(n_attention_tokens * hidden_channels, embed_dim),
             nn.LayerNorm(embed_dim),
             nn.GELU(),
             nn.Linear(embed_dim, embed_dim),
@@ -281,10 +293,13 @@ class PyWakeProfileEncoderWithAttention(nn.Module):
         batch_size, n_turbines, n_dirs = profiles.shape
         x = profiles.view(batch_size * n_turbines, 1, n_dirs)
         
-        # CNN: (batch * n_turb, hidden, 36)
+        # CNN: (batch * n_turb, hidden, n_dirs)
         x = self.cnn(x)
         
-        # Transpose for attention: (batch * n_turb, 36, hidden)
+        # Adaptive pool to fixed size: (batch * n_turb, hidden, n_attention_tokens)
+        x = self.adaptive_pool(x)
+        
+        # Transpose for attention: (batch * n_turb, n_attention_tokens, hidden)
         x = x.transpose(1, 2)
         
         # Add positional embedding
@@ -301,8 +316,7 @@ class PyWakeProfileEncoderWithAttention(nn.Module):
 
 # ===============================================================
 # Fourier based encoders for PyWake profiles
-# ======
-
+# ===============================================================
 
 class FourierProfileEncoder(nn.Module):
     """
@@ -319,6 +333,7 @@ class FourierProfileEncoder(nn.Module):
     - Naturally handles circular wraparound
     - Interpretable components
     - No learned pooling that might destroy information
+    - Works with ANY n_profile_directions
     
     Args:
         embed_dim: Output embedding dimension
@@ -333,7 +348,7 @@ class FourierProfileEncoder(nn.Module):
         self, 
         embed_dim: int = 128, 
         n_harmonics: int = 8,
-        use_phase: bool = False, # False beacuse if we did true, then it MIGHT be unstable, due to phase discontinuities
+        use_phase: bool = False,
         learnable_weights: bool = True,
     ):
         super().__init__()
@@ -364,7 +379,7 @@ class FourierProfileEncoder(nn.Module):
         """
         Args:
             profiles: (batch, n_turbines, n_directions) 
-                     Angular profiles, e.g., (32, 10, 360)
+                     Angular profiles, e.g., (32, 10, 72) or (32, 10, 360)
                      Assumed to be in wind-relative frame (index 0 = upstream)
         
         Returns:
@@ -380,7 +395,17 @@ class FourierProfileEncoder(nn.Module):
         fft = torch.fft.rfft(x, dim=-1)
         
         # Extract first n_harmonics + 1 (including DC)
-        fft = fft[:, :self.n_harmonics + 1]
+        # Note: For small n_dirs, we might have fewer harmonics available
+        n_available = min(self.n_harmonics + 1, fft.shape[-1])
+        fft = fft[:, :n_available]
+        
+        # Pad with zeros if we have fewer harmonics than expected
+        if n_available < self.n_harmonics + 1:
+            padding = torch.zeros(
+                fft.shape[0], self.n_harmonics + 1 - n_available,
+                dtype=fft.dtype, device=fft.device
+            )
+            fft = torch.cat([fft, padding], dim=-1)
         
         # Apply learnable harmonic weights
         fft = fft * self.harmonic_weights.to(fft.device)
@@ -432,7 +457,11 @@ class FourierProfileEncoder(nn.Module):
         h1_direction = -torch.angle(h1) * n_dirs / (2 * math.pi)  # Convert to index
         h1_direction = h1_direction % n_dirs  # Wrap to [0, n_dirs)
         
-        higher_mags = torch.abs(fft[:, 2:self.n_harmonics + 1]) * 2 / n_dirs
+        n_higher = min(self.n_harmonics - 1, fft.shape[-1] - 2)
+        if n_higher > 0:
+            higher_mags = torch.abs(fft[:, 2:2 + n_higher]) * 2 / n_dirs
+        else:
+            higher_mags = torch.zeros(x.shape[0], 0, device=x.device)
         
         return {
             'dc': dc.reshape(batch_size, n_turbines),
@@ -448,6 +477,8 @@ class FourierProfileEncoderWithContext(nn.Module):
     
     This allows the encoder to learn direction-dependent transformations,
     which can be useful if profiles are NOT pre-rotated to wind-relative frame.
+    
+    Works with any n_profile_directions.
     """
     
     def __init__(
@@ -488,7 +519,19 @@ class FourierProfileEncoderWithContext(nn.Module):
         
         # Fourier features
         x = profiles.reshape(batch_size * n_turbines, n_dirs)
-        fft = torch.fft.rfft(x, dim=-1)[:, :self.n_harmonics + 1]
+        fft = torch.fft.rfft(x, dim=-1)
+        
+        # Handle case where n_dirs is small
+        n_available = min(self.n_harmonics + 1, fft.shape[-1])
+        fft = fft[:, :n_available]
+        
+        # Pad if needed
+        if n_available < self.n_harmonics + 1:
+            padding = torch.zeros(
+                fft.shape[0], self.n_harmonics + 1 - n_available,
+                dtype=fft.dtype, device=fft.device
+            )
+            fft = torch.cat([fft, padding], dim=-1)
         
         fourier_features = torch.cat([
             fft[:, 0:1].real,
@@ -508,4 +551,48 @@ class FourierProfileEncoderWithContext(nn.Module):
         embeddings = self.proj(combined)
         
         return embeddings.reshape(batch_size, n_turbines, -1)
+    
+    
+# =============================================================================
+# QUICK TEST
+# =============================================================================
 
+if __name__ == "__main__":
+    import time
+    
+    torch.manual_seed(42)
+    
+    # Test setup
+    batch_size = 32
+    n_turbines = 10
+    n_directions = int(360/2)
+    embed_dim = 128
+    
+    profiles = torch.randn(batch_size, n_turbines, n_directions)
+    
+    encoders = {
+        "Original": PyWakeProfileEncoder(embed_dim),
+        "PyWakeProfileEncoderWithAttention": PyWakeProfileEncoderWithAttention(embed_dim),
+        "Dilated": PyWakeProfileEncoderDilated(embed_dim),
+        "FourierProfileEncoder": FourierProfileEncoder(embed_dim),
+    }
+    
+    print(f"Input shape: {profiles.shape}\n")
+    
+    for name, encoder in encoders.items():
+        # Count parameters
+        n_params = sum(p.numel() for p in encoder.parameters())
+        
+        # Time forward pass
+        encoder.eval()
+        with torch.no_grad():
+            start = time.time()
+            for _ in range(100):
+                out = encoder(profiles)
+            elapsed = (time.time() - start) / 100 * 1000
+        
+        print(f"{name}:")
+        print(f"  Parameters: {n_params:,}")
+        print(f"  Output shape: {out.shape}")
+        print(f"  Forward time: {elapsed:.2f} ms")
+        print()
