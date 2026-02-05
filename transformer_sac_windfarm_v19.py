@@ -4,7 +4,8 @@ Transformer-based SAC for Wind Farm Control - V19
 Changes in V19_
 - Renamed encodings_helper to positional_encodings_helper
 - Made profile_encodings_helper
-- 
+- Add profile_fusion_type, joint or add
+- Added RelativePositionalBiasAdvanced, RelativePositionalBiasFactorized, and RelativePositionalBiasWithWind
 
 Changes in V18:
 - Removed sample_env
@@ -48,11 +49,14 @@ POSITIONAL ENCODING OPTIONS (--pos_encoding_type):
 - "alibi": Linear distance penalty (no learned params)
 - "alibi_directional": ALiBi with upwind/downwind asymmetry (learned slopes)
 - "absolute_plus_relative": Both absolute embedding AND relative bias
-
+- "RelativePositionalBiasAdvanced": Relative bias with distance and angle features
+- "RelativePositionalBiasFactorized": Factorized relative bias for efficiency
+- "RelativePositionalBiasWithWind": Relative bias incorporating wind direction
 
 MAIN TASKS:
 [ ] Implement FourierProfileEncoderWithContext that takes wind direction as input
-[ ] Add Joint fusion of receptivity and influence profiles. So h = h + f(recep, influence), where f is nn with concat of both profiles as input.
+[ ] Add RelativePositionalBiasWithWind that takes wind direction as input
+[x] Add Joint fusion of receptivity and influence profiles. So h = h + f(recep, influence), where f is nn with concat of both profiles as input.
 [ ] Make weights shared between actor and critic for: pos_encoder, rel_pos_bias, input_proj, transformer
 [x] Add receptivity profile as option for positional encoding
 [x] Add infuence profile as option for positional encoding
@@ -133,6 +137,9 @@ from positional_encodings_helper import (
     RelativePolarBias,
     ALiBiPositionalBias,
     DirectionalALiBiPositionalBias,
+    RelativePositionalBiasAdvanced,
+    RelativePositionalBiasFactorized,
+    RelativePositionalBiasWithWind,
 )
 
 from profile_encodings_helper import (
@@ -172,7 +179,7 @@ class Args:
     profile_encoder_hidden: int = 128       # Hidden dim in profile encoder MLP
     rotate_profiles: bool = True            # Rotate profiles to wind-relative frame
     n_profile_directions: int = 360         # Number of directions in profile
-
+    profile_fusion_type: str = "add"       # "add" or "joint" fusion of receptivity and influence profiles
     # === Environment Settings ===
     turbtype: str = "DTU10MW"  # Wind turbine type
     TI_type: str = "Random"   # Turbulence intensity sampling
@@ -263,7 +270,9 @@ VALID_POS_ENCODING_TYPES = [
     "relative_polar_shared",       # MLP on pairwise (Δr, Δθ) → attention bias (shared)
     "alibi",                # Linear distance penalty (no learned params)
     "alibi_directional",    # ALiBi with upwind/downwind asymmetry
-    
+    "RelativePositionalBiasAdvanced",  # Advanced relative bias with distance and angle features
+    "RelativePositionalBiasFactorized", # Factorized relative bias for efficiency
+    "RelativePositionalBiasWithWind",   # Relative bias incorporating wind direction
     # === Combined ===
     "absolute_plus_relative",  # Both absolute embedding AND relative bias
 ]
@@ -391,6 +400,32 @@ def create_positional_encoding(
         rel_pos_bias = DirectionalALiBiPositionalBias(num_heads=num_heads)
         uses_additive_embedding = False
     
+    elif encoding_type == "RelativePositionalBiasAdvanced":
+        # Advanced relative bias with distance and angle features
+        pos_encoder = None
+        rel_pos_bias = RelativePositionalBiasAdvanced(
+            num_heads=num_heads,
+            hidden_dim=rel_pos_hidden_dim,
+            characteristic_distance=5.0,
+            use_physics_asymmetry=True,
+        )
+        uses_additive_embedding = False
+        
+    elif encoding_type == "RelativePositionalBiasFactorized":
+        # Factorized relative bias for efficiency
+        pos_encoder = None
+        rel_pos_bias = RelativePositionalBiasFactorized(
+            num_heads=num_heads,
+            hidden_dim=rel_pos_hidden_dim,
+        )
+        uses_additive_embedding = False
+        
+    elif encoding_type == "RelativePositionalBiasWithWind":
+        # Relative bias incorporating wind direction
+        # NOT YET IMPLEMENTED
+        raise NotImplementedError(
+            "RelativePositionalBiasWithWind requires wind direction as input. See TODO."
+        )
     # =========================================================================
     # Combined Encodings
     # =========================================================================
@@ -512,6 +547,11 @@ def create_profile_encoding(
                 learnable_weights=True,
         )
         
+    elif profile_type == "FourierProfileEncoderWithContext":
+        raise NotImplementedError(
+            "FourierProfileEncoderWithContext requires wind direction as input. See TODO."
+        )
+    
     else:
         raise ValueError(f"profile type '{profile_type}' not implemented yet.")
     
@@ -715,9 +755,7 @@ class TransformerActor(nn.Module):
         profile_encoding: Optional[str] = None,
         profile_encoder_hidden: int = 128,
         n_profile_directions: int = 360,
-        
-
-
+        profile_fusion_type: str = "add",  # "add" or "joint"
     ):
         """
         Args:
@@ -745,6 +783,10 @@ class TransformerActor(nn.Module):
         self.embed_dim = embed_dim
         self.pos_encoding_type = pos_encoding_type
         self.profile_encoding = profile_encoding
+        self.profile_fusion_type = profile_fusion_type
+
+        assert profile_fusion_type in ("add", "joint"), \
+            f"Invalid profile_fusion_type: {profile_fusion_type}"
 
         # Create positional encoding modules based on type
         self.pos_encoder, self.rel_pos_bias, self.uses_additive_embedding = \
@@ -764,6 +806,14 @@ class TransformerActor(nn.Module):
                 profile_type=profile_encoding,
                 embed_dim=embed_dim,
                 hidden_channels=profile_encoder_hidden,
+            )
+
+        if profile_encoding is not None and profile_fusion_type == "joint":
+            self.profile_fusion = nn.Sequential(
+                nn.Linear(2 * embed_dim, embed_dim),
+                nn.LayerNorm(embed_dim),
+                nn.GELU(),
+                nn.Linear(embed_dim, embed_dim),
             )
 
         # Observation encoder (shared across turbines)
@@ -834,7 +884,12 @@ class TransformerActor(nn.Module):
         if self.recep_encoder and recep_profile is not None and influence_profile is not None:
             recep_embed = self.recep_encoder(recep_profile)  # (batch, n_turb, embed_dim)
             influence_embed = self.influence_encoder(influence_profile)  # (batch, n_turb, embed_dim)
-            h = h + recep_embed + influence_embed
+            
+            if self.profile_fusion_type == "joint":
+                profile_combined = torch.cat([recep_embed, influence_embed], dim=-1)
+                h = h + self.profile_fusion(profile_combined)
+            else:
+                h = h + recep_embed + influence_embed
 
 
         # Compute relative position bias if using relative encoding
@@ -954,12 +1009,14 @@ class TransformerCritic(nn.Module):
         profile_encoding: Optional[str] = None,
         profile_encoder_hidden: int = 128,
         n_profile_directions: int = 360,
+        profile_fusion_type: str = "add",  # "add" or "joint"
     ):
         super().__init__()
         
         self.embed_dim = embed_dim
         self.pos_encoding_type = pos_encoding_type
         self.profile_encoding = profile_encoding
+        self.profile_fusion_type = profile_fusion_type
         
         # Create positional encoding modules based on type
         self.pos_encoder, self.rel_pos_bias, self.uses_additive_embedding = \
@@ -995,6 +1052,13 @@ class TransformerCritic(nn.Module):
         else:
             self.input_proj = nn.Identity()
 
+        if profile_encoding is not None and profile_fusion_type == "joint":
+            self.profile_fusion = nn.Sequential(
+                nn.Linear(2 * embed_dim, embed_dim),
+                nn.LayerNorm(embed_dim),
+                nn.GELU(),
+                nn.Linear(embed_dim, embed_dim),
+            )
 
         # Transformer encoder (choose based on encoding type)
         self.transformer = TransformerEncoder(
@@ -1047,11 +1111,16 @@ class TransformerCritic(nn.Module):
         # Project to embed_dim
         h = self.input_proj(h)
         
-        # ADD profile encoding (after projection)
+        # ADD profile encoding (after projection, like positional encoding in LLMs)
         if self.recep_encoder and recep_profile is not None and influence_profile is not None:
             recep_embed = self.recep_encoder(recep_profile)  # (batch, n_turb, embed_dim)
             influence_embed = self.influence_encoder(influence_profile)  # (batch, n_turb, embed_dim)
-            h = h + recep_embed + influence_embed
+            
+            if self.profile_fusion_type == "joint":
+                profile_combined = torch.cat([recep_embed, influence_embed], dim=-1)
+                h = h + self.profile_fusion(profile_combined)
+            else:
+                h = h + recep_embed + influence_embed
 
         # Compute relative position bias if using relative encoding
         attn_bias = None
@@ -1597,17 +1666,7 @@ def main():
         autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,
     )
     envs = RecordEpisodeVals(envs)
-    
-    # Get dimensions from sample env
-    # sample_env = make_env_fn(args.seed)()
-    # sample_obs, sample_info = sample_env.reset()
-    
-    # n_turbines_max = sample_env.max_turbines
-    # obs_dim_per_turbine = sample_obs.shape[1]
-    # action_dim_per_turbine = 1
-    # rotor_diameter = sample_env.rotor_diameter
-    # sample_env.close()
-    
+       
 
     n_turbines_max = envs.env.get_attr('max_turbines')[0]
     obs_dim_per_turbine = envs.single_observation_space.shape[-1]
@@ -1720,6 +1779,7 @@ def main():
         "profile_encoding": args.profile_encoding_type,
         "profile_encoder_hidden": args.profile_encoder_hidden,
         "n_profile_directions": args.n_profile_directions,
+        "profile_fusion_type": args.profile_fusion_type,
     }
 
     if args.profile_encoding_type is not None:
