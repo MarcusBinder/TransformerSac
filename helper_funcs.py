@@ -19,6 +19,11 @@ import re
 
 from typing import Optional, Tuple, List, Dict, Any
 
+def soft_update(source, target, tau):
+    with torch.no_grad():
+        source_params = list(source.parameters())
+        target_params = list(target.parameters())
+        torch._foreach_lerp_(target_params, source_params, tau)
 
 
 # =============================================================================
@@ -443,6 +448,14 @@ def get_env_receptivity_profiles(envs) -> np.ndarray:
         print("I dont know if this will cause issues later, so be careful")
     return np.array(envs.env.get_attr('receptivity_profiles'), dtype=np.float32)
 
+def get_env_layout_indices(envs) -> List[int]:
+    """Get current layout index for each env."""
+    return list(envs.env.get_attr('current_layout_index'))
+
+def get_env_permutations(envs) -> List[np.ndarray]:
+    """Get current turbine permutation for each env."""
+    return list(envs.env.get_attr('current_permutation'))
+
 def get_env_influence_profiles(envs) -> np.ndarray:
     """Get influence profiles from vectorized environments.
     Returns:
@@ -458,10 +471,10 @@ def get_env_attention_masks(envs) -> np.ndarray:
     """Get attention masks from each environment."""
     return np.array(envs.env.get_attr('attention_mask'), dtype=bool)
 
+
 def rotate_profiles_tensor(
     profiles: torch.Tensor,
     wind_directions: torch.Tensor,
-    # n_directions: int = 360
 ) -> torch.Tensor:
     """
     Rotate profiles so current wind direction is at index 0.
@@ -474,19 +487,15 @@ def rotate_profiles_tensor(
     Returns:
         Rotated profiles with same shape
     """
-    batch_size = profiles.shape[0]
     n_directions = profiles.shape[2]
     degrees_per_index = 360.0 / n_directions
-    
-    # Calculate shifts
+
     shifts = (wind_directions / degrees_per_index).round().long()
-    
-    # Roll each sample individually (torch.roll doesn't support per-sample shifts)
-    rotated = torch.empty_like(profiles)
-    for i in range(batch_size):
-        rotated[i] = torch.roll(profiles[i], shifts=-shifts[i].item(), dims=-1)
-    
-    return rotated
+    # Build shifted indices: (batch, 1, n_directions)
+    base_idx = torch.arange(n_directions, device=profiles.device)
+    indices = (base_idx[None, None, :] + shifts[:, None, None]) % n_directions
+    return torch.gather(profiles, 2, indices.expand_as(profiles))
+
 
 def save_checkpoint(
     actor: nn.Module,
