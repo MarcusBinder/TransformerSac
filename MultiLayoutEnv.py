@@ -347,6 +347,14 @@ class MultiLayoutEnv(gym.Env):
     # =========================================================================
     
     @property
+    def current_layout_index(self) -> int:
+        """Index of current layout in self.layouts list."""
+        for i, layout in enumerate(self.layouts):
+            if layout.name == self.current_layout.name:
+                return i
+        raise ValueError(f"Current layout '{self.current_layout.name}' not found in layouts list")
+
+    @property
     def n_turbines(self) -> int:
         """Actual number of turbines in current layout (not padded)."""
         return self.current_layout.n_turbines
