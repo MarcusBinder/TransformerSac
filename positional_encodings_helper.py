@@ -19,6 +19,9 @@ import tyro
 from torch.utils.tensorboard import SummaryWriter
 from collections import deque
 
+from torch_geometric.nn import GATv2Conv
+from torch_geometric.data import Data, Batch
+
 
 class AbsolutePositionalEncoding(nn.Module): # I dont like this one
     """
@@ -1032,3 +1035,561 @@ class RelativePositionalBiasWithWind(nn.Module):
             bias = bias.masked_fill(mask, 0.0)
         
         return bias
+
+class SpatialContextEmbedding(nn.Module):
+    """
+    Per-turbine embedding based on spatial neighborhood structure.
+
+    For each turbine, computes physics-meaningful summary features
+    from the relative positions of all other turbines:
+      - Upstream / downstream / lateral neighbor counts at multiple distance thresholds
+      - Nearest neighbor distances in each directional sector
+      - Angular sector occupancy (turbine count + min distance per sector)
+      - Global stats (total neighbors, mean distance)
+
+    These features describe a turbine's "role" in the farm (edge vs interior,
+    upstream exposure, downstream influence footprint) without being tied to
+    any absolute position. A turbine on the upwind edge of a 5-turbine row
+    and the upwind edge of a 20-turbine grid get similar feature vectors.
+
+    Output is added to token embeddings, same as profile encodings.
+
+    Pathway: ADDITIVE (added to token embeddings)
+    """
+    def __init__(
+        self,
+        embed_dim: int = 128,
+        distance_thresholds: Tuple[float, ...] = (3.0, 5.0, 8.0, 12.0),
+        n_angular_sectors: int = 8,
+    ):
+        """
+        Args:
+            embed_dim: Output dimension (should match transformer embed_dim)
+            distance_thresholds: Distance shells (in rotor diameters) for
+                                 counting upstream/downstream/lateral neighbors
+            n_angular_sectors: Number of angular bins for sector features
+        """
+        super().__init__()
+        self.distance_thresholds = distance_thresholds
+        self.n_angular_sectors = n_angular_sectors
+        
+        # Feature count breakdown:
+        #   3 * len(thresholds)  — upstream/downstream/lateral counts per threshold
+        #   3                    — nearest upstream/downstream/lateral distances
+        #   2 * n_sectors        — per-sector count + min distance
+        #   2                    — total neighbors, mean distance
+        n_threshold_feats = 3 * len(distance_thresholds)
+        n_nearest_feats = 3
+        n_sector_feats = 2 * n_angular_sectors
+        n_global_feats = 2
+        
+        self.feature_dim = n_threshold_feats + n_nearest_feats + n_sector_feats + n_global_feats
+        
+        self.encoder = nn.Sequential(
+            nn.Linear(self.feature_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        
+        # Sector boundaries (fixed)
+        sector_edges = torch.linspace(-math.pi, math.pi, n_angular_sectors + 1)
+        self.register_buffer("sector_lo", sector_edges[:-1])
+        self.register_buffer("sector_hi", sector_edges[1:])
+    
+    def forward(
+        self,
+        positions: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            positions: (B, N, 2) wind-relative, normalized by rotor diameter
+            key_padding_mask: (B, N) True = padding
+
+        Returns:
+            embeddings: (B, N, embed_dim)
+        """
+        B, N, _ = positions.shape
+        device = positions.device
+        
+        # Pairwise relative positions
+        pos_i = positions.unsqueeze(2)  # (B, N, 1, 2)
+        pos_j = positions.unsqueeze(1)  # (B, 1, N, 2)
+        rel = pos_j - pos_i             # (B, N, N, 2) "from i, where is j?"
+        
+        dx = rel[..., 0]  # positive = j is upstream of i (wind-relative)
+        dy = rel[..., 1]
+        dist = torch.sqrt(dx**2 + dy**2 + 1e-8)  # (B, N, N)
+        angle = torch.atan2(dy, dx)                # (B, N, N)
+        
+        # Mask: exclude self-pairs and padded turbines
+        self_mask = torch.eye(N, device=device, dtype=torch.bool).unsqueeze(0)  # (1, N, N)
+        if key_padding_mask is not None:
+            pad_mask = key_padding_mask.unsqueeze(1)  # (B, 1, N) - j is padding
+            valid = ~(self_mask | pad_mask)
+        else:
+            valid = ~self_mask
+        
+        # Replace invalid distances with large number
+        LARGE = 1e6
+        dist_masked = dist.masked_fill(~valid, LARGE)
+
+        # Directional classification (relative to wind)
+        is_upstream = dx > torch.abs(dy) * 0.5
+        is_downstream = dx < -torch.abs(dy) * 0.5
+        is_lateral = ~is_upstream & ~is_downstream
+
+        features = []
+
+        # --- Threshold features: neighbor counts ---
+        for thresh in self.distance_thresholds:
+            within = (dist_masked < thresh) & valid
+            features.append((within & is_upstream).float().sum(dim=-1, keepdim=True))
+            features.append((within & is_downstream).float().sum(dim=-1, keepdim=True))
+            features.append((within & is_lateral).float().sum(dim=-1, keepdim=True))
+
+        # --- Nearest distances per direction ---
+        scale = 10.0
+        up_dist = dist_masked.masked_fill(~(is_upstream & valid), LARGE)
+        dn_dist = dist_masked.masked_fill(~(is_downstream & valid), LARGE)
+        lat_dist = dist_masked.masked_fill(~(is_lateral & valid), LARGE)
+
+        features.append(
+            (up_dist.min(dim=-1).values / scale).clamp(max=1.0).unsqueeze(-1)
+        )
+        features.append(
+            (dn_dist.min(dim=-1).values / scale).clamp(max=1.0).unsqueeze(-1)
+        )
+        features.append(
+            (lat_dist.min(dim=-1).values / scale).clamp(max=1.0).unsqueeze(-1)
+        )
+
+        # --- Angular sector features ---
+        for s in range(self.n_angular_sectors):
+            in_sector = (
+                (angle >= self.sector_lo[s])
+                & (angle < self.sector_hi[s])
+                & valid
+            )
+            features.append(in_sector.float().sum(dim=-1, keepdim=True))
+            sector_dist = dist_masked.masked_fill(~in_sector, LARGE)
+            features.append(
+                (sector_dist.min(dim=-1).values / scale)
+                .clamp(max=1.0)
+                .unsqueeze(-1)
+            )
+
+        # --- Global features ---
+        max_thresh = max(self.distance_thresholds)
+        n_neighbors = (
+            ((dist_masked < max_thresh) & valid).float().sum(dim=-1, keepdim=True)
+        )
+        valid_count = valid.float().sum(dim=-1, keepdim=True).clamp(min=1)
+        mean_dist = (
+            dist_masked.masked_fill(~valid, 0.0).sum(dim=-1, keepdim=True)
+            / valid_count
+            / scale
+        )
+        features.append(n_neighbors)
+        features.append(mean_dist.clamp(max=1.0))
+
+        feat_vec = torch.cat(features, dim=-1)  # (B, N, feature_dim)
+        return self.encoder(feat_vec)
+    
+class NeighborhoodAggregationEmbedding(nn.Module):
+    """
+    Learned aggregation of pairwise spatial features into per-token embeddings.
+    
+    For each turbine i, attends over all other turbines j using spatial
+    features (distance, angle, upstream/downstream) as keys, and aggregates
+    into a single context vector.
+    
+    This is essentially one round of message passing on the spatial graph
+    before the main transformer processes the tokens.
+
+    Pathway: ADDITIVE (added to token embeddings)
+    """
+    def __init__(
+        self,
+        embed_dim: int = 128,
+        n_heads: int = 4,
+        pairwise_dim: int = 6,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.n_heads = n_heads
+        self.head_dim = embed_dim // n_heads
+        
+        # Pairwise features → key/value
+        # Input: (dist_norm, cos_angle, sin_angle, dx_norm, dy_norm, log_dist)
+        self.pairwise_dim = pairwise_dim
+        self.kv_proj = nn.Linear(pairwise_dim, 2 * embed_dim)
+        
+        # Learnable query per head (not per turbine — structure-agnostic)
+        self.query = nn.Parameter(torch.randn(1, 1, n_heads, self.head_dim) * 0.02)
+        
+        self.out_proj = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+    
+    def forward(self, positions, key_padding_mask=None):
+        """
+        positions: (B, N, 2) wind-relative
+        Returns: (B, N, embed_dim) per-turbine spatial context
+        """
+        B, N, _ = positions.shape
+        
+        pos_i = positions.unsqueeze(2)  # (B, N, 1, 2)
+        pos_j = positions.unsqueeze(1)  # (B, 1, N, 2)
+        rel = pos_j - pos_i             # (B, N, N, 2)
+        
+        dx, dy = rel[..., 0], rel[..., 1]
+        dist = torch.sqrt(dx**2 + dy**2 + 1e-8)
+        angle = torch.atan2(dy, dx)
+        
+        # Pairwise features
+        feats = torch.stack([
+            dist,                           #  distance, already normalized by rotor diameter
+            torch.cos(angle),                # direction cosine
+            torch.sin(angle),                # direction sine
+            dx / (dist + 1e-8),              # unit dx
+            dy / (dist + 1e-8),              # unit dy
+            torch.log1p(dist),               # log distance (soft)
+        ], dim=-1)  # (B, N, N, 6)
+        
+        # Project to keys and values
+        kv = self.kv_proj(feats)  # (B, N, N, 2*embed_dim)
+        k, v = kv.chunk(2, dim=-1)
+        
+        # Reshape for multi-head attention
+        k = k.view(B, N, N, self.n_heads, self.head_dim)  # (B, N, N, H, D)
+        v = v.view(B, N, N, self.n_heads, self.head_dim)
+        
+        # Query broadcasts: (1, 1, H, D) → (B, N, H, D)
+        q = self.query.expand(B, N, -1, -1)
+        
+        # Attention: for each turbine i, attend over all j
+        # q: (B, N, H, D), k: (B, N, N, H, D)
+        attn_logits = torch.einsum('bnhd,bnmhd->bnmh', q, k) / (self.head_dim ** 0.5)
+        
+        # Mask self and padding
+        self_mask = torch.eye(N, device=positions.device, dtype=torch.bool)
+        attn_logits = attn_logits.masked_fill(self_mask.unsqueeze(0).unsqueeze(-1), float('-inf'))
+        
+        if key_padding_mask is not None:
+            pad_mask = key_padding_mask.unsqueeze(1).unsqueeze(-1)  # (B, 1, N, 1)
+            attn_logits = attn_logits.masked_fill(pad_mask, float('-inf'))
+        
+        attn_weights = F.softmax(attn_logits, dim=2)  # over j dimension
+        
+        # Aggregate: (B, N, N, H, D) weighted sum over N → (B, N, H, D)
+        context = torch.einsum('bnmh,bnmhd->bnhd', attn_weights, v)
+        context = context.reshape(B, N, self.embed_dim)
+        
+        return self.out_proj(context)
+    
+class WakeKernelBias(nn.Module):
+    """
+    Physics-motivated attention bias with very few learnable parameters.
+
+    Models the wake interaction pattern:
+      - Distance decay: closer turbines get more attention
+      - Upstream bonus: turbines directly upstream matter most
+      - Lateral Gaussian falloff: turbines perpendicular to wind matter less
+
+    Only ~3 * num_heads learnable parameters -> essentially impossible to overfit.
+    The inductive bias is correct for wake physics; the model just learns the
+    right scale/strength per attention head.
+
+    Pathway: ATTENTION BIAS (added to attention logits, like RelativePositionalBias)
+    """
+
+    def __init__(self, num_heads: int):
+        """
+        Args:
+            num_heads: Number of attention heads
+        """
+        super().__init__()
+        self.num_heads = num_heads
+
+        # Per-head learnable parameters
+        self.dist_decay = nn.Parameter(torch.ones(num_heads) * 0.3)
+        self.lateral_width = nn.Parameter(torch.ones(num_heads) * 2.0)
+        self.upstream_bonus = nn.Parameter(torch.ones(num_heads) * 1.0)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            positions: (B, N, 2) wind-relative positions (rotor-diameter normalized)
+            key_padding_mask: (B, N) True = padding
+
+        Returns:
+            bias: (B, num_heads, N, N) — add to attention logits before softmax
+        """
+        B, N, _ = positions.shape
+
+        pos_i = positions.unsqueeze(2)
+        pos_j = positions.unsqueeze(1)
+        rel = pos_j - pos_i
+
+        dx = rel[..., 0]  # positive = j upstream of i (wind-relative)
+        dy = rel[..., 1]
+        dist = torch.sqrt(dx ** 2 + dy ** 2 + 1e-8)
+
+        # Expand for heads: (B, 1, N, N)
+        dx = dx.unsqueeze(1)
+        dy = dy.unsqueeze(1)
+        dist = dist.unsqueeze(1)
+
+        decay = self.dist_decay.abs().view(1, -1, 1, 1)
+        width = (self.lateral_width.abs() + 0.1).view(1, -1, 1, 1)
+        bonus = self.upstream_bonus.view(1, -1, 1, 1)
+
+        # bias = distance_decay + upstream_bonus + lateral_penalty
+        bias = -decay * dist
+        bias = bias + bonus * torch.tanh(dx)
+        bias = bias - (dy ** 2) / (2 * width ** 2)
+
+        # Mask padded positions
+        if key_padding_mask is not None:
+            mask = key_padding_mask.unsqueeze(1).unsqueeze(2) | \
+                   key_padding_mask.unsqueeze(1).unsqueeze(3)
+            bias = bias.masked_fill(mask, 0.0)
+
+        return bias
+
+
+class GATPositionalEncoder(nn.Module):
+    """
+    Graph Attention Network that produces per-turbine spatial context
+    embeddings from positions (and optionally wind conditions).
+
+    Uses PyG's GATv2Conv for message passing, which applies a more
+    expressive "dynamic" attention mechanism (Brody et al., 2022).
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 128,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        edge_dim: int = 8,
+        use_wind_context: bool = False,
+        distance_cutoff: Optional[float] = None,
+    ):
+        super().__init__()
+        self.n_layers = n_layers
+        self.n_heads = n_heads
+        self.embed_dim = embed_dim
+        self.distance_cutoff = distance_cutoff
+        self.use_wind_context = use_wind_context
+
+        # --- Raw edge features (8-dim) → projected edge features ---
+        raw_edge_dim = 8
+        self.edge_proj = nn.Sequential(
+            nn.Linear(raw_edge_dim, edge_dim * 2),
+            nn.GELU(),
+            nn.Linear(edge_dim * 2, edge_dim),
+        )
+
+        # --- Initial node embedding ---
+        if use_wind_context:
+            self.node_init = nn.Sequential(
+                nn.Linear(3, embed_dim),
+                nn.GELU(),
+                nn.Linear(embed_dim, embed_dim),
+            )
+        else:
+            self.node_init_embed = nn.Parameter(
+                torch.randn(1, 1, embed_dim) * 0.02
+            )
+
+        # --- GAT layers using PyG's GATv2Conv ---
+        self.gat_layers = nn.ModuleList()
+        self.norms1 = nn.ModuleList()
+        self.norms2 = nn.ModuleList()
+        self.ffns = nn.ModuleList()
+
+        for _ in range(n_layers):
+            # GATv2Conv: concat heads then project back to embed_dim
+            self.gat_layers.append(
+                GATv2Conv(
+                    in_channels=embed_dim,
+                    out_channels=embed_dim // n_heads,
+                    heads=n_heads,
+                    edge_dim=edge_dim,
+                    concat=True,           # concat heads → n_heads * (embed_dim // n_heads) = embed_dim
+                    add_self_loops=False,   # we handle topology explicitly
+                    share_weights=False,
+                )
+            )
+            self.norms1.append(nn.LayerNorm(embed_dim))
+            self.norms2.append(nn.LayerNorm(embed_dim))
+            self.ffns.append(nn.Sequential(
+                nn.Linear(embed_dim, embed_dim * 2),
+                nn.GELU(),
+                nn.Linear(embed_dim * 2, embed_dim),
+            ))
+
+        self.final_norm = nn.LayerNorm(embed_dim)
+
+    def _build_pyg_batch(self, positions, key_padding_mask=None):
+        """
+        Convert dense (B, N, 2) positions into a PyG Batch with
+        edge_index and projected edge_attr.
+
+        Returns:
+            batch: PyG Batch object
+            valid_counts: (B,) number of real turbines per sample
+        """
+        B, N, _ = positions.shape
+        device = positions.device
+
+        graphs = []
+        for b in range(B):
+            # Determine valid nodes
+            if key_padding_mask is not None:
+                valid = ~key_padding_mask[b]  # (N,) True = real
+                n_valid = valid.sum().item()
+                pos_b = positions[b, valid]   # (n_valid, 2)
+            else:
+                n_valid = N
+                pos_b = positions[b]          # (N, 2)
+
+            # Build fully-connected edge index (no self-loops)
+            src = torch.arange(n_valid, device=device).repeat_interleave(n_valid - 1)
+            # For each node i, connect to all j != i
+            dst_list = []
+            for i in range(n_valid):
+                others = torch.cat([
+                    torch.arange(0, i, device=device),
+                    torch.arange(i + 1, n_valid, device=device),
+                ])
+                dst_list.append(others)
+            dst = torch.cat(dst_list)
+            edge_index = torch.stack([src, dst], dim=0)  # (2, n_valid*(n_valid-1))
+
+            # Compute raw pairwise features for these edges
+            pos_i = pos_b[edge_index[0]]  # (E, 2)
+            pos_j = pos_b[edge_index[1]]  # (E, 2)
+            rel = pos_j - pos_i           # (E, 2)
+
+            dx, dy = rel[:, 0], rel[:, 1]
+            dist = torch.sqrt(dx**2 + dy**2 + 1e-8)
+            angle = torch.atan2(dy, dx)
+
+            raw_feats = torch.stack([
+                dx / (dist + 1e-8),
+                dy / (dist + 1e-8),
+                dist / 10.0,
+                torch.cos(angle),
+                torch.sin(angle),
+                torch.log1p(dist),
+                torch.tanh(dx / (dist + 1e-8) * 2),
+                1 - torch.abs(dx / (dist + 1e-8)),
+            ], dim=-1)  # (E, 8)
+
+            edge_attr = self.edge_proj(raw_feats)  # (E, edge_dim)
+
+            # Optional distance cutoff
+            if self.distance_cutoff is not None:
+                keep = dist < self.distance_cutoff
+                edge_index = edge_index[:, keep]
+                edge_attr = edge_attr[keep]
+
+            graphs.append(Data(
+                x=torch.zeros(n_valid, self.embed_dim, device=device),  # placeholder
+                edge_index=edge_index,
+                edge_attr=edge_attr,
+                num_nodes=n_valid,
+            ))
+
+        batch = Batch.from_data_list(graphs)
+        valid_counts = torch.tensor(
+            [g.num_nodes for g in graphs], device=device
+        )
+        return batch, valid_counts
+
+    def forward(
+        self,
+        positions,
+        key_padding_mask=None,
+        wind_speed=None,
+        wind_direction=None,
+    ):
+        """
+        Args:
+            positions: (B, N, 2) wind-relative positions
+            key_padding_mask: (B, N) True = padding
+            wind_speed: (B,) optional
+            wind_direction: (B,) optional
+
+        Returns:
+            node_embeddings: (B, N, embed_dim) spatial context per turbine
+        """
+        B, N, _ = positions.shape
+        device = positions.device
+
+        # Build PyG batch (edge_index + edge_attr)
+        pyg_batch, valid_counts = self._build_pyg_batch(
+            positions, key_padding_mask
+        )
+
+        # Initialize node embeddings
+        if self.use_wind_context and wind_speed is not None:
+            wd_rad = wind_direction * (math.pi / 180.0)
+            wind_feats = torch.stack([
+                wind_speed / 15.0,
+                torch.cos(wd_rad),
+                torch.sin(wd_rad),
+            ], dim=-1)                          # (B, 3)
+            h_dense = self.node_init(wind_feats)  # (B, embed_dim)
+            h_dense = h_dense.unsqueeze(1).expand(-1, N, -1)
+        else:
+            h_dense = self.node_init_embed.expand(B, N, -1)
+
+        # Pack valid nodes into flat tensor matching PyG batch ordering
+        if key_padding_mask is not None:
+            h_list = [
+                h_dense[b, ~key_padding_mask[b]]
+                for b in range(B)
+            ]
+        else:
+            h_list = [h_dense[b] for b in range(B)]
+        h = torch.cat(h_list, dim=0)  # (total_nodes, embed_dim)
+
+        # Message passing
+        edge_index = pyg_batch.edge_index
+        edge_attr = pyg_batch.edge_attr
+
+        for gat, norm1, norm2, ffn in zip(
+            self.gat_layers, self.norms1, self.norms2, self.ffns
+        ):
+            h_norm = norm1(h)
+            h_out = gat(h_norm, edge_index, edge_attr=edge_attr)
+            h = h + h_out                 # residual
+            h = h + ffn(norm2(h))         # FFN + residual
+
+        h = self.final_norm(h)
+
+        # Unpack back to dense (B, N, embed_dim), zero-fill padding
+        out = torch.zeros(B, N, self.embed_dim, device=device)
+        offset = 0
+        for b in range(B):
+            nv = valid_counts[b].item()
+            if key_padding_mask is not None:
+                valid_idx = (~key_padding_mask[b]).nonzero(as_tuple=True)[0]
+                out[b, valid_idx] = h[offset : offset + nv]
+            else:
+                out[b, :nv] = h[offset : offset + nv]
+            offset += nv
+
+        return out
