@@ -19,8 +19,8 @@ import tyro
 from torch.utils.tensorboard import SummaryWriter
 from collections import deque
 
-from torch_geometric.nn import GATv2Conv
-from torch_geometric.data import Data, Batch
+# from torch_geometric.nn import GATv2Conv
+# from torch_geometric.data import Data, Batch
 
 
 class AbsolutePositionalEncoding(nn.Module): # I dont like this one
@@ -1367,13 +1367,100 @@ class WakeKernelBias(nn.Module):
         return bias
 
 
+class DenseGATv2Layer(nn.Module):
+    """
+    GATv2-style attention operating on dense (B, N, N) pairs.
+
+    Implements the "dynamic attention" of Brody et al. (2022):
+        e_ij = a^T · LeakyReLU(W_l·h_i + W_r·h_j + W_e·edge_ij)
+        a_ij = softmax_j(e_ij)
+        h_i' = Σ_j a_ij · W_r·h_j
+
+    All operations are fully batched — no loops over B or N.
+    """
+    def __init__(self, embed_dim: int, n_heads: int, edge_dim: int, dropout: float = 0.0):
+        super().__init__()
+        
+        assert embed_dim % n_heads == 0, "embed_dim must be divisible by n_heads"
+
+        self.n_heads = n_heads
+        self.head_dim = embed_dim // n_heads
+        self.scale = self.head_dim**-0.5  # optional scaling for stability
+
+        # Node projections (left = query-side, right = key/value-side)
+        self.W_l = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.W_r = nn.Linear(embed_dim, embed_dim, bias=False)
+
+        # Edge projection
+        self.W_e = nn.Linear(edge_dim, embed_dim, bias=False)
+
+        # Per-head attention vector
+        self.attn = nn.Parameter(torch.empty(n_heads, self.head_dim))
+        nn.init.xavier_normal_(self.attn.unsqueeze(-1))
+
+        # Output projection (after concatenating heads)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+        self.attn_dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        edge_feats: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            h:          (B, N, D) node embeddings
+            edge_feats: (B, N, N, edge_dim) pairwise edge features
+            attn_mask:  (B, N, N) bool — True = attend, False = mask out
+
+        Returns:
+            out: (B, N, D) updated node embeddings
+        """
+        B, N, D = h.shape
+        H, Dh = self.n_heads, self.head_dim
+
+        l = self.W_l(h)  # (B, N, D)
+        r = self.W_r(h)  # (B, N, D)
+
+        # Pairwise interaction: (B, N, 1, D) + (B, 1, N, D) + (B, N, N, D)
+        pair = l.unsqueeze(2) + r.unsqueeze(1) + self.W_e(edge_feats)
+        pair = F.leaky_relu(pair, negative_slope=0.2)
+
+        # Reshape to multi-head: (B, N, N, H, Dh)
+        pair = pair.view(B, N, N, H, Dh)
+
+        # Attention logits: dot with per-head vector → (B, N, N, H)
+        logits = (pair * self.attn).sum(dim=-1)
+
+        # Apply mask (padding + self-loops + optional distance cutoff)
+        if attn_mask is not None:
+            logits = logits.masked_fill(~attn_mask.unsqueeze(-1), float("-inf"))
+
+        weights = F.softmax(logits, dim=2)  # softmax over source dim j
+        weights = self.attn_dropout(weights)
+
+        # Values: use W_r·h (standard GATv2) reshaped to (B, N, H, Dh)
+        values = r.view(B, N, H, Dh)
+
+        # Weighted aggregation: (B, N_i, N_j, H) × (B, N_j, H, Dh) → (B, N_i, H, Dh)
+        out = torch.einsum("bijn,bjnh->binh", weights, values)
+        out = out.reshape(B, N, D)
+
+        return self.out_proj(out)
+    
 class GATPositionalEncoder(nn.Module):
     """
-    Graph Attention Network that produces per-turbine spatial context
+    Dense Graph Attention Network that produces per-turbine spatial context
     embeddings from positions (and optionally wind conditions).
 
-    Uses PyG's GATv2Conv for message passing, which applies a more
-    expressive "dynamic" attention mechanism (Brody et al., 2022).
+    Uses a fully vectorized GATv2-style attention mechanism operating on
+    dense (B, N, N) pair matrices. No PyG dependency required.
+
+    For wind farms of typical scale (10–100 turbines), dense attention is
+    both faster and simpler than sparse message passing, since the graphs
+    are fully or near-fully connected anyway.
     """
 
     def __init__(
@@ -1382,6 +1469,7 @@ class GATPositionalEncoder(nn.Module):
         n_heads: int = 4,
         n_layers: int = 2,
         edge_dim: int = 8,
+        dropout: float = 0.0,
         use_wind_context: bool = False,
         distance_cutoff: Optional[float] = None,
     ):
@@ -1389,6 +1477,7 @@ class GATPositionalEncoder(nn.Module):
         self.n_layers = n_layers
         self.n_heads = n_heads
         self.embed_dim = embed_dim
+        self.edge_dim = edge_dim
         self.distance_cutoff = distance_cutoff
         self.use_wind_context = use_wind_context
 
@@ -1412,184 +1501,146 @@ class GATPositionalEncoder(nn.Module):
                 torch.randn(1, 1, embed_dim) * 0.02
             )
 
-        # --- GAT layers using PyG's GATv2Conv ---
+        # --- GAT layers (dense) ---
         self.gat_layers = nn.ModuleList()
         self.norms1 = nn.ModuleList()
         self.norms2 = nn.ModuleList()
         self.ffns = nn.ModuleList()
 
         for _ in range(n_layers):
-            # GATv2Conv: concat heads then project back to embed_dim
             self.gat_layers.append(
-                GATv2Conv(
-                    in_channels=embed_dim,
-                    out_channels=embed_dim // n_heads,
-                    heads=n_heads,
-                    edge_dim=edge_dim,
-                    concat=True,           # concat heads → n_heads * (embed_dim // n_heads) = embed_dim
-                    add_self_loops=False,   # we handle topology explicitly
-                    share_weights=False,
-                )
+                DenseGATv2Layer(embed_dim, n_heads, edge_dim, dropout=dropout)
             )
             self.norms1.append(nn.LayerNorm(embed_dim))
             self.norms2.append(nn.LayerNorm(embed_dim))
-            self.ffns.append(nn.Sequential(
-                nn.Linear(embed_dim, embed_dim * 2),
-                nn.GELU(),
-                nn.Linear(embed_dim * 2, embed_dim),
-            ))
+            self.ffns.append(
+                nn.Sequential(
+                    nn.Linear(embed_dim, embed_dim * 2),
+                    nn.GELU(),
+                    nn.Linear(embed_dim * 2, embed_dim),
+                )
+            )
 
         self.final_norm = nn.LayerNorm(embed_dim)
 
-    def _build_pyg_batch(self, positions, key_padding_mask=None):
+    def _compute_dense_edge_feats(self, positions: torch.Tensor) -> torch.Tensor:
         """
-        Convert dense (B, N, 2) positions into a PyG Batch with
-        edge_index and projected edge_attr.
+        Compute pairwise edge features for all (i, j) pairs in one vectorized pass.
+
+        Args:
+            positions: (B, N, 2) wind-relative turbine positions
 
         Returns:
-            batch: PyG Batch object
-            valid_counts: (B,) number of real turbines per sample
+            edge_feats: (B, N, N, edge_dim) projected edge features
         """
-        B, N, _ = positions.shape
-        device = positions.device
+        # Pairwise differences: (B, N, N, 2)
+        diff = positions.unsqueeze(2) - positions.unsqueeze(1)
+        dx = diff[..., 0]  # (B, N, N)
+        dy = diff[..., 1]  # (B, N, N)
 
-        graphs = []
-        for b in range(B):
-            # Determine valid nodes
-            if key_padding_mask is not None:
-                valid = ~key_padding_mask[b]  # (N,) True = real
-                n_valid = valid.sum().item()
-                pos_b = positions[b, valid]   # (n_valid, 2)
-            else:
-                n_valid = N
-                pos_b = positions[b]          # (N, 2)
+        dist = torch.sqrt(dx**2 + dy**2 + 1e-8)
+        angle = torch.atan2(dy, dx)
+        unit_dx = dx / (dist + 1e-8)
+        unit_dy = dy / (dist + 1e-8)
 
-            # Build fully-connected edge index (no self-loops)
-            src = torch.arange(n_valid, device=device).repeat_interleave(n_valid - 1)
-            # For each node i, connect to all j != i
-            dst_list = []
-            for i in range(n_valid):
-                others = torch.cat([
-                    torch.arange(0, i, device=device),
-                    torch.arange(i + 1, n_valid, device=device),
-                ])
-                dst_list.append(others)
-            dst = torch.cat(dst_list)
-            edge_index = torch.stack([src, dst], dim=0)  # (2, n_valid*(n_valid-1))
-
-            # Compute raw pairwise features for these edges
-            pos_i = pos_b[edge_index[0]]  # (E, 2)
-            pos_j = pos_b[edge_index[1]]  # (E, 2)
-            rel = pos_j - pos_i           # (E, 2)
-
-            dx, dy = rel[:, 0], rel[:, 1]
-            dist = torch.sqrt(dx**2 + dy**2 + 1e-8)
-            angle = torch.atan2(dy, dx)
-
-            raw_feats = torch.stack([
-                dx / (dist + 1e-8),
-                dy / (dist + 1e-8),
+        # Stack raw features: (B, N, N, 8) — same features as original
+        raw_feats = torch.stack(
+            [
+                unit_dx,
+                unit_dy,
                 dist / 10.0,
                 torch.cos(angle),
                 torch.sin(angle),
                 torch.log1p(dist),
-                torch.tanh(dx / (dist + 1e-8) * 2),
-                1 - torch.abs(dx / (dist + 1e-8)),
-            ], dim=-1)  # (E, 8)
-
-            edge_attr = self.edge_proj(raw_feats)  # (E, edge_dim)
-
-            # Optional distance cutoff
-            if self.distance_cutoff is not None:
-                keep = dist < self.distance_cutoff
-                edge_index = edge_index[:, keep]
-                edge_attr = edge_attr[keep]
-
-            graphs.append(Data(
-                x=torch.zeros(n_valid, self.embed_dim, device=device),  # placeholder
-                edge_index=edge_index,
-                edge_attr=edge_attr,
-                num_nodes=n_valid,
-            ))
-
-        batch = Batch.from_data_list(graphs)
-        valid_counts = torch.tensor(
-            [g.num_nodes for g in graphs], device=device
+                torch.tanh(unit_dx * 2),
+                1.0 - torch.abs(unit_dx),
+            ],
+            dim=-1,
         )
-        return batch, valid_counts
 
-    def forward(
+        # Single batched projection: (B, N, N, 8) → (B, N, N, edge_dim)
+        return self.edge_proj(raw_feats)
+
+    def _build_attn_mask(
         self,
-        positions,
-        key_padding_mask=None,
-        wind_speed=None,
-        wind_direction=None,
-    ):
+        positions: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
         """
-        Args:
-            positions: (B, N, 2) wind-relative positions
-            key_padding_mask: (B, N) True = padding
-            wind_speed: (B,) optional
-            wind_direction: (B,) optional
+        Build dense attention mask: (B, N, N) where True = attend.
 
-        Returns:
-            node_embeddings: (B, N, embed_dim) spatial context per turbine
+        Handles: no self-loops, padding exclusion, optional distance cutoff.
         """
         B, N, _ = positions.shape
         device = positions.device
 
-        # Build PyG batch (edge_index + edge_attr)
-        pyg_batch, valid_counts = self._build_pyg_batch(
-            positions, key_padding_mask
-        )
+        # No self-attention (no self-loops)
+        mask = ~torch.eye(N, dtype=torch.bool, device=device).unsqueeze(0)  # (1, N, N)
 
-        # Initialize node embeddings
+        # Exclude padding positions from both source and target
+        if key_padding_mask is not None:
+            valid = ~key_padding_mask  # (B, N) True = real turbine
+            # valid_i AND valid_j: (B, N, 1) & (B, 1, N) → (B, N, N)
+            mask = mask & valid.unsqueeze(1) & valid.unsqueeze(2)
+
+        # Optional distance cutoff (sparse connectivity for large farms)
+        if self.distance_cutoff is not None:
+            dist = torch.cdist(positions, positions)  # (B, N, N)
+            mask = mask & (dist < self.distance_cutoff)
+
+        return mask
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        wind_speed: Optional[torch.Tensor] = None,
+        wind_direction: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            positions:        (B, N, 2) wind-relative turbine positions
+            key_padding_mask: (B, N) True = padding token
+            wind_speed:       (B,) free-stream wind speed [m/s]
+            wind_direction:   (B,) wind direction [degrees]
+
+        Returns:
+            out: (B, N, embed_dim) spatial context embedding per turbine
+        """
+        B, N, _ = positions.shape
+
+        # --- Dense edge features (single batched pass) ---
+        edge_feats = self._compute_dense_edge_feats(positions)  # (B, N, N, edge_dim)
+
+        # --- Attention mask ---
+        attn_mask = self._build_attn_mask(positions, key_padding_mask)  # (B, N, N)
+
+        # --- Initialize node embeddings ---
         if self.use_wind_context and wind_speed is not None:
             wd_rad = wind_direction * (math.pi / 180.0)
-            wind_feats = torch.stack([
-                wind_speed / 15.0,
-                torch.cos(wd_rad),
-                torch.sin(wd_rad),
-            ], dim=-1)                          # (B, 3)
-            h_dense = self.node_init(wind_feats)  # (B, embed_dim)
-            h_dense = h_dense.unsqueeze(1).expand(-1, N, -1)
+            wind_feats = torch.stack(
+                [
+                    wind_speed / 15.0,
+                    torch.cos(wd_rad),
+                    torch.sin(wd_rad),
+                ],
+                dim=-1,
+            )  # (B, 3)
+            h = self.node_init(wind_feats).unsqueeze(1).expand(-1, N, -1)  # (B, N, D)
         else:
-            h_dense = self.node_init_embed.expand(B, N, -1)
+            h = self.node_init_embed.expand(B, N, -1)  # (B, N, D)
 
-        # Pack valid nodes into flat tensor matching PyG batch ordering
-        if key_padding_mask is not None:
-            h_list = [
-                h_dense[b, ~key_padding_mask[b]]
-                for b in range(B)
-            ]
-        else:
-            h_list = [h_dense[b] for b in range(B)]
-        h = torch.cat(h_list, dim=0)  # (total_nodes, embed_dim)
-
-        # Message passing
-        edge_index = pyg_batch.edge_index
-        edge_attr = pyg_batch.edge_attr
-
+        # --- Message passing ---
         for gat, norm1, norm2, ffn in zip(
             self.gat_layers, self.norms1, self.norms2, self.ffns
         ):
-            h_norm = norm1(h)
-            h_out = gat(h_norm, edge_index, edge_attr=edge_attr)
-            h = h + h_out                 # residual
-            h = h + ffn(norm2(h))         # FFN + residual
+            h = h + gat(norm1(h), edge_feats, attn_mask)  # GAT + residual
+            h = h + ffn(norm2(h))                          # FFN + residual
 
         h = self.final_norm(h)
 
-        # Unpack back to dense (B, N, embed_dim), zero-fill padding
-        out = torch.zeros(B, N, self.embed_dim, device=device)
-        offset = 0
-        for b in range(B):
-            nv = valid_counts[b].item()
-            if key_padding_mask is not None:
-                valid_idx = (~key_padding_mask[b]).nonzero(as_tuple=True)[0]
-                out[b, valid_idx] = h[offset : offset + nv]
-            else:
-                out[b, :nv] = h[offset : offset + nv]
-            offset += nv
+        # --- Zero out padding positions ---
+        if key_padding_mask is not None:
+            h = h.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
 
-        return out
+        return h
