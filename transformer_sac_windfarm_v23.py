@@ -3,6 +3,10 @@ Transformer-based SAC for Wind Farm Control - V23
 
 Changes in V23:
 - Added geometric profiles as alternative to PyWake profiles
+- Renamed the following:
+    PyWakeProfileEncoder -> CNNProfileEncoder
+    PyWakeProfileEncoderDilated ->  DilatedProfileEncoder
+    PyWakeProfileEncoderWithAttention -> AttentionProfileEncoder
 
 Changes in V22:
 - Added the following positional encoders:
@@ -151,9 +155,9 @@ from positional_encodings_helper import (
 )
 
 from profile_encodings_helper import (
-    PyWakeProfileEncoder,
-    PyWakeProfileEncoderDilated,
-    PyWakeProfileEncoderWithAttention,
+    CNNProfileEncoder,
+    DilatedProfileEncoder,
+    AttentionProfileEncoder,
     FourierProfileEncoder,
     FourierProfileEncoderWithContext, # Needs wind direction as input. Not yet implemented
 )
@@ -527,9 +531,9 @@ PositionalEncoding = AbsolutePositionalEncoding
 VALID_PROFILE_ENCODING_TYPES = [
     None,                  # No positional encoding
     # === CNN Based ===
-    "PyWakeProfileEncoder",                 # CNN encoder for PyWake profiles
-    "PyWakeProfileEncoderDilated",          # Dilated convolutions for large receptive field without pooling
-    "PyWakeProfileEncoderWithAttention",    # Lightweight attention over angular positions
+    "CNNProfileEncoder",                # CNN encoder for PyWake profiles
+    "DilatedProfileEncoder",            # Dilated convolutions for large receptive field without pooling
+    "AttentionProfileEncoder",          # Lightweight attention over angular positions
     
     # === Fourier Based ===
     "FourierProfileEncoder",                # Encode circular profiles via Fourier decomposition.
@@ -571,34 +575,34 @@ def create_profile_encoding(
     # Profile Encodings
     # =========================================================================
     
-    elif profile_type == "PyWakeProfileEncoder":
+    elif profile_type == "CNNProfileEncoder":
         
-        recep_encoder = PyWakeProfileEncoder(
+        recep_encoder = CNNProfileEncoder(
                 embed_dim=embed_dim,
                 hidden_channels=hidden_channels,
             )
-        influence_encoder = PyWakeProfileEncoder(
-                embed_dim=embed_dim,
-                hidden_channels=hidden_channels,
-            )
-        
-    elif profile_type == "PyWakeProfileEncoderDilated":
-        recep_encoder = PyWakeProfileEncoderDilated(
-                embed_dim=embed_dim,
-                hidden_channels=hidden_channels,
-            )
-        influence_encoder = PyWakeProfileEncoderDilated(
+        influence_encoder = CNNProfileEncoder(
                 embed_dim=embed_dim,
                 hidden_channels=hidden_channels,
             )
         
-    elif profile_type == "PyWakeProfileEncoderWithAttention":
-        recep_encoder = PyWakeProfileEncoderWithAttention(
+    elif profile_type == "DilatedProfileEncoder":
+        recep_encoder = DilatedProfileEncoder(
+                embed_dim=embed_dim,
+                hidden_channels=hidden_channels,
+            )
+        influence_encoder = DilatedProfileEncoder(
+                embed_dim=embed_dim,
+                hidden_channels=hidden_channels,
+            )
+        
+    elif profile_type == "AttentionProfileEncoder":
+        recep_encoder = AttentionProfileEncoder(
                 embed_dim=embed_dim,
                 hidden_channels=hidden_channels,
                 n_attention_heads=4,
             )
-        influence_encoder = PyWakeProfileEncoderWithAttention(
+        influence_encoder = AttentionProfileEncoder(
                 embed_dim=embed_dim,
                 hidden_channels=hidden_channels,
                 n_attention_heads=4,

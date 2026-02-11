@@ -4,9 +4,9 @@ Only related to the profiles.
 
 Currently split into 2 types:
 CNN based encoders:
-- PyWakeProfileEncoder -> multi-scale CNN with residuals
-- PyWakeProfileEncoderDilated -> dilated convs for large receptive field
-- PyWakeProfileEncoderWithAttention -> CNN + self-attention
+- CNNProfileEncoder -> multi-scale CNN with residuals
+- ProfileEncoderDilated -> dilated convs for large receptive field
+- ProfileEncoderWithAttention -> CNN + self-attention
 
 Fourier based encoders:
 - FourierProfileEncoder -> Fourier decomposition of profiles
@@ -33,7 +33,7 @@ from torch.utils.tensorboard import SummaryWriter
 from collections import deque
 
 # =============================================================
-# CNN based encoders for PyWake profiles
+# CNN based encoders for profiles
 # ============================================================
 
 class ResidualConvBlock(nn.Module):
@@ -76,9 +76,9 @@ class ResidualConvBlock(nn.Module):
         return F.gelu(x + residual)
 
 
-class PyWakeProfileEncoder(nn.Module):
+class CNNProfileEncoder(nn.Module):
     """
-    Improved CNN encoder for PyWake profiles.
+    Improved CNN encoder for profiles.
     
     Key improvements:
     1. Multi-scale pyramid: Extract features at multiple resolutions
@@ -181,7 +181,7 @@ class PyWakeProfileEncoder(nn.Module):
         return out.view(batch_size, n_turbines, -1)
 
 
-class PyWakeProfileEncoderDilated(nn.Module):
+class DilatedProfileEncoder(nn.Module):
     """
     Alternative: Dilated convolutions for large receptive field without pooling.
     
@@ -237,7 +237,7 @@ class PyWakeProfileEncoderDilated(nn.Module):
         return out.view(batch_size, n_turbines, -1)
 
 
-class PyWakeProfileEncoderWithAttention(nn.Module):
+class AttentionProfileEncoder(nn.Module):
     """
     Alternative: Lightweight attention over angular positions.
     
@@ -315,7 +315,7 @@ class PyWakeProfileEncoderWithAttention(nn.Module):
 
 
 # ===============================================================
-# Fourier based encoders for PyWake profiles
+# Fourier based encoders for profiles
 # ===============================================================
 
 class FourierProfileEncoder(nn.Module):
@@ -571,9 +571,9 @@ if __name__ == "__main__":
     profiles = torch.randn(batch_size, n_turbines, n_directions)
     
     encoders = {
-        "Original": PyWakeProfileEncoder(embed_dim),
-        "PyWakeProfileEncoderWithAttention": PyWakeProfileEncoderWithAttention(embed_dim),
-        "Dilated": PyWakeProfileEncoderDilated(embed_dim),
+        "Original": CNNProfileEncoder(embed_dim),
+        "ProfileEncoderWithAttention": AttentionProfileEncoder(embed_dim),
+        "Dilated": DilatedProfileEncoder(embed_dim),
         "FourierProfileEncoder": FourierProfileEncoder(embed_dim),
     }
     
