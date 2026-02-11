@@ -117,6 +117,7 @@ class PolicyEvaluator:
         deterministic: bool = True,
         use_profiles: bool = False,
         n_profile_directions: int = 360,
+        profile_source: str = "pywake",
     ):
         """
         Args:
@@ -151,6 +152,7 @@ class PolicyEvaluator:
         self.deterministic = deterministic
         self.use_profiles = use_profiles
         self.n_profile_directions = n_profile_directions
+        self.profile_source = profile_source
         
         # Create layout configs
         self.eval_layouts = self._create_layout_configs()
@@ -167,12 +169,28 @@ class PolicyEvaluator:
             
             # Compute profiles if enabled
             if self.use_profiles:
-                from receptivity_profiles import compute_layout_profiles
-                print(f"[Evaluator] Computing profiles for layout: {name}")
-                receptivity_profiles, influence_profiles = compute_layout_profiles(
-                    x_pos, y_pos, self.wind_turbine,
-                    n_directions=self.n_profile_directions,
-                )
+                if self.profile_source.lower() == "geometric":
+                    from geometric_profiles import compute_layout_profiles_vectorized
+                    D = self.wind_turbine.diameter()
+                    print(f"[Evaluator] Computing GEOMETRIC profiles for layout: {name}")
+                    receptivity_profiles, influence_profiles = compute_layout_profiles_vectorized(
+                        x_pos, y_pos,
+                        rotor_diameter=D,
+                        k_wake=0.04,
+                        n_directions=self.n_profile_directions,
+                        sigma_smooth=10.0,
+                        scale_factor=15.0,
+                    )
+                else:
+                    from receptivity_profiles import compute_layout_profiles
+                    print(f"[Evaluator] Computing PyWake profiles for layout: {name}")
+                    receptivity_profiles, influence_profiles = compute_layout_profiles(
+                        x_pos, y_pos, self.wind_turbine,
+                        n_directions=self.n_profile_directions,
+                    )
+
+
+
                 config.receptivity_profiles = receptivity_profiles
                 config.influence_profiles = influence_profiles
             

@@ -1784,11 +1784,6 @@ def main():
 
 
 
-
-
-
-
-
     # Build profile registry from layouts
     if use_profiles:
         profile_registry = [
@@ -1897,6 +1892,7 @@ def main():
         deterministic=False,
         use_profiles=use_profiles,  # NEW: Pass profile setting
         n_profile_directions=args.n_profile_directions,  # NEW: Pass profile resolution
+        profile_source=args.profile_source,
     )
 
 

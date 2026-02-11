@@ -457,17 +457,17 @@ class MultiLayoutEnv(gym.Env):
         """Whether turbine indices are currently shuffled."""
         return self.shuffle and not np.array_equal(self._perm, np.arange(self.n_turbines))
     
-    @property
-    def current_permutation(self) -> np.ndarray:
-        """
-        Current turbine permutation array.
+    # @property
+    # def current_permutation(self) -> np.ndarray:
+    #     """
+    #     Current turbine permutation array.
         
-        Maps from shuffled index to original index:
-        original_idx = current_permutation[shuffled_idx]
+    #     Maps from shuffled index to original index:
+    #     original_idx = current_permutation[shuffled_idx]
         
-        If shuffle=False, this is identity [0, 1, 2, ...].
-        """
-        return self._perm.copy()
+    #     If shuffle=False, this is identity [0, 1, 2, ...].
+    #     """
+    #     return self._perm.copy()
     
     @property
     def inverse_permutation(self) -> np.ndarray:
@@ -527,6 +527,13 @@ class MultiLayoutEnv(gym.Env):
         padded = np.zeros((self.max_turbines, n_dirs), dtype=np.float32)
         padded[:self.n_turbines] = profiles
         
+        return padded
+
+    @property
+    def current_permutation(self) -> np.ndarray:
+        """Return permutation padded to max_turbines (identity for padding slots)."""
+        padded = np.arange(self.max_turbines, dtype=np.int64)
+        padded[:self.n_turbines] = self._perm
         return padded
 
     @property
