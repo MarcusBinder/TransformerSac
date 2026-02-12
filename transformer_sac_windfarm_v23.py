@@ -1909,7 +1909,7 @@ def main():
     # Initialize debug logger with configurable frequencies
     debug_logger = create_debug_logger(
         layout_names=layout_names,
-        log_every=250,  # Base frequency - others are multiples of this
+        log_every=250000,  # Base frequency - others are multiples of this
     )
     # Frequencies will be:
     #   - summary metrics: every 100 steps
