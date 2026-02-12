@@ -2,7 +2,9 @@ from WindGym.utils.generate_layouts import (
     generate_square_grid,
     generate_cirular_farm,
     generate_right_triangle_grid,
-    generate_line_dots_multiple_thetas
+    generate_line_dots_multiple_thetas,
+    generate_diamond_grid,
+    generate_staggered_grid,
 )
 
 import os
@@ -421,6 +423,17 @@ def get_layout_positions(layout_type: str, wind_turbine) -> Tuple[np.ndarray, np
         "c": lambda: generate_square_grid(turbine=wind_turbine, nx=4, ny=1, xDist=5, yDist=5),
         "d": lambda: generate_right_triangle_grid(turbine=wind_turbine, nx=2, ny=2, xDist=5, yDist=5, orientation='lower_right'),
         "e": lambda: generate_square_grid(turbine=wind_turbine, nx=3, ny=2, xDist=5, yDist=5),
+        "T1": lambda: generate_square_grid(turbine=wind_turbine, nx=3, ny=1, xDist=5, yDist=5),
+        "T2": lambda: generate_square_grid(turbine=wind_turbine, nx=2, ny=2, xDist=5, yDist=5),
+        "T3": lambda: generate_square_grid(turbine=wind_turbine, nx=4, ny=1, xDist=5, yDist=5),
+        "T4": lambda: generate_right_triangle_grid(turbine=wind_turbine, nx=2, ny=2, xDist=5, yDist=5,orientation="lower_right"),
+        "T5": lambda: generate_diamond_grid(wind_turbine, n=2, xDist=5, yDist=2.2),
+        "T6": lambda: generate_right_triangle_grid(turbine=wind_turbine, nx=3, ny=3, xDist=5, yDist=5,orientation="lower_right"),
+        "E1": lambda: generate_square_grid(turbine=wind_turbine, nx=3, ny=2, xDist=5, yDist=5),
+        "E2": lambda: generate_square_grid(turbine=wind_turbine, nx=3, ny=3, xDist=5, yDist=5),
+        "E3": lambda: generate_square_grid(turbine=wind_turbine, nx=4, ny=3, xDist=5, yDist=5),
+        "E4": lambda: (lambda x, y: (y, x))(*generate_staggered_grid(turbine=wind_turbine, nx=2, ny=3, xDist=5, yDist=5, y_stagger_offset=[0, 2.5])),
+        "E5": lambda: (np.array([0, 6, 2, 11, 8, 14, 5]) * wind_turbine.diameter(),np.array([0, 3, 8, 1, 7, 5, 13]) * wind_turbine.diameter()),
     }
     
     if layout_type not in layouts:
