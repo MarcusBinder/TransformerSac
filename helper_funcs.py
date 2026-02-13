@@ -19,6 +19,7 @@ import torch.optim as optim
 from pathlib import Path
 import re
 
+from copy import deepcopy
 from typing import Optional, Tuple, List, Dict, Any
 
 def soft_update(source, target, tau):
@@ -61,8 +62,6 @@ def load_actor_from_checkpoint(checkpoint_path: str, device: torch.device):
         raise ValueError(f"Unknown checkpoint format: {type(data)}")
     
     return checkpoint, args
-
-
 
 
 def find_checkpoints(checkpoint_dir: str) -> list:
@@ -620,15 +619,12 @@ def load_old_sac_checkpoint(checkpoint_path: str, device: torch.device):
     
     return checkpoint, default_args
 
-def make_env_config() -> Dict[str, Any]:
-    """
-    Create base environment configuration.
-    
-    This configuration is designed for transformer-based control:
-    - Per-turbine measurements enabled (ws, wd, yaw)
-    - History stacking for temporal context
-    - Baseline comparison for reward calculation
-    """
+# helper.py
+from copy import deepcopy
+from typing import Dict, Any
+
+def _base_config() -> Dict[str, Any]:
+    """Base environment configuration for transformer-based control."""
     return {
         "yaw_init": "Random",
         "BaseController": "Local",
@@ -636,17 +632,17 @@ def make_env_config() -> Dict[str, Any]:
         "Track_power": False,
         "farm": {"yaw_min": -30, "yaw_max": 30},
         "wind": {
-            "ws_min": 10, "ws_max": 14,
+            "ws_min": 10, "ws_max": 10,
             "TI_min": 0.07, "TI_max": 0.07,
-            "wd_min": 225, "wd_max": 315,
+            "wd_min": 260, "wd_max": 280,
         },
         "act_pen": {"action_penalty": 0.0, "action_penalty_type": "Change"},
         "power_def": {"Power_reward": "Baseline", "Power_avg": 1, "Power_scaling": 1.0},
         "mes_level": {
             "turb_ws": True,
-            "turb_wd": True,  # Will be converted to deviation
+            "turb_wd": True,
             "turb_TI": False,
-            "turb_power": True,  # Include power
+            "turb_power": True,
             "farm_ws": False,
             "farm_wd": False,
             "farm_TI": False,
@@ -655,7 +651,7 @@ def make_env_config() -> Dict[str, Any]:
         "ws_mes": {
             "ws_current": False,
             "ws_rolling_mean": True,
-            "ws_history_N": 15,  # History length
+            "ws_history_N": 15,
             "ws_history_length": 15,
             "ws_window_length": 1,
         },
@@ -682,67 +678,51 @@ def make_env_config() -> Dict[str, Any]:
         },
     }
 
-def make_BIG_config() -> Dict[str, Any]:
-    """
-    Create base environment configuration.
-    
-    This configuration is designed for transformer-based control:
-    - Per-turbine measurements enabled (ws, wd, yaw)
-    - History stacking for temporal context
-    - Baseline comparison for reward calculation
-    """
-    return {
-        "yaw_init": "Random",
+
+def _deep_update(base: dict, overrides: dict) -> dict:
+    """Recursively update base dict with overrides."""
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_update(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+# Registry: name -> overrides from base
+ENV_CONFIGS: Dict[str, Dict[str, Any]] = {
+    "default": {},
+    "big": {
         "BaseController": "PyWake",
-        "ActionMethod": "yaw",
-        "Track_power": False,
-        "farm": {"yaw_min": -30, "yaw_max": 30},
         "wind": {
-            "ws_min": 9, "ws_max": 9,
-            "TI_min": 0.07, "TI_max": 0.07,
-            "wd_min": 225, "wd_max": 315,
+            "ws_min": 9, "ws_max": 9, 
+            "wd_min": 225, "wd_max": 315
         },
-        "act_pen": {"action_penalty": 0.0, "action_penalty_type": "Change"},
-        "power_def": {"Power_reward": "Baseline", "Power_avg": 1, "Power_scaling": 1.0},
-        "mes_level": {
-            "turb_ws": True,
-            "turb_wd": True,  # Will be converted to deviation
-            "turb_TI": False,
-            "turb_power": True,  # Include power
-            "farm_ws": False,
-            "farm_wd": False,
-            "farm_TI": False,
-            "farm_power": False,
-        },
-        "ws_mes": {
-            "ws_current": False,
-            "ws_rolling_mean": True,
-            "ws_history_N": 15,  # History length
-            "ws_history_length": 15,
-            "ws_window_length": 1,
-        },
-        "wd_mes": {
-            "wd_current": False,
-            "wd_rolling_mean": True,
-            "wd_history_N": 15,
-            "wd_history_length": 15,
-            "wd_window_length": 1,
-        },
-        "yaw_mes": {
-            "yaw_current": False,
-            "yaw_rolling_mean": True,
-            "yaw_history_N": 15,
-            "yaw_history_length": 15,
-            "yaw_window_length": 1,
-        },
-        "power_mes": {
-            "power_current": False,
-            "power_rolling_mean": True,
-            "power_history_N": 15,
-            "power_history_length": 15,
-            "power_window_length": 1,
-        },
-    }
+    },
+    # Easy to add more:
+    "hard": {
+        "wind": {
+            "wd_min": 225, "wd_max": 315, 
+            "ws_min": 10, "ws_max": 14,
+        },  
+    },
+    "20deg_wd": {
+        "wind": {
+            "wd_min": 250, "wd_max": 290, 
+        },  
+    },
+}
+
+
+def make_env_config(name: str = "default") -> Dict[str, Any]:
+    """Build an env config by name. Applies overrides on top of the base config."""
+    if name not in ENV_CONFIGS:
+        available = ", ".join(sorted(ENV_CONFIGS.keys()))
+        raise ValueError(f"Unknown env config '{name}'. Available: {available}")
+    
+    config = deepcopy(_base_config())
+    return _deep_update(config, deepcopy(ENV_CONFIGS[name]))
+
 
 def load_checkpoint(
     checkpoint_path: str,
