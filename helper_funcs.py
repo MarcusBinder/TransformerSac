@@ -434,6 +434,23 @@ def get_layout_positions(layout_type: str, wind_turbine) -> Tuple[np.ndarray, np
         "E3": lambda: generate_square_grid(turbine=wind_turbine, nx=4, ny=3, xDist=5, yDist=5),
         "E4": lambda: (lambda x, y: (y, x))(*generate_staggered_grid(turbine=wind_turbine, nx=2, ny=3, xDist=5, yDist=5, y_stagger_offset=[0, 2.5])),
         "E5": lambda: (np.array([0, 6, 2, 11, 8, 14, 5]) * wind_turbine.diameter(),np.array([0, 3, 8, 1, 7, 5, 13]) * wind_turbine.diameter()),
+        # --- Grid training layouts ---
+        "g1": lambda: generate_square_grid(turbine=wind_turbine, nx=3, ny=2, xDist=5, yDist=5),
+        "g2": lambda: generate_square_grid(turbine=wind_turbine, nx=2, ny=3, xDist=5, yDist=5),
+        "g3": lambda: (np.array([5.0, 2.5, 7.5, 0.0, 5.0, 10.0]) * wind_turbine.diameter(),
+                        np.array([10.0, 5.0, 5.0, 0.0, 0.0, 0.0]) * wind_turbine.diameter()),
+        # --- Perturbed training layouts (~1D perturbation from grid) ---
+        "p1": lambda: (np.array([0.9, 5.6, 9.2, -0.5, 4.2, 10.8]) * wind_turbine.diameter(),
+                        np.array([-0.7, 1.1, -1.0, 5.8, 4.5, 5.5]) * wind_turbine.diameter()),
+        "p2": lambda: (np.array([-0.7, 5.8, 1.0, 4.3, -0.4, 5.5]) * wind_turbine.diameter(),
+                        np.array([0.9, -0.5, 5.7, 4.6, 10.8, 9.3]) * wind_turbine.diameter()),
+        "p3": lambda: (np.array([5.8, 1.7, 8.4, 0.7, 4.3, 10.7]) * wind_turbine.diameter(),
+                        np.array([10.7, 5.7, 4.2, 1.0, -0.7, 0.5]) * wind_turbine.diameter()),
+        # --- Evaluation layouts ---
+        "eval_grid": lambda: (np.array([0, 5, 10, 15, 2.5, 7.5, 12.5, 17.5]) * wind_turbine.diameter(),
+                              np.array([0, 0, 0, 0, 5, 5, 5, 5]) * wind_turbine.diameter()),
+        "eval_perturb": lambda: (np.array([1.0, 7.5, 4.0, 11.5, 9.0, 0.5, 14.0]) * wind_turbine.diameter(),
+                                 np.array([1.5, 0.0, 6.0, 3.5, 8.5, 11.0, 9.5]) * wind_turbine.diameter()),
     }
     
     if layout_type not in layouts:
