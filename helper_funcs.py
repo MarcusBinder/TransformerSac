@@ -445,11 +445,29 @@ def get_layout_positions(layout_type: str, wind_turbine) -> Tuple[np.ndarray, np
                         np.array([0.9, -0.5, 5.7, 4.6, 10.8, 9.3]) * wind_turbine.diameter()),
         "p3": lambda: (np.array([5.8, 1.7, 8.4, 0.7, 4.3, 10.7]) * wind_turbine.diameter(),
                         np.array([10.7, 5.7, 4.2, 1.0, -0.7, 0.5]) * wind_turbine.diameter()),
+        # --- regular training layouts --- found to match the irregular performance
+        "r1": lambda: (np.array([0.0, 1248.1, 2496.2, 0.0, 1248.1, 2496.2]), 
+                       np.array([0.0, 0.0, 0.0, 891.5, 891.5, 891.5])),
+        "r2": lambda: (np.array([0.0, 713.2, 1426.4, 0.0, 713.2, 1426.4]), 
+                       np.array([0.0, 0.0, 0.0, 713.2, 713.2, 713.2])),
+        "r3": lambda: (np.array([0.0, 713.2, 0.0, 713.2, 0.0, 713.2]), 
+                       np.array([0.0, 0.0, 713.2, 713.2, 1426.4, 1426.4])),
+        # --- irregular training layouts --- found to match the regular performance
+        "ir1": lambda: (np.array([1704.551048268463, 914.3306311063952, 1228.5520434497569, 258.5255410712933, 23.24574142543186, 1781.9532368498412]), 
+                        np.array([222.17800042267135, 145.406792381138, 900.5017154692762, 797.6217097748043, 21.26233244323475, 1047.416107140278])),
+        "ir2": lambda: (np.array([749.535392785272, 488.31018842263705, 1392.4616322926706, 111.8851795987488, 1747.4330560273631, 1248.5147109705342]), 
+                        np.array([990.4950250849097, 64.23999669027903, 576.3010846379485, 885.2083834296628, 1059.4419436654625, 59.40283654123481])),
+        "ir3": lambda: (np.array([653.1965502153917, 157.89957952486031, 818.9979507784572, 1518.3458685445662, 1190.252321095436, 40.8895846585575]), 
+                        np.array([213.2061968554637, 698.7844673954643, 1056.6153770780397, 895.3812235989902, 441.623693251274, 159.96676745124617])),
         # --- Evaluation layouts ---
         "eval_grid": lambda: (np.array([0, 5, 10, 15, 2.5, 7.5, 12.5, 17.5]) * wind_turbine.diameter(),
                               np.array([0, 0, 0, 0, 5, 5, 5, 5]) * wind_turbine.diameter()),
         "eval_perturb": lambda: (np.array([1.0, 7.5, 4.0, 11.5, 9.0, 0.5, 14.0]) * wind_turbine.diameter(),
                                  np.array([1.5, 0.0, 6.0, 3.5, 8.5, 11.0, 9.5]) * wind_turbine.diameter()),
+        # --- Eval layouts but matching the grid performance ---
+        "eval_regular": lambda: (np.array([0.0, 891.5, 1783.0, 0.0, 891.5, 1783.0]), np.array([0.0, 0.0, 0.0, 891.5, 891.5, 891.5])),
+        "eval_irregular": lambda: (np.array([1235.1614250818666, 614.0772491446635, 32.67493594582077, 590.169988163652, 70.89867195187087, 1603.8511283851528]), 
+                                   np.array([872.7611457073143, 47.96788035361005, 951.2489425231132, 972.0429395286828, 366.8012544177941, 95.07779748241096])),
     }
     
     if layout_type not in layouts:
@@ -619,9 +637,6 @@ def load_old_sac_checkpoint(checkpoint_path: str, device: torch.device):
     
     return checkpoint, default_args
 
-# helper.py
-from copy import deepcopy
-from typing import Dict, Any
 
 def _base_config() -> Dict[str, Any]:
     """Base environment configuration for transformer-based control."""
@@ -706,6 +721,14 @@ ENV_CONFIGS: Dict[str, Dict[str, Any]] = {
             "ws_min": 10, "ws_max": 14,
         },  
     },
+    "wide": {
+        "wind": {
+            "wd_min": 250, "wd_max": 290, 
+            "ws_min": 10, "ws_max": 10,
+            "TI_min": 0.07, "TI_max": 0.07,
+        },  
+    },
+    
     "20deg_wd": {
         "wind": {
             "wd_min": 250, "wd_max": 290, 
