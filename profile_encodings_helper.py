@@ -44,6 +44,7 @@ class ResidualConvBlock(nn.Module):
         out_channels: int, 
         kernel_size: int = 5,
         dilation: int = 1,
+        **kwargs,
     ):
         super().__init__()
         # Circular padding amount
@@ -96,6 +97,7 @@ class CNNProfileEncoder(nn.Module):
         embed_dim: int = 128,
         hidden_channels: int = 64,
         n_angular_bins: int = 8,  # Keep this many angular bins (not 1!)
+        **kwargs,
     ):
         super().__init__()
         self.n_angular_bins = n_angular_bins
@@ -199,6 +201,7 @@ class DilatedProfileEncoder(nn.Module):
         hidden_channels: int = 64,
         kernel_size: int = 5,
         dilations: Tuple[int, ...] = (1, 2, 4, 8, 16),
+        **kwargs,
     ):
         super().__init__()
         
@@ -253,6 +256,7 @@ class AttentionProfileEncoder(nn.Module):
         hidden_channels: int = 32,
         n_attention_heads: int = 4,
         n_attention_tokens: int = 16,  # Number of angular tokens after pooling
+        **kwargs,
     ):
         super().__init__()
         self.n_attention_tokens = n_attention_tokens
@@ -314,6 +318,65 @@ class AttentionProfileEncoder(nn.Module):
         return out.view(batch_size, n_turbines, -1)
 
 
+class MultiResolutionProfileEncoder(nn.Module):
+    """
+    Multi-resolution 1D conv on circular profiles.
+    
+    Each scale uses a different kernel size, capturing features
+    at different angular resolutions. Circular padding ensures
+    the 360° wraparound is handled correctly.
+    
+    Kernel sizes [3, 7, 15, 31] roughly correspond to angular
+    resolutions of [3°, 7°, 15°, 31°] — from individual turbine
+    wakes to broad directional sectors.
+    """
+    def __init__(self, embed_dim=128, 
+                 scales=[3, 7, 15, 31], 
+                 channels_per_scale=16,
+                 **kwargs,
+                 ):
+        super().__init__()
+        self.scales = scales
+        self.convs = nn.ModuleList()
+        
+        for k in scales:
+            self.convs.append(nn.Sequential(
+                # Circular padding: pad with wraparound
+                # Conv1d with kernel k on 1-channel input
+                nn.Conv1d(1, channels_per_scale, kernel_size=k, padding=0),
+                nn.GELU(),
+                nn.Conv1d(channels_per_scale, channels_per_scale, kernel_size=1),
+            ))
+        
+        total_features = channels_per_scale * len(scales)
+        self.proj = nn.Sequential(
+            nn.Linear(total_features, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+    
+    def _circular_pad(self, x, pad_size):
+        """Wrap-around padding for circular signals."""
+        return torch.cat([x[:, :, -pad_size:], x, x[:, :, :pad_size]], dim=-1)
+    
+    def forward(self, profiles):
+        B, T, D = profiles.shape
+        x = profiles.reshape(B * T, 1, D)  # (B*T, 1, 360)
+        
+        scale_features = []
+        for conv, k in zip(self.convs, self.scales):
+            pad = k // 2
+            x_padded = self._circular_pad(x, pad)       # (B*T, 1, 360+2*pad)
+            h = conv(x_padded)                            # (B*T, C, 360)
+            # Global average + max pool over angles
+            avg = h.mean(dim=-1)                          # (B*T, C)
+            mx = h.max(dim=-1).values                     # (B*T, C)
+            scale_features.append(avg + mx)
+        
+        features = torch.cat(scale_features, dim=-1)      # (B*T, C*n_scales)
+        return self.proj(features).reshape(B, T, -1)
+
 # ===============================================================
 # Fourier based encoders for profiles
 # ===============================================================
@@ -350,6 +413,7 @@ class FourierProfileEncoder(nn.Module):
         n_harmonics: int = 8,
         use_phase: bool = False,
         learnable_weights: bool = True,
+        **kwargs,
     ):
         super().__init__()
         self.n_harmonics = n_harmonics
@@ -486,6 +550,7 @@ class FourierProfileEncoderWithContext(nn.Module):
         embed_dim: int = 128,
         n_harmonics: int = 8,
         wind_dir_embed_dim: int = 16,
+        **kwargs,
     ):
         super().__init__()
         self.n_harmonics = n_harmonics

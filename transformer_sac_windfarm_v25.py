@@ -587,10 +587,14 @@ def create_profile_encoding(
         "MultiResolutionProfileEncoder": dict(scales=[3, 7, 15, 31], channels_per_scale=16),
         "AttentionProfileEncoder": dict(n_attention_heads=4),
     }
-    
-    defaults = ENCODER_DEFAULTS.get(profile_type, {})
+        
+
+    defaults = dict(ENCODER_DEFAULTS.get(profile_type, {}))  # Copy to avoid mutating ENCODER_DEFAULTS
     defaults.update(encoder_kwargs)  # user overrides win
-    
+    defaults.pop("embed_dim", None)        # Avoid duplicate kwargs
+    defaults.pop("hidden_channels", None)  # Avoid duplicate kwargs
+
+
     ENCODER_CLASSES = {
         "CNNProfileEncoder": CNNProfileEncoder,
         "DilatedProfileEncoder": DilatedProfileEncoder,
