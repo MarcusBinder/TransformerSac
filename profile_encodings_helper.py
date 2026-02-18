@@ -318,7 +318,7 @@ class AttentionProfileEncoder(nn.Module):
         return out.view(batch_size, n_turbines, -1)
 
 
-class MultiResolutionProfileEncoder(nn.Module):
+class MultiResolutionProfileEncoder(nn.Module): # This one could 'maybe' work. Looked somewhat prommising, but much slower then the Fourier encoder, and it didnt run long enough to see if it would actually improve performance. Worth further tuning and testing.
     """
     Multi-resolution 1D conv on circular profiles.
     
@@ -411,8 +411,8 @@ class FourierProfileEncoder(nn.Module):
         self, 
         embed_dim: int = 128, 
         n_harmonics: int = 8,
-        use_phase: bool = False,
-        learnable_weights: bool = True,
+        use_phase: bool = False,        # Always false gave best results. 
+        learnable_weights: bool = True, # Inital test showed that learnable weights can help, but not by much. Worth further tuning.
         **kwargs,
     ):
         super().__init__()
