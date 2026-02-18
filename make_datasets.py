@@ -6,7 +6,7 @@ in HDF5 format for self-supervised pretraining of transformer encoders.
 
 HDF5 Structure:
     layout_<name>.h5
-    ├── attrs: layout_name, n_turbines, rotor_diameter, turbine_type
+    ├── attrs: layout_name, n_turbines, rotor_diameter, turbine_type, policy
     ├── positions/xy                    # (n_turbines, 2)
     ├── profiles/receptivity            # (n_turbines, n_directions)  [optional]
     ├── profiles/influence              # (n_turbines, n_directions)  [optional]
@@ -20,12 +20,13 @@ HDF5 Structure:
             └── actions # (n_steps, n_turbines)
 
 Usage:
-    python collect_pretrain_data.py \
-        --layouts "grid_3x3,grid_5x5,hornsrev" \
-        --episodes_per_layout 100 \
-        --output_dir ./pretrain_data \
-        --n_profile_directions 360 \
-        --profile_source geometric
+    python collect_pretrain_data.py \\
+        --layouts "grid_3x3,grid_5x5,hornsrev" \\
+        --episodes_per_layout 100 \\
+        --output_dir ./pretrain_data \\
+        --n_profile_directions 360 \\
+        --profile_source geometric \\
+        --n_workers 16
 
 Author: Marcus (DTU Wind Energy)
 """
@@ -36,6 +37,7 @@ import time
 import numpy as np
 import h5py
 import gymnasium as gym
+from multiprocessing import Pool, cpu_count
 
 # WindGym imports
 from WindGym import WindFarmEnv
@@ -58,6 +60,7 @@ def create_layout_file(
     y_pos: np.ndarray,
     rotor_diameter: float,
     turbine_type: str = "DTU10MW",
+    policy: str = "random",
     receptivity: np.ndarray = None,
     influence: np.ndarray = None,
     n_profile_directions: int = 360,
@@ -69,6 +72,7 @@ def create_layout_file(
         f.attrs["n_turbines"] = len(x_pos)
         f.attrs["rotor_diameter"] = rotor_diameter
         f.attrs["turbine_type"] = turbine_type
+        f.attrs["policy"] = policy
 
         # Positions
         pos_group = f.create_group("positions")
@@ -92,6 +96,7 @@ def create_layout_file(
 
 def append_episode(
     filepath: str,
+    ep_idx: int,
     ws: np.ndarray,       # (n_steps, n_turbines)
     wd: np.ndarray,       # (n_steps, n_turbines)
     yaw: np.ndarray,      # (n_steps, n_turbines)
@@ -102,10 +107,9 @@ def append_episode(
     mean_ti: float,
     seed: int = -1,
 ):
-    """Append a completed episode to the layout file."""
+    """Append a completed episode to the layout file with a specific index."""
     with h5py.File(filepath, "a") as f:
         eps_group = f["episodes"]
-        ep_idx = len(eps_group)
         ep = eps_group.create_group(f"ep_{ep_idx:04d}")
 
         # Episode metadata
@@ -204,17 +208,17 @@ def pywake_agent(fs, optimal_yaws, max_yaw_delta):
 def collect_episode(env, policy="random", max_steps=600) -> dict:
     """
     Run one episode and collect per-turbine measurements.
-    
+
     Args:
         env: WindFarmEnv instance (reset will be called)
         policy: "random" for uniform random actions, "greedy" for zero yaw
-        max_steps: safety limit to prevent infinite loops (should not be hit if env is configured properly)
+        max_steps: safety limit to prevent infinite loops
     Returns:
         dict with keys: ws, wd, yaw, power, actions (each (n_steps, n_turb)),
         plus mean_ws, mean_wd, mean_ti scalars
     """
     obs, info = env.reset()
-    base_env = env # No base_env here. We just use the env directly since it's not wrapped.
+    base_env = env  # No wrapper, use env directly
     n_turb = base_env.n_turb
 
     # Episode-level metadata (constant within episode)
@@ -229,10 +233,11 @@ def collect_episode(env, policy="random", max_steps=600) -> dict:
     current_step = 0
 
     if policy == "pywake":
-        py_agent = PyWakeAgent(x_pos=base_env.x_pos, y_pos=base_env.y_pos, 
-                       turbine=base_env.turbine, yaw_max=30, yaw_min = -30,
-                       look_up=False, env=base_env)
-        
+        py_agent = PyWakeAgent(
+            x_pos=base_env.x_pos, y_pos=base_env.y_pos,
+            turbine=base_env.turbine, yaw_max=30, yaw_min=-30,
+            look_up=False, env=base_env,
+        )
         py_agent.update_wind(wind_speed=base_env.ws, wind_direction=base_env.wd, TI=base_env.ti)
         py_agent.optimize()
 
@@ -241,7 +246,7 @@ def collect_episode(env, policy="random", max_steps=600) -> dict:
         if policy == "random":
             action = env.action_space.sample()
         elif policy == "greedy":
-            action = greedy_controller(base_env.fs, max_yaw_delta=base_env.yaw_step_env)  # or whatever the env's max delta is
+            action = greedy_controller(base_env.fs, max_yaw_delta=base_env.yaw_step_env)
         elif policy == "pywake":
             action = pywake_agent(base_env.fs, py_agent.optimized_yaws, max_yaw_delta=base_env.yaw_step_env)
         else:
@@ -275,6 +280,45 @@ def collect_episode(env, policy="random", max_steps=600) -> dict:
         "mean_wd": mean_wd,
         "mean_ti": mean_ti,
     }
+
+
+# =============================================================================
+# PARALLEL EPISODE WORKER
+# =============================================================================
+
+def _collect_single_episode(args: tuple) -> dict:
+    """
+    Worker function for parallel episode collection.
+
+    Each worker creates its own environment instance to avoid shared state,
+    collects one episode, and returns the data dict (including ep_idx/seed).
+    """
+    (
+        ep_idx, ep_seed, x_pos, y_pos, turbtype, config,
+        policy, max_steps, dt_sim, dt_env, yaw_step, max_eps, TI_type,
+    ) = args
+
+    # Each worker creates its own env and turbine (no shared state)
+    wind_turbine = make_wind_turbine(turbtype)
+    env = make_single_env(
+        x_pos=x_pos,
+        y_pos=y_pos,
+        wind_turbine=wind_turbine,
+        config=config,
+        seed=ep_seed,
+        dt_sim=dt_sim,
+        dt_env=dt_env,
+        yaw_step=yaw_step,
+        max_eps=max_eps,
+        TI_type=TI_type,
+    )
+
+    episode_data = collect_episode(env, policy=policy, max_steps=max_steps)
+    env.close()
+
+    episode_data["ep_idx"] = ep_idx
+    episode_data["seed"] = ep_seed
+    return episode_data
 
 
 # =============================================================================
@@ -326,6 +370,7 @@ def collect_layout_data(
     compute_profiles_flag: bool = True,
     base_seed: int = 0,
     max_steps: int = 600,
+    n_workers: int = 1,
     # Env kwargs
     dt_sim: int = 5,
     dt_env: int = 10,
@@ -342,6 +387,7 @@ def collect_layout_data(
     x_pos, y_pos = get_layout_positions(layout_name, wind_turbine)
     rotor_diameter = float(wind_turbine.diameter())
     n_turb = len(x_pos)
+    turbtype = wind_turbine.__class__.__name__
 
     # Compute profiles
     receptivity, influence = None, None
@@ -355,68 +401,98 @@ def collect_layout_data(
         print(f"  Profiles shape: {receptivity.shape}")
 
     # Create HDF5 file
-    filepath = os.path.join(output_dir, f"layout_{layout_name}.h5")
+    filepath = os.path.join(output_dir, f"layout_{layout_name}_{policy}.h5")
     create_layout_file(
         filepath=filepath,
         layout_name=layout_name,
         x_pos=x_pos,
         y_pos=y_pos,
         rotor_diameter=rotor_diameter,
-        turbine_type=wind_turbine.__class__.__name__,
+        turbine_type=turbtype,
+        policy=policy,
         receptivity=receptivity,
         influence=influence,
         n_profile_directions=n_profile_directions,
     )
 
-    # Create environment
-    env = make_single_env(
-        x_pos=x_pos,
-        y_pos=y_pos,
-        wind_turbine=wind_turbine,
-        config=config,
-        seed=base_seed,
-        dt_sim=dt_sim,
-        dt_env=dt_env,
-        yaw_step=yaw_step,
-        max_eps=max_eps,
-        TI_type=TI_type,
-    )
-
-    # Collect episodes
-    total_steps = 0
-    t_start = time.time()
-
-    for ep_idx in range(episodes_per_layout):
-        ep_seed = base_seed + ep_idx
-        env.action_space.seed(ep_seed)
-
-        episode_data = collect_episode(env, policy=policy, max_steps=max_steps)
-        n_steps = episode_data["ws"].shape[0]
-        total_steps += n_steps
-
-        append_episode(
-            filepath=filepath,
-            ws=episode_data["ws"],
-            wd=episode_data["wd"],
-            yaw=episode_data["yaw"],
-            power=episode_data["power"],
-            actions=episode_data["actions"],
-            mean_ws=episode_data["mean_ws"],
-            mean_wd=episode_data["mean_wd"],
-            mean_ti=episode_data["mean_ti"],
-            seed=ep_seed,
+    # Build worker arguments for all episodes
+    worker_args = [
+        (
+            ep_idx, base_seed + ep_idx, x_pos, y_pos, turbtype, config,
+            policy, max_steps, dt_sim, dt_env, yaw_step, max_eps, TI_type,
         )
+        for ep_idx in range(episodes_per_layout)
+    ]
 
-        if (ep_idx + 1) % 10 == 0 or ep_idx == 0:
-            elapsed = time.time() - t_start
-            eps_per_sec = (ep_idx + 1) / elapsed
-            eta = (episodes_per_layout - ep_idx - 1) / eps_per_sec
-            print(f"  Episode {ep_idx + 1}/{episodes_per_layout} | "
-                  f"steps={n_steps} | ws={episode_data['mean_ws']:.1f} | "
-                  f"wd={episode_data['mean_wd']:.0f}° | ti={episode_data['mean_ti']:.3f} | "
-                  f"ETA: {eta:.0f}s")
+    t_start = time.time()
+    total_steps = 0
+    effective_workers = min(n_workers, episodes_per_layout)
 
-    env.close()
+    if effective_workers <= 1:
+        # ── Sequential fallback ──
+        print(f"  Running {episodes_per_layout} episodes sequentially...")
+        for args in worker_args:
+            ep_data = _collect_single_episode(args)
+            ep_idx = ep_data["ep_idx"]
+            total_steps += ep_data["ws"].shape[0]
+
+            append_episode(
+                filepath=filepath,
+                ep_idx=ep_idx,
+                ws=ep_data["ws"],
+                wd=ep_data["wd"],
+                yaw=ep_data["yaw"],
+                power=ep_data["power"],
+                actions=ep_data["actions"],
+                mean_ws=ep_data["mean_ws"],
+                mean_wd=ep_data["mean_wd"],
+                mean_ti=ep_data["mean_ti"],
+                seed=ep_data["seed"],
+            )
+
+            if (ep_idx + 1) % 10 == 0 or ep_idx == 0:
+                elapsed = time.time() - t_start
+                eps_per_sec = (ep_idx + 1) / elapsed
+                eta = (episodes_per_layout - ep_idx - 1) / eps_per_sec
+                print(f"  Episode {ep_idx + 1}/{episodes_per_layout} | "
+                      f"steps={ep_data['ws'].shape[0]} | ws={ep_data['mean_ws']:.1f} | "
+                      f"wd={ep_data['mean_wd']:.0f}\u00b0 | ti={ep_data['mean_ti']:.3f} | "
+                      f"ETA: {eta:.0f}s")
+    else:
+        # ── Parallel collection ──
+        print(f"  Running {episodes_per_layout} episodes with {effective_workers} workers...")
+        with Pool(processes=effective_workers) as pool:
+            results = pool.imap_unordered(_collect_single_episode, worker_args)
+
+            completed = 0
+            for ep_data in results:
+                ep_idx = ep_data["ep_idx"]
+                n_steps = ep_data["ws"].shape[0]
+                total_steps += n_steps
+
+                append_episode(
+                    filepath=filepath,
+                    ep_idx=ep_idx,
+                    ws=ep_data["ws"],
+                    wd=ep_data["wd"],
+                    yaw=ep_data["yaw"],
+                    power=ep_data["power"],
+                    actions=ep_data["actions"],
+                    mean_ws=ep_data["mean_ws"],
+                    mean_wd=ep_data["mean_wd"],
+                    mean_ti=ep_data["mean_ti"],
+                    seed=ep_data["seed"],
+                )
+
+                completed += 1
+                if completed % 10 == 0 or completed == 1:
+                    elapsed = time.time() - t_start
+                    eps_per_sec = completed / elapsed
+                    eta = (episodes_per_layout - completed) / eps_per_sec
+                    print(f"  Completed {completed}/{episodes_per_layout} | "
+                          f"steps={n_steps} | ws={ep_data['mean_ws']:.1f} | "
+                          f"wd={ep_data['mean_wd']:.0f}\u00b0 | ti={ep_data['mean_ti']:.3f} | "
+                          f"ETA: {eta:.0f}s")
 
     elapsed = time.time() - t_start
     print(f"\n  Done: {episodes_per_layout} episodes, {total_steps} total steps in {elapsed:.1f}s")
@@ -438,6 +514,7 @@ def inspect_dataset(filepath: str):
         print(f"  Turbines: {f.attrs['n_turbines']}")
         print(f"  Rotor diameter: {f.attrs['rotor_diameter']:.1f}m")
         print(f"  Turbine type: {f.attrs['turbine_type']}")
+        print(f"  Policy: {f.attrs.get('policy', 'N/A')}")
 
         n_episodes = len(f["episodes"])
         print(f"  Episodes: {n_episodes}")
@@ -457,11 +534,11 @@ def inspect_dataset(filepath: str):
 
         print(f"  Total steps: {total_steps}")
         if ws_vals:
-            print(f"  Wind speed:  {np.mean(ws_vals):.1f} ± {np.std(ws_vals):.1f} m/s "
+            print(f"  Wind speed:  {np.mean(ws_vals):.1f} \u00b1 {np.std(ws_vals):.1f} m/s "
                   f"[{np.min(ws_vals):.1f}, {np.max(ws_vals):.1f}]")
-            print(f"  Wind dir:    {np.mean(wd_vals):.0f} ± {np.std(wd_vals):.0f}° "
+            print(f"  Wind dir:    {np.mean(wd_vals):.0f} \u00b1 {np.std(wd_vals):.0f}\u00b0 "
                   f"[{np.min(wd_vals):.0f}, {np.max(wd_vals):.0f}]")
-            print(f"  Turbulence:  {np.mean(ti_vals):.3f} ± {np.std(ti_vals):.3f} "
+            print(f"  Turbulence:  {np.mean(ti_vals):.3f} \u00b1 {np.std(ti_vals):.3f} "
                   f"[{np.min(ti_vals):.3f}, {np.max(ti_vals):.3f}]")
 
 
@@ -499,6 +576,11 @@ def parse_args():
     parser.add_argument("--no_profiles", action="store_true",
                         help="Skip profile computation")
 
+    # Parallelism
+    parser.add_argument("--n_workers", type=int, default=1,
+                        help="Number of parallel workers for episode collection "
+                             "(default: 1, use 0 for all available cores)")
+
     # Seeds
     parser.add_argument("--seed", type=int, default=0)
 
@@ -512,10 +594,13 @@ def main():
     layout_names = [l.strip() for l in args.layouts.split(",")]
     os.makedirs(args.output_dir, exist_ok=True)
 
+    n_workers = args.n_workers if args.n_workers > 0 else cpu_count()
+
     print(f"Collecting pretraining data")
     print(f"  Layouts: {layout_names}")
     print(f"  Episodes per layout: {args.episodes_per_layout}")
     print(f"  Policy: {args.policy}")
+    print(f"  Workers: {n_workers}")
     print(f"  Output: {args.output_dir}")
 
     # Create wind turbine
@@ -536,6 +621,8 @@ def main():
             n_profile_directions=args.n_profile_directions,
             compute_profiles_flag=not args.no_profiles,
             base_seed=args.seed + li * 10000,
+            max_steps=args.max_steps,
+            n_workers=n_workers,
             dt_sim=args.dt_sim,
             dt_env=args.dt_env,
             yaw_step=args.yaw_step,
