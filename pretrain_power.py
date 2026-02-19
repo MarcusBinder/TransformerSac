@@ -40,6 +40,14 @@ except ImportError:
 
 from data_loader import create_pretrain_dataloader, WindFarmPretrainDataset, WindFarmSnapshotDataset
 
+# Import real RL model architecture (ensures identical weight keys)
+from transformer_sac_windfarm_v26 import (
+    TransformerActor,
+    TransformerEncoder,
+    TransformerEncoderLayer,
+    create_positional_encoding,
+    create_profile_encoding,
+)
 
 # =============================================================================
 # CONFIG
@@ -99,6 +107,31 @@ class Args:
     dropout: float = 0.1
     """Dropout rate."""
 
+    # === Positional Encoding (must match RL training) ===
+    pos_encoding_type: Optional[str] = None
+    """Positional encoding type. Must match RL config. None = no pos encoding."""
+    rel_pos_hidden_dim: int = 64
+    """Hidden dim for relative position MLP."""
+    rel_pos_per_head: bool = True
+    """Whether relative bias is per-head."""
+    pos_embedding_mode: str = "concat"
+    """'add' or 'concat' positional embedding to token."""
+
+    # === Profile Encoding (must match RL training) ===
+    profile_encoding_type: Optional[str] = None
+    """Profile encoding type. Must match RL config. None = no profiles."""
+    profile_encoder_hidden: int = 128
+    """Hidden dim in profile encoder."""
+    n_profile_directions: int = 360
+    """Number of directions in profile."""
+    profile_fusion_type: str = "add"
+    """'add' or 'joint' fusion of receptivity and influence."""
+    profile_embed_mode: str = "add"
+    """'add' or 'concat' profile embedding into token."""
+    profile_encoder_kwargs: str = "{}"
+    """JSON string of encoder-specific kwargs."""
+
+
     # === Training Hyperparameters ===
     epochs: int = 50
     """Number of training epochs."""
@@ -125,157 +158,112 @@ class Args:
 
 
 # =============================================================================
-# PLACEHOLDER ENCODER (mirrors real TransformerActor backbone)
+# PRETRAINING MODEL (real TransformerActor backbone + power head)
 # =============================================================================
 
-class PlaceholderTransformerEncoder(nn.Module):
-    """
-    Simplified transformer encoder for pipeline validation.
-
-    Architecture mirrors the real TransformerActor:
-        obs → obs_encoder → h
-        positions → pos_encoder → added to h
-        profiles → profile_encoder → added to h
-        h → input_proj → transformer layers → output embeddings
-
-    But with smaller defaults and simpler components.
-    """
-
-    def __init__(
-        self,
-        obs_dim: int,
-        embed_dim: int = 64,
-        pos_embed_dim: int = 16,
-        num_heads: int = 4,
-        num_layers: int = 2,
-        mlp_ratio: float = 2.0,
-        dropout: float = 0.1,
-        n_profile_dirs: int = 0,  # 0 = no profiles
-    ):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.use_profiles = n_profile_dirs > 0
-
-        # --- Obs encoder: raw features → embed_dim ---
-        self.obs_encoder = nn.Sequential(
-            nn.Linear(obs_dim, embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, embed_dim),
-        )
-
-        # --- Position encoder: (x, y) → embed_dim (added) ---
-        self.pos_encoder = nn.Sequential(
-            nn.Linear(2, pos_embed_dim),
-            nn.GELU(),
-            nn.Linear(pos_embed_dim, embed_dim),
-        )
-
-        # --- Profile encoders (optional) ---
-        if self.use_profiles:
-            # Simple 1D conv encoder for profiles
-            self.recep_encoder = nn.Sequential(
-                nn.Linear(n_profile_dirs, embed_dim),
-                nn.GELU(),
-                nn.Linear(embed_dim, embed_dim),
-            )
-            self.influence_encoder = nn.Sequential(
-                nn.Linear(n_profile_dirs, embed_dim),
-                nn.GELU(),
-                nn.Linear(embed_dim, embed_dim),
-            )
-            self.profile_fusion = nn.Linear(2 * embed_dim, embed_dim)
-
-        # --- Transformer ---
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=int(embed_dim * mlp_ratio),
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=num_layers,
-            norm=nn.LayerNorm(embed_dim),
-        )
-
-    def forward(
-        self,
-        obs: torch.Tensor,             # (B, N, obs_dim)
-        positions: torch.Tensor,        # (B, N, 2)
-        attention_mask: torch.Tensor,   # (B, N) True=padding
-        receptivity: torch.Tensor = None,   # (B, N, n_dirs)
-        influence: torch.Tensor = None,     # (B, N, n_dirs)
-    ) -> torch.Tensor:
-        """
-        Returns:
-            h: (B, N, embed_dim) per-turbine embeddings
-        """
-        # Encode observations
-        h = self.obs_encoder(obs)                    # (B, N, embed_dim)
-
-        # Add positional encoding
-        h = h + self.pos_encoder(positions)          # (B, N, embed_dim)
-
-        # Add profile encoding
-        if self.use_profiles and receptivity is not None and influence is not None:
-            recep_embed = self.recep_encoder(receptivity)
-            infl_embed = self.influence_encoder(influence)
-            profile_embed = self.profile_fusion(
-                torch.cat([recep_embed, infl_embed], dim=-1)
-            )
-            h = h + profile_embed
-
-        # Transformer (attend across turbines)
-        h = self.transformer(h, src_key_padding_mask=attention_mask)
-
-        return h
+# Keys that belong to the actor head, NOT the encoder
+ACTOR_HEAD_KEYS = {"fc_mean", "fc_logstd", "action_scale", "action_bias_val"}
 
 
-# =============================================================================
-# PRETRAINING MODEL (encoder + power prediction head)
-# =============================================================================
+def get_encoder_state_dict(actor: TransformerActor) -> dict:
+    """Extract only encoder weights from actor (excluding action heads)."""
+    return {
+        k: v for k, v in actor.state_dict().items()
+        if not any(k.startswith(head) for head in ACTOR_HEAD_KEYS)
+    }
+
 
 class PowerPredictionModel(nn.Module):
     """
-    Wraps encoder + prediction head for pretraining.
+    Wraps the REAL TransformerActor backbone + power prediction head.
 
-    After pretraining, transfer encoder weights to the RL agent.
-    The power_head is discarded.
+    Uses the actor's encoder path (obs_encoder → pos_encoder → input_proj
+    → profiles → transformer) so that saved weights have identical keys
+    to the RL agent. The power_head is discarded after pretraining.
     """
 
-    def __init__(self, encoder: PlaceholderTransformerEncoder):
+    def __init__(self, actor: TransformerActor):
         super().__init__()
-        self.encoder = encoder
+        self.actor = actor
         self.power_head = nn.Sequential(
-            nn.Linear(encoder.embed_dim, encoder.embed_dim // 2),
+            nn.Linear(actor.embed_dim, actor.embed_dim // 2),
             nn.GELU(),
-            nn.Linear(encoder.embed_dim // 2, 1),
+            nn.Linear(actor.embed_dim // 2, 1),
         )
+
+    def _encode(
+        self,
+        obs: torch.Tensor,
+        positions: torch.Tensor,
+        attention_mask: torch.Tensor,
+        receptivity: torch.Tensor = None,
+        influence: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Replicate the actor's encoder path (forward up to transformer output).
+        This is lines 958-1004 of the RL script, minus the action heads.
+        """
+        actor = self.actor
+
+        # 1. Encode observations
+        h = actor.obs_encoder(obs)  # (B, N, embed_dim)
+
+        # 2. Positional encoding
+        if actor.embedding_mode == "concat" and actor.pos_encoder is not None:
+            pos_embed = actor.pos_encoder(positions)
+            h = torch.cat([h, pos_embed], dim=-1)
+        elif actor.embedding_mode == "add" and actor.pos_encoder is not None:
+            pos_embed = actor.pos_encoder(positions)
+            h = h + pos_embed
+
+        # 3. Project to embed_dim
+        h = actor.input_proj(h)
+
+        # 4. Profile encoding
+        if actor.recep_encoder and receptivity is not None and influence is not None:
+            recep_embed = actor.recep_encoder(receptivity)
+            influence_embed = actor.influence_encoder(influence)
+
+            if actor.profile_fusion_type == "joint":
+                profile_embed = actor.profile_fusion(
+                    torch.cat([recep_embed, influence_embed], dim=-1)
+                )
+            else:
+                profile_embed = recep_embed + influence_embed
+
+            if actor.profile_embed_mode == "concat":
+                h = actor.profile_proj(torch.cat([h, profile_embed], dim=-1))
+            else:
+                h = h + profile_embed
+
+        # 5. Relative position bias
+        attn_bias = None
+        if actor.rel_pos_bias is not None:
+            attn_bias = actor.rel_pos_bias(positions, attention_mask)
+
+        # 6. Transformer
+        h, _ = actor.transformer(h, attention_mask, attn_bias, need_weights=False)
+
+        return h
 
     def forward(self, batch: dict) -> torch.Tensor:
         """
         Args:
-            batch: Dict from dataloader with keys:
-                obs, positions, attention_mask, [receptivity, influence]
-
+            batch: Dict with keys: obs, positions, attention_mask,
+                   [receptivity, influence]
         Returns:
             predicted_power: (B, N) predicted normalized power per turbine
         """
-        h = self.encoder(
+        h = self._encode(
             obs=batch["obs"],
             positions=batch["positions"],
             attention_mask=batch["attention_mask"],
             receptivity=batch.get("receptivity"),
             influence=batch.get("influence"),
         )
-
-        power = self.power_head(h).squeeze(-1)  # (B, N)
+        power = self.power_head(h).squeeze(-1)
         return power
-
-
+    
 # =============================================================================
 # LOSS FUNCTION
 # =============================================================================
@@ -473,18 +461,32 @@ def main():
     print(f"  num_heads: {args.num_heads}")
     print(f"  num_layers: {args.num_layers}")
 
-    # --- Build model ---
-    encoder = PlaceholderTransformerEncoder(
-        obs_dim=obs_dim,
+    # --- Build model (using REAL TransformerActor backbone) ---
+    actor = TransformerActor(
+        obs_dim_per_turbine=obs_dim,
+        action_dim_per_turbine=1,        # dummy, head is discarded
         embed_dim=args.embed_dim,
         pos_embed_dim=args.pos_embed_dim,
         num_heads=args.num_heads,
         num_layers=args.num_layers,
         mlp_ratio=args.mlp_ratio,
         dropout=args.dropout,
-        n_profile_dirs=n_profile_dirs,
+        action_scale=1.0,                # dummy
+        action_bias=0.0,                 # dummy
+        # Positional encoding (must match RL config)
+        pos_encoding_type=args.pos_encoding_type,
+        rel_pos_hidden_dim=args.rel_pos_hidden_dim,
+        rel_pos_per_head=args.rel_pos_per_head,
+        pos_embedding_mode=args.pos_embedding_mode,
+        # Profile encoding (must match RL config)
+        profile_encoding=args.profile_encoding_type,
+        profile_encoder_hidden=args.profile_encoder_hidden,
+        n_profile_directions=n_profile_dirs if has_profiles else args.n_profile_directions,
+        profile_fusion_type=args.profile_fusion_type,
+        profile_embed_mode=args.profile_embed_mode,
+        args=args,  # for profile_encoder_kwargs
     )
-    model = PowerPredictionModel(encoder).to(device)
+    model = PowerPredictionModel(actor).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Total parameters: {n_params:,}")
@@ -563,7 +565,7 @@ def main():
             best_val_mse = val_mse
             torch.save({
                 "epoch": epoch,
-                "encoder_state_dict": model.encoder.state_dict(),
+                "encoder_state_dict":get_encoder_state_dict(model.actor),
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "val_mse": val_mse,
@@ -585,7 +587,7 @@ def main():
         if epoch % args.save_every == 0:
             torch.save({
                 "epoch": epoch,
-                "encoder_state_dict": model.encoder.state_dict(),
+                "encoder_state_dict": get_encoder_state_dict(model.actor),
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "val_mse": val_mse,
@@ -595,7 +597,7 @@ def main():
     # Final save
     torch.save({
         "epoch": args.epochs,
-        "encoder_state_dict": model.encoder.state_dict(),
+        "encoder_state_dict": get_encoder_state_dict(model.actor),
         "model_state_dict": model.state_dict(),
         "val_mse": val_mse,
         "val_mae": val_mae,
