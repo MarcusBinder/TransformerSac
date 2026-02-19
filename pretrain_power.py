@@ -9,16 +9,18 @@ This script uses a placeholder encoder to validate the full pipeline.
 Once confirmed working, swap in the real TransformerActor backbone.
 
 Usage:
-    python pretrain_power.py --data_dir ./pretrain_data --epochs 50
-    python pretrain_power.py --data_dir ./pretrain_data --snapshot  # no history
-    python pretrain_power.py --data_dir ./pretrain_data --no_wandb  # disable logging
+    python pretrain_power.py --data-dir ./pretrain_data --epochs 50
+    python pretrain_power.py --data-dir ./pretrain_data --snapshot  # no history
+    python pretrain_power.py --data-dir ./pretrain_data --no-track  # disable wandb
 
 Author: Marcus (DTU Wind Energy)
 """
 
 import os
-import argparse
 import time
+from dataclasses import dataclass, field
+from typing import Optional, List
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -26,6 +28,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 from glob import glob
 from pathlib import Path
+
+import tyro
 
 try:
     import wandb
@@ -35,6 +39,89 @@ except ImportError:
     print("wandb not installed — logging disabled. Install with: pip install wandb")
 
 from data_loader import create_pretrain_dataloader, WindFarmPretrainDataset, WindFarmSnapshotDataset
+
+
+# =============================================================================
+# CONFIG
+# =============================================================================
+
+@dataclass
+class Args:
+    """Command-line arguments for power prediction pretraining."""
+
+    # === Experiment Settings ===
+    exp_name: str = os.path.basename(__file__)[: -len(".py")]
+    """Experiment name (used for run naming)."""
+    seed: int = 42
+    """Random seed for reproducibility."""
+    track: bool = True
+    """Enable wandb tracking."""
+    wandb_project_name: str = "windfarm-pretrain"
+    """Wandb project name."""
+    wandb_entity: Optional[str] = None
+    """Wandb entity (team/user). None = default entity."""
+    wandb_tags: Optional[str] = None
+    """Comma-separated wandb tags (e.g. 'baseline,snapshot')."""
+
+    # === Data Settings ===
+    data_dir: str = "./pretrain_data"
+    """Directory containing layout_*.h5 files."""
+    snapshot: bool = False
+    """Use snapshot mode (no history)."""
+    history_length: int = 15
+    """Number of timesteps of history per feature (sequence mode)."""
+    skip_steps: int = 1
+    """Subsample every N steps (snapshot mode only)."""
+
+    # === Preprocessing ===
+    use_wd_deviation: bool = False
+    """Convert wind direction to deviation from mean."""
+    use_wind_relative_pos: bool = True
+    """Transform turbine positions to wind-relative frame."""
+    rotate_profiles: bool = True
+    """Rotate profiles to wind-relative frame."""
+    wd_scale_range: float = 90.0
+    """Wind direction deviation range for scaling (±degrees → [-1,1])."""
+    power_max: float = 10e6
+    """Max power for normalization (W). DTU10MW ≈ 10.64e6."""
+
+    # === Transformer Architecture ===
+    embed_dim: int = 64
+    """Transformer hidden dimension."""
+    pos_embed_dim: int = 16
+    """Dimension for positional encoding MLP."""
+    num_heads: int = 4
+    """Number of attention heads."""
+    num_layers: int = 2
+    """Number of transformer encoder layers."""
+    mlp_ratio: float = 2.0
+    """FFN hidden dim = embed_dim * mlp_ratio."""
+    dropout: float = 0.1
+    """Dropout rate."""
+
+    # === Training Hyperparameters ===
+    epochs: int = 50
+    """Number of training epochs."""
+    batch_size: int = 256
+    """Batch size."""
+    lr: float = 3e-4
+    """Learning rate."""
+    weight_decay: float = 1e-4
+    """AdamW weight decay."""
+    val_split: float = 0.1
+    """Fraction of data held out for validation."""
+    num_workers: int = 4
+    """DataLoader workers."""
+
+    # === Output / Checkpointing ===
+    save_dir: str = "./pretrain_checkpoints"
+    """Directory for saving checkpoints."""
+    save_every: int = 10
+    """Save checkpoint every N epochs."""
+
+    # === Device ===
+    device: str = "auto"
+    """Device: 'auto', 'cuda', 'cpu'."""
 
 
 # =============================================================================
@@ -286,64 +373,8 @@ def evaluate(model, loader, device):
 # MAIN
 # =============================================================================
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Power prediction pretraining")
-
-    # Data
-    parser.add_argument("--data_dir", type=str, default="./pretrain_data")
-    parser.add_argument("--snapshot", action="store_true",
-                        help="Use snapshot mode (no history)")
-    parser.add_argument("--history_length", type=int, default=15)
-    parser.add_argument("--skip_steps", type=int, default=1,
-                        help="Subsample every N steps (snapshot mode only)")
-
-    # Preprocessing
-    parser.add_argument("--use_wd_deviation", action="store_true")
-    parser.add_argument("--use_wind_relative_pos", action="store_true", default=True)
-    parser.add_argument("--rotate_profiles", action="store_true", default=True)
-    parser.add_argument("--power_max", type=float, default=10e6,
-                        help="Max power for normalization (W). DTU10MW ≈ 10.64e6")
-
-    # Model
-    parser.add_argument("--embed_dim", type=int, default=64)
-    parser.add_argument("--num_heads", type=int, default=4)
-    parser.add_argument("--num_layers", type=int, default=2)
-    parser.add_argument("--dropout", type=float, default=0.1)
-
-    # Training
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--val_split", type=float, default=0.1,
-                        help="Fraction of data for validation")
-    parser.add_argument("--num_workers", type=int, default=4)
-
-    # Output
-    parser.add_argument("--save_dir", type=str, default="./pretrain_checkpoints")
-    parser.add_argument("--save_every", type=int, default=10,
-                        help="Save checkpoint every N epochs")
-
-    # Device
-    parser.add_argument("--device", type=str, default="auto")
-
-    # Wandb
-    parser.add_argument("--no_wandb", action="store_true",
-                        help="Disable wandb logging")
-    parser.add_argument("--wandb_project", type=str, default="windfarm-pretrain",
-                        help="Wandb project name")
-    parser.add_argument("--wandb_entity", type=str, default=None,
-                        help="Wandb entity (team/user)")
-    parser.add_argument("--wandb_run_name", type=str, default=None,
-                        help="Wandb run name (auto-generated if not set)")
-    parser.add_argument("--wandb_tags", type=str, nargs="*", default=None,
-                        help="Wandb tags for the run")
-
-    return parser.parse_args()
-
-
 def main():
-    args = parse_args()
+    args = tyro.cli(Args)
 
     # Device
     if args.device == "auto":
@@ -355,27 +386,28 @@ def main():
     # =========================================================================
     # Wandb init
     # =========================================================================
-    use_wandb = WANDB_AVAILABLE and not args.no_wandb
+    use_wandb = WANDB_AVAILABLE and args.track
 
     if use_wandb:
-        # Auto-generate a descriptive run name if not provided
-        run_name = args.wandb_run_name
-        if run_name is None:
-            mode = "snap" if args.snapshot else f"hist{args.history_length}"
-            run_name = f"pretrain_{mode}_e{args.embed_dim}_L{args.num_layers}_H{args.num_heads}"
+        # Auto-generate a descriptive run name
+        mode = "snap" if args.snapshot else f"hist{args.history_length}"
+        run_name = f"{args.exp_name}_{mode}_e{args.embed_dim}_L{args.num_layers}_H{args.num_heads}"
+
+        # Parse comma-separated tags
+        tags = [t.strip() for t in args.wandb_tags.split(",")] if args.wandb_tags else None
 
         wandb.init(
-            project=args.wandb_project,
+            project=args.wandb_project_name,
             entity=args.wandb_entity,
             name=run_name,
-            tags=args.wandb_tags,
+            tags=tags,
             config=vars(args),
         )
-        print(f"Wandb: logging to {args.wandb_project}/{run_name}")
-    elif not WANDB_AVAILABLE and not args.no_wandb:
+        print(f"Wandb: logging to {args.wandb_project_name}/{run_name}")
+    elif not WANDB_AVAILABLE and args.track:
         print("Wandb: not available (install with pip install wandb)")
     else:
-        print("Wandb: disabled (--no_wandb)")
+        print("Wandb: disabled (--no-track)")
 
     # Find data files
     files = sorted(glob(f"{args.data_dir}/layout_*.h5"))
@@ -398,7 +430,7 @@ def main():
         features=input_features,
         scaling_limits=scaling_limits,
         use_wd_deviation=args.use_wd_deviation,
-        wd_scale_range=90.0,
+        wd_scale_range=args.wd_scale_range,
         use_wind_relative_pos=args.use_wind_relative_pos,
         rotate_profiles=args.rotate_profiles,
     )
@@ -413,7 +445,7 @@ def main():
     n_train = len(dataset) - n_val
     train_set, val_set = random_split(
         dataset, [n_train, n_val],
-        generator=torch.Generator().manual_seed(42),
+        generator=torch.Generator().manual_seed(args.seed),
     )
     print(f"Train: {n_train} samples, Val: {n_val} samples")
 
@@ -445,8 +477,10 @@ def main():
     encoder = PlaceholderTransformerEncoder(
         obs_dim=obs_dim,
         embed_dim=args.embed_dim,
+        pos_embed_dim=args.pos_embed_dim,
         num_heads=args.num_heads,
         num_layers=args.num_layers,
+        mlp_ratio=args.mlp_ratio,
         dropout=args.dropout,
         n_profile_dirs=n_profile_dirs,
     )
