@@ -20,7 +20,7 @@ HDF5 Structure:
             └── actions # (n_steps, n_turbines)
 
 Usage:
-    python collect_pretrain_data.py \\
+    python make_dataset.py \\
         --layouts "grid_3x3,grid_5x5,hornsrev" \\
         --episodes_per_layout 100 \\
         --output_dir ./pretrain_data \\
@@ -32,12 +32,16 @@ Author: Marcus (DTU Wind Energy)
 """
 
 import os
-import argparse
 import time
+from dataclasses import dataclass
+from typing import Optional
+
 import numpy as np
 import h5py
 import gymnasium as gym
 from multiprocessing import Pool, cpu_count
+
+import tyro
 
 # WindGym imports
 from WindGym import WindFarmEnv
@@ -48,6 +52,60 @@ from helper_funcs import (
 )
 
 from WindGym.Agents import GreedyAgent, PyWakeAgent
+
+
+# =============================================================================
+# CLI CONFIG
+# =============================================================================
+
+@dataclass
+class Args:
+    """Collect pretraining data for wind farm transformer."""
+
+    # === Layout and Output ===
+    layouts: str = "grid_3x3"
+    """Comma-separated layout names (e.g. 'grid_3x3,grid_5x5')"""
+    output_dir: str = "./pretrain_data"
+    """Output directory for HDF5 files"""
+    episodes_per_layout: int = 100
+    """Number of episodes to collect per layout"""
+    policy: str = "random"
+    """Data collection policy: 'random', 'greedy', or 'pywake'"""
+
+    # === Turbine and Environment ===
+    turbtype: str = "DTU10MW"
+    """Wind turbine type"""
+    TI_type: str = "Random"
+    """Turbulence intensity sampling"""
+    config: str = "basic"
+    """Environment config preset"""
+    dt_sim: int = 5
+    """Simulation timestep (seconds)"""
+    dt_env: int = 10
+    """Environment timestep (seconds)"""
+    yaw_step: float = 5.0
+    """Max yaw change per sim step (degrees)"""
+    max_eps: int = 60
+    """Number of flow passthroughs per episode"""
+    max_steps: int = 600
+    """Safety limit for max steps per episode"""
+
+    # === Profiles ===
+    profile_source: str = "geometric"
+    """Profile computation source: 'geometric' or 'pywake'"""
+    n_profile_directions: int = 360
+    """Number of directions in profile"""
+    no_profiles: bool = False
+    """Skip profile computation"""
+
+    # === Parallelism ===
+    n_workers: int = 1
+    """Number of parallel workers (0 = all available cores)"""
+
+    # === Seeds ===
+    seed: int = 0
+    """Base random seed"""
+
 
 # =============================================================================
 # HDF5 WRITER
@@ -543,52 +601,11 @@ def inspect_dataset(filepath: str):
 
 
 # =============================================================================
-# CLI ENTRYPOINT
+# MAIN
 # =============================================================================
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Collect pretraining data for wind farm transformer")
-
-    # Layout and output
-    parser.add_argument("--layouts", type=str, required=True,
-                        help="Comma-separated layout names (e.g. 'grid_3x3,grid_5x5')")
-    parser.add_argument("--output_dir", type=str, default="./pretrain_data",
-                        help="Output directory for HDF5 files")
-    parser.add_argument("--episodes_per_layout", type=int, default=100,
-                        help="Number of episodes to collect per layout")
-    parser.add_argument("--policy", type=str, default="random", choices=["random", "greedy", "pywake"],
-                        help="Data collection policy")
-
-    # Turbine and environment
-    parser.add_argument("--turbtype", type=str, default="DTU10MW")
-    parser.add_argument("--TI_type", type=str, default="Random")
-    parser.add_argument("--config", type=str, default="basic")
-    parser.add_argument("--dt_sim", type=int, default=5)
-    parser.add_argument("--dt_env", type=int, default=10)
-    parser.add_argument("--yaw_step", type=float, default=5.0)
-    parser.add_argument("--max_eps", type=int, default=60)
-    parser.add_argument("--max_steps", type=int, default=600)
-
-    # Profiles
-    parser.add_argument("--profile_source", type=str, default="geometric",
-                        choices=["geometric", "pywake"])
-    parser.add_argument("--n_profile_directions", type=int, default=360)
-    parser.add_argument("--no_profiles", action="store_true",
-                        help="Skip profile computation")
-
-    # Parallelism
-    parser.add_argument("--n_workers", type=int, default=1,
-                        help="Number of parallel workers for episode collection "
-                             "(default: 1, use 0 for all available cores)")
-
-    # Seeds
-    parser.add_argument("--seed", type=int, default=0)
-
-    return parser.parse_args()
-
-
 def main():
-    args = parse_args()
+    args = tyro.cli(Args)
 
     # Setup
     layout_names = [l.strip() for l in args.layouts.split(",")]
