@@ -1,0 +1,681 @@
+"""
+PyTorch Dataset for Wind Farm Pretraining Data
+
+Reads HDF5 files produced by collect_pretrain_data.py and serves
+(obs, positions, profiles, targets) samples with configurable history windows.
+
+Supports two modes:
+    1. Snapshot mode (history_length=1): For masked prediction on single timesteps
+    2. History mode (history_length>1): Stacks past observations like the RL agent sees
+
+Preprocessing (matching the RL training pipeline):
+    - Normalization: Raw values → [-1, 1] using env-compatible scaling limits
+    - Wind direction deviation: Optionally convert absolute WD to deviation from
+      episode mean, matching EnhancedPerTurbineWrapper behavior
+    - Wind-relative positions: Optionally rotate positions so wind comes from 270°
+    - Profile rotation: Optionally rotate profiles so wind direction aligns to index 0
+
+Author: Marcus (DTU Wind Energy)
+"""
+
+import math
+import numpy as np
+import h5py
+import torch
+from torch.utils.data import Dataset, DataLoader
+from typing import List, Optional, Dict, Tuple
+from pathlib import Path
+
+
+# =============================================================================
+# NORMALIZATION UTILITIES
+# =============================================================================
+
+def normalize_to_minus1_plus1(
+    values: np.ndarray,
+    vmin: float,
+    vmax: float,
+) -> np.ndarray:
+    """
+    Scale values from [vmin, vmax] → [-1, 1].
+
+    This matches the WindFarmEnv's internal observation scaling:
+        scaled = 2 * (val - vmin) / (vmax - vmin) - 1
+
+    Args:
+        values: Array of raw physical values
+        vmin: Minimum of the expected range
+        vmax: Maximum of the expected range
+
+    Returns:
+        Scaled array in [-1, 1] (values outside [vmin, vmax] will exceed ±1)
+    """
+    return (2.0 * (values - vmin) / (vmax - vmin) - 1.0).astype(np.float32)
+
+
+def compute_wd_deviation(
+    local_wd: np.ndarray,
+    mean_wd: float,
+    scale_range: float = 90.0,
+) -> np.ndarray:
+    """
+    Convert absolute wind direction to deviation from episode mean, scaled to [-1, 1].
+
+    Matches helper_funcs.compute_wind_direction_deviation exactly:
+        deviation = ((local_wd - mean_wd + 180) % 360) - 180
+        scaled = clip(deviation / scale_range, -1, 1)
+
+    Args:
+        local_wd: Per-turbine local wind direction in degrees
+        mean_wd: Episode-level mean wind direction in degrees
+        scale_range: ±scale_range degrees maps to [-1, 1] (default 90°)
+
+    Returns:
+        Scaled deviation in [-1, 1], same shape as input
+    """
+    deviation = local_wd - mean_wd
+    deviation = ((deviation + 180) % 360) - 180
+    scaled = np.clip(deviation / scale_range, -1.0, 1.0)
+    return scaled.astype(np.float32)
+
+
+def rotate_positions_wind_relative(
+    positions: np.ndarray,
+    wind_direction: float,
+) -> np.ndarray:
+    """
+    Rotate positions so wind effectively comes from 270° (negative x).
+
+    Matches helper_funcs.transform_to_wind_relative (numpy single-sample version).
+
+    Args:
+        positions: (n_turbines, 2) normalized positions
+        wind_direction: Wind direction in degrees (meteorological convention)
+
+    Returns:
+        Rotated positions with same shape
+    """
+    angle_offset = wind_direction - 270.0
+    theta = angle_offset * (math.pi / 180.0)
+    cos_t = math.cos(theta)
+    sin_t = math.sin(theta)
+
+    x = positions[:, 0]
+    y = positions[:, 1]
+
+    x_rot = cos_t * x - sin_t * y
+    y_rot = sin_t * x + cos_t * y
+
+    return np.stack([x_rot, y_rot], axis=-1).astype(np.float32)
+
+
+def rotate_profiles_numpy(
+    profiles: np.ndarray,
+    wind_direction: float,
+) -> np.ndarray:
+    """
+    Rotate profiles so current wind direction aligns to index 0.
+
+    Matches helper_funcs.rotate_profiles_tensor and
+    TransformerReplayBuffer._rotate_profiles_batch (single-sample).
+
+    Args:
+        profiles: (n_turbines, n_directions)
+        wind_direction: Wind direction in degrees
+
+    Returns:
+        Rotated profiles with same shape
+    """
+    n_directions = profiles.shape[1]
+    degrees_per_index = 360.0 / n_directions
+    shift = int(round(wind_direction / degrees_per_index))
+    indices = (np.arange(n_directions) + shift) % n_directions
+    return profiles[:, indices].astype(np.float32)
+
+
+# =============================================================================
+# DEFAULT SCALING LIMITS (matching WindFarmEnv constructor defaults)
+# =============================================================================
+
+DEFAULT_SCALING = {
+    "ws":    (0.0, 30.0),     # m/s  — WindFarmEnv: ws_scaling_min/max
+    "wd":    (0.0, 360.0),    # deg  — WindFarmEnv: wd_scaling_min/max
+    "yaw":   (-45.0, 45.0),   # deg  — WindFarmEnv: yaw_scaling_min/max
+    "power": (0.0, 10e6),      # Fraction of max power (see note below)
+}
+# NOTE on power scaling:
+# The env uses [0, maxturbpower] where maxturbpower = max(turbine.power(...)).
+# For DTU10MW ≈ 10.64 MW, for V80 ≈ 2.0 MW.
+# The raw data from make_datasets.py stores power in physical units (W or kW
+# depending on PyWake config). The user should set power_range to match their
+# turbine's max power output. Alternatively, if the data is already normalized
+# to [0, 1] (fraction of rated), the default (0, 1) will work.
+
+
+# =============================================================================
+# HISTORY DATASET
+# =============================================================================
+
+class WindFarmPretrainDataset(Dataset):
+    """
+    Serves (obs, positions, profiles, target_power) for pretraining.
+
+    Each sample is a single timestep with history_length context,
+    drawn from a random episode across all layout files.
+
+    Preprocessing pipeline (applied per sample in __getitem__):
+        1. Stack history window for each feature → (n_turb, H * n_features)
+        2. Normalize each feature to [-1, 1] using scaling limits
+        3. Optionally convert WD to deviation from episode mean
+        4. Pad to max_turbines with attention_mask
+        5. Optionally transform positions to wind-relative frame
+        6. Optionally rotate profiles to wind-relative frame
+    """
+
+    def __init__(
+        self,
+        layout_files: List[str],
+        history_length: int = 15,
+        max_turbines: Optional[int] = None,
+        features: List[str] = ["ws", "wd", "yaw", "power"],
+        # --- Normalization ---
+        scaling_limits: Optional[Dict[str, Tuple[float, float]]] = None,
+        # --- Wind direction deviation ---
+        use_wd_deviation: bool = False,
+        wd_scale_range: float = 90.0,
+        # --- Wind-relative positions ---
+        use_wind_relative_pos: bool = True,
+        # --- Profile rotation ---
+        rotate_profiles: bool = True,
+    ):
+        """
+        Args:
+            layout_files: List of HDF5 file paths (one per layout)
+            history_length: Number of past timesteps to stack per feature
+            max_turbines: Pad to this many turbines (None = auto from data)
+            features: Which per-turbine features to include in obs
+            scaling_limits: Dict mapping feature name → (min, max) for [-1,1] scaling.
+                            Defaults to WindFarmEnv defaults if not provided.
+            use_wd_deviation: If True, convert WD to deviation from episode mean_wd
+                              (matches EnhancedPerTurbineWrapper behavior)
+            wd_scale_range: ±degrees that map to [-1, 1] for WD deviation (default 90°)
+            use_wind_relative_pos: If True, rotate positions so wind comes from 270°
+            rotate_profiles: If True, rotate profiles so wind direction is at index 0
+        """
+        self.history_length = history_length
+        self.features = features
+        self.use_wd_deviation = use_wd_deviation
+        self.wd_scale_range = wd_scale_range
+        self.use_wind_relative_pos = use_wind_relative_pos
+        self.rotate_profiles = rotate_profiles
+
+        # Merge user-provided limits with defaults
+        self.scaling_limits = dict(DEFAULT_SCALING)
+        if scaling_limits is not None:
+            self.scaling_limits.update(scaling_limits)
+
+        # Build index: list of (layout_idx, ep_key, timestep)
+        self.index = []
+        self.layouts = []
+
+        print(f"Loading dataset from {len(layout_files)} layout file(s)...")
+        print(f"  Normalization: ON (limits: { {k: v for k, v in self.scaling_limits.items() if k in features} })")
+        print(f"  WD deviation: {'ON' if use_wd_deviation else 'OFF'}"
+              f"{f' (±{wd_scale_range}°→[-1,1])' if use_wd_deviation else ''}")
+        print(f"  Wind-relative positions: {'ON' if use_wind_relative_pos else 'OFF'}")
+        print(f"  Profile rotation: {'ON' if rotate_profiles else 'OFF'}")
+
+        for li, path in enumerate(layout_files):
+            with h5py.File(path, "r") as f:
+                layout_info = {
+                    "path": str(path),
+                    "layout_name": str(f.attrs["layout_name"]),
+                    "n_turbines": int(f.attrs["n_turbines"]),
+                    "rotor_diameter": float(f.attrs["rotor_diameter"]),
+                    "positions": f["positions/xy"][:].astype(np.float32),
+                }
+
+                # Load profiles if available
+                if "profiles" in f:
+                    layout_info["receptivity"] = f["profiles/receptivity"][:].astype(np.float32)
+                    layout_info["influence"] = f["profiles/influence"][:].astype(np.float32)
+
+                # Load episode-level metadata
+                episode_meta = {}
+                for ep_key in sorted(f["episodes"].keys()):
+                    ep = f[f"episodes/{ep_key}"]
+                    n_steps = int(ep.attrs["n_steps"])
+                    episode_meta[ep_key] = {
+                        "n_steps": n_steps,
+                        "mean_ws": float(ep.attrs["mean_ws"]),
+                        "mean_wd": float(ep.attrs["mean_wd"]),
+                        "mean_ti": float(ep.attrs["mean_ti"]),
+                    }
+
+                    # Valid timesteps: need history_length steps of context before
+                    for t in range(history_length, n_steps):
+                        self.index.append((li, ep_key, t))
+
+                layout_info["episode_meta"] = episode_meta
+                self.layouts.append(layout_info)
+
+                print(f"  [{li}] {layout_info['layout_name']}: "
+                      f"{layout_info['n_turbines']} turbines, "
+                      f"{len(episode_meta)} episodes, "
+                      f"{sum(m['n_steps'] for m in episode_meta.values())} total steps")
+
+        # Determine max turbines for padding
+        self.max_turbines = max_turbines or max(l["n_turbines"] for l in self.layouts)
+        self.obs_dim = history_length * len(features)
+
+        print(f"Dataset ready: {len(self.index)} samples, "
+              f"max_turbines={self.max_turbines}, "
+              f"obs_dim={self.obs_dim} ({history_length} × {len(features)} features)")
+
+    def __len__(self):
+        return len(self.index)
+
+    def _normalize_feature(self, feat_name: str, raw_values: np.ndarray,
+                           mean_wd: float = 0.0) -> np.ndarray:
+        """
+        Normalize a single feature's raw values to [-1, 1].
+
+        For wind direction with use_wd_deviation=True, computes deviation
+        from episode mean instead of standard min-max scaling.
+
+        Args:
+            feat_name: Feature name (e.g., "ws", "wd", "yaw", "power")
+            raw_values: Raw physical values, any shape
+            mean_wd: Episode mean wind direction (only used if feat_name=="wd" and use_wd_deviation)
+
+        Returns:
+            Normalized values in [-1, 1], same shape
+        """
+        if feat_name == "wd" and self.use_wd_deviation:
+            return compute_wd_deviation(raw_values, mean_wd, self.wd_scale_range)
+        else:
+            vmin, vmax = self.scaling_limits.get(feat_name, (0.0, 1.0))
+            return normalize_to_minus1_plus1(raw_values, vmin, vmax)
+
+    def __getitem__(self, idx):
+        li, ep_key, t = self.index[idx]
+        layout = self.layouts[li]
+        n_turb = layout["n_turbines"]
+
+        # Episode metadata (needed for WD deviation and wind-relative transforms)
+        ep_meta = layout["episode_meta"][ep_key]
+        mean_wd = ep_meta["mean_wd"]
+
+        with h5py.File(layout["path"], "r") as f:
+            ep = f[f"episodes/{ep_key}"]
+
+            # Build stacked observation: (n_turb, history_length * n_features)
+            obs_parts = []
+            for feat in self.features:
+                # Slice: (history_length, n_turb)
+                hist_raw = ep[feat][t - self.history_length : t]  # (H, n_turb)
+
+                # Normalize each feature to [-1, 1]
+                hist_norm = self._normalize_feature(feat, hist_raw, mean_wd)
+
+                obs_parts.append(hist_norm.T)  # (n_turb, H)
+
+            obs = np.concatenate(obs_parts, axis=-1)  # (n_turb, H * n_features)
+
+            # Target: current power at last step in history window
+            target_power_raw = ep["power"][t - 1]  # (n_turb,)
+            target_power = self._normalize_feature("power", target_power_raw)
+
+            # Current actions (for next-step prediction, if needed)
+            actions = ep["actions"][t - 1]  # (n_turb,)
+
+        # --- Positions ---
+        positions_norm = layout["positions"] / layout["rotor_diameter"]  # (n_turb, 2)
+
+        if self.use_wind_relative_pos:
+            positions_norm = rotate_positions_wind_relative(positions_norm, mean_wd)
+
+        # --- Pad to max_turbines ---
+        obs_padded = np.zeros((self.max_turbines, obs.shape[-1]), dtype=np.float32)
+        obs_padded[:n_turb] = obs
+
+        target_padded = np.zeros(self.max_turbines, dtype=np.float32)
+        target_padded[:n_turb] = target_power
+
+        actions_padded = np.zeros(self.max_turbines, dtype=np.float32)
+        actions_padded[:n_turb] = actions
+
+        positions_padded = np.zeros((self.max_turbines, 2), dtype=np.float32)
+        positions_padded[:n_turb] = positions_norm
+
+        attention_mask = np.ones(self.max_turbines, dtype=bool)  # True = padding
+        attention_mask[:n_turb] = False
+
+        sample = {
+            "obs": obs_padded,                          # (max_turb, obs_dim)
+            "positions": positions_padded,              # (max_turb, 2) normalized [+ wind-relative]
+            "attention_mask": attention_mask,            # (max_turb,) True=padding
+            "target_power": target_padded,              # (max_turb,) normalized
+            "actions": actions_padded,                  # (max_turb,) raw [-1, 1]
+            "n_turbines": n_turb,                       # scalar
+            "layout_idx": li,                           # scalar
+            # Episode-level conditions
+            "mean_ws": np.float32(ep_meta["mean_ws"]),
+            "mean_wd": np.float32(ep_meta["mean_wd"]),
+            "mean_ti": np.float32(ep_meta["mean_ti"]),
+        }
+
+        # Profiles (if available)
+        if "receptivity" in layout:
+            n_dirs = layout["receptivity"].shape[1]
+
+            recep = layout["receptivity"]   # (n_turb, n_dirs)
+            infl = layout["influence"]      # (n_turb, n_dirs)
+
+            # Optionally rotate profiles to wind-relative frame
+            if self.rotate_profiles:
+                recep = rotate_profiles_numpy(recep, mean_wd)
+                infl = rotate_profiles_numpy(infl, mean_wd)
+
+            recep_padded = np.zeros((self.max_turbines, n_dirs), dtype=np.float32)
+            recep_padded[:n_turb] = recep
+            sample["receptivity"] = recep_padded
+
+            infl_padded = np.zeros((self.max_turbines, n_dirs), dtype=np.float32)
+            infl_padded[:n_turb] = infl
+            sample["influence"] = infl_padded
+
+        return sample
+
+
+# =============================================================================
+# SNAPSHOT DATASET (no history, for pure masked prediction on steady-state)
+# =============================================================================
+
+class WindFarmSnapshotDataset(Dataset):
+    """
+    Simplified dataset for snapshot-based pretraining (history_length=1).
+
+    Each sample is a single timestep with per-turbine (ws, wd, yaw, power).
+    Obs dim = n_features (4), not n_features * history.
+
+    Useful for:
+    - Masked turbine prediction from PyWake steady-state data
+    - Quick pretraining experiments without temporal context
+    """
+
+    def __init__(
+        self,
+        layout_files: List[str],
+        max_turbines: Optional[int] = None,
+        features: List[str] = ["ws", "wd", "yaw", "power"],
+        skip_steps: int = 1,
+        # --- Normalization ---
+        scaling_limits: Optional[Dict[str, Tuple[float, float]]] = None,
+        # --- Wind direction deviation ---
+        use_wd_deviation: bool = False,
+        wd_scale_range: float = 90.0,
+        # --- Wind-relative positions ---
+        use_wind_relative_pos: bool = True,
+        # --- Profile rotation ---
+        rotate_profiles: bool = True,
+    ):
+        self.features = features
+        self.use_wd_deviation = use_wd_deviation
+        self.wd_scale_range = wd_scale_range
+        self.use_wind_relative_pos = use_wind_relative_pos
+        self.rotate_profiles = rotate_profiles
+
+        # Merge user-provided limits with defaults
+        self.scaling_limits = dict(DEFAULT_SCALING)
+        if scaling_limits is not None:
+            self.scaling_limits.update(scaling_limits)
+
+        self.index = []
+        self.layouts = []
+
+        for li, path in enumerate(layout_files):
+            with h5py.File(path, "r") as f:
+                layout_info = {
+                    "path": str(path),
+                    "n_turbines": int(f.attrs["n_turbines"]),
+                    "rotor_diameter": float(f.attrs["rotor_diameter"]),
+                    "positions": f["positions/xy"][:].astype(np.float32),
+                }
+                if "profiles" in f:
+                    layout_info["receptivity"] = f["profiles/receptivity"][:].astype(np.float32)
+                    layout_info["influence"] = f["profiles/influence"][:].astype(np.float32)
+
+                # Store episode metadata for WD deviation
+                episode_meta = {}
+                for ep_key in sorted(f["episodes"].keys()):
+                    ep = f[f"episodes/{ep_key}"]
+                    n_steps = int(ep.attrs["n_steps"])
+                    episode_meta[ep_key] = {
+                        "n_steps": n_steps,
+                        "mean_wd": float(ep.attrs["mean_wd"]),
+                    }
+                    for t in range(0, n_steps, skip_steps):
+                        self.index.append((li, ep_key, t))
+
+                layout_info["episode_meta"] = episode_meta
+                self.layouts.append(layout_info)
+
+        self.max_turbines = max_turbines or max(l["n_turbines"] for l in self.layouts)
+        print(f"Snapshot dataset: {len(self.index)} samples, max_turb={self.max_turbines}")
+
+    def __len__(self):
+        return len(self.index)
+
+    def _normalize_feature(self, feat_name: str, raw_values: np.ndarray,
+                           mean_wd: float = 0.0) -> np.ndarray:
+        """Normalize a single feature (same logic as history dataset)."""
+        if feat_name == "wd" and self.use_wd_deviation:
+            return compute_wd_deviation(raw_values, mean_wd, self.wd_scale_range)
+        else:
+            vmin, vmax = self.scaling_limits.get(feat_name, (0.0, 1.0))
+            return normalize_to_minus1_plus1(raw_values, vmin, vmax)
+
+    def __getitem__(self, idx):
+        li, ep_key, t = self.index[idx]
+        layout = self.layouts[li]
+        n_turb = layout["n_turbines"]
+        mean_wd = layout["episode_meta"][ep_key]["mean_wd"]
+
+        with h5py.File(layout["path"], "r") as f:
+            ep = f[f"episodes/{ep_key}"]
+
+            # Load and normalize each feature
+            obs_parts = []
+            for feat in self.features:
+                raw = ep[feat][t]  # (n_turb,)
+                norm = self._normalize_feature(feat, raw, mean_wd)
+                obs_parts.append(norm)
+
+            obs = np.stack(obs_parts, axis=-1)  # (n_turb, n_features)
+            target_power = self._normalize_feature("power", ep["power"][t])
+
+        # Positions
+        positions_norm = layout["positions"] / layout["rotor_diameter"]
+        if self.use_wind_relative_pos:
+            positions_norm = rotate_positions_wind_relative(positions_norm, mean_wd)
+
+        # Pad
+        obs_padded = np.zeros((self.max_turbines, len(self.features)), dtype=np.float32)
+        obs_padded[:n_turb] = obs
+
+        target_padded = np.zeros(self.max_turbines, dtype=np.float32)
+        target_padded[:n_turb] = target_power
+
+        positions_padded = np.zeros((self.max_turbines, 2), dtype=np.float32)
+        positions_padded[:n_turb] = positions_norm
+
+        attention_mask = np.ones(self.max_turbines, dtype=bool)
+        attention_mask[:n_turb] = False
+
+        sample = {
+            "obs": obs_padded,
+            "positions": positions_padded,
+            "attention_mask": attention_mask,
+            "target_power": target_padded,
+            "n_turbines": n_turb,
+            "layout_idx": li,
+        }
+
+        if "receptivity" in layout:
+            n_dirs = layout["receptivity"].shape[1]
+
+            recep = layout["receptivity"]
+            infl = layout["influence"]
+
+            if self.rotate_profiles:
+                recep = rotate_profiles_numpy(recep, mean_wd)
+                infl = rotate_profiles_numpy(infl, mean_wd)
+
+            recep_padded = np.zeros((self.max_turbines, n_dirs), dtype=np.float32)
+            recep_padded[:n_turb] = recep
+            sample["receptivity"] = recep_padded
+
+            infl_padded = np.zeros((self.max_turbines, n_dirs), dtype=np.float32)
+            infl_padded[:n_turb] = infl
+            sample["influence"] = infl_padded
+
+        return sample
+
+
+# =============================================================================
+# DATALOADER HELPER
+# =============================================================================
+
+def create_pretrain_dataloader(
+    layout_files: List[str],
+    history_length: int = 15,
+    batch_size: int = 256,
+    num_workers: int = 4,
+    max_turbines: Optional[int] = None,
+    snapshot_mode: bool = False,
+    skip_steps: int = 1,
+    # --- Preprocessing flags ---
+    scaling_limits: Optional[Dict[str, Tuple[float, float]]] = None,
+    use_wd_deviation: bool = False,
+    wd_scale_range: float = 90.0,
+    use_wind_relative_pos: bool = True,
+    rotate_profiles: bool = True,
+    **kwargs,
+) -> DataLoader:
+    """
+    Create a DataLoader for pretraining.
+
+    Args:
+        layout_files: HDF5 files to load
+        history_length: Timesteps of history (ignored if snapshot_mode)
+        batch_size: Batch size
+        num_workers: DataLoader workers
+        max_turbines: Padding target (None=auto)
+        snapshot_mode: If True, use single-step snapshots instead of history
+        skip_steps: Subsample every N steps (snapshot mode only)
+        scaling_limits: Dict of feature → (min, max) for normalization
+        use_wd_deviation: Convert WD to deviation from episode mean
+        wd_scale_range: ±degrees for WD deviation scaling
+        use_wind_relative_pos: Transform positions to wind-relative frame
+        rotate_profiles: Rotate profiles to wind-relative frame
+    """
+    common_kwargs = dict(
+        scaling_limits=scaling_limits,
+        use_wd_deviation=use_wd_deviation,
+        wd_scale_range=wd_scale_range,
+        use_wind_relative_pos=use_wind_relative_pos,
+        rotate_profiles=rotate_profiles,
+    )
+
+    if snapshot_mode:
+        dataset = WindFarmSnapshotDataset(
+            layout_files=layout_files,
+            max_turbines=max_turbines,
+            skip_steps=skip_steps,
+            **common_kwargs,
+        )
+    else:
+        dataset = WindFarmPretrainDataset(
+            layout_files=layout_files,
+            history_length=history_length,
+            max_turbines=max_turbines,
+            **common_kwargs,
+        )
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
+        **kwargs,
+    )
+
+
+# =============================================================================
+# QUICK TEST
+# =============================================================================
+
+if __name__ == "__main__":
+    import sys
+    from glob import glob
+
+    data_dir = sys.argv[1] if len(sys.argv) > 1 else "./pretrain_data"
+    files = sorted(glob(f"{data_dir}/layout_*.h5"))
+
+    if not files:
+        print(f"No layout files found in {data_dir}")
+        sys.exit(1)
+
+    print("=" * 60)
+    print("Testing history dataset (history_length=15, all preprocessing ON)")
+    print("=" * 60)
+    loader = create_pretrain_dataloader(
+        files,
+        history_length=15,
+        batch_size=32,
+        num_workers=0,
+        use_wd_deviation=True,
+        use_wind_relative_pos=True,
+        rotate_profiles=True,
+    )
+    batch = next(iter(loader))
+    print(f"  obs:           {batch['obs'].shape}")            # (32, max_turb, 60)
+    print(f"  positions:     {batch['positions'].shape}")      # (32, max_turb, 2)
+    print(f"  attention_mask:{batch['attention_mask'].shape}")  # (32, max_turb)
+    print(f"  target_power:  {batch['target_power'].shape}")   # (32, max_turb)
+    print(f"  obs range:     [{batch['obs'].min():.3f}, {batch['obs'].max():.3f}]")
+    print(f"  target range:  [{batch['target_power'].min():.3f}, {batch['target_power'].max():.3f}]")
+    if "receptivity" in batch:
+        print(f"  receptivity:   {batch['receptivity'].shape}")  # (32, max_turb, 360)
+
+    print("\n" + "=" * 60)
+    print("Testing snapshot dataset (all preprocessing ON)")
+    print("=" * 60)
+    loader_snap = create_pretrain_dataloader(
+        files,
+        snapshot_mode=True,
+        batch_size=32,
+        num_workers=0,
+        use_wd_deviation=True,
+        use_wind_relative_pos=True,
+        rotate_profiles=True,
+    )
+    batch_snap = next(iter(loader_snap))
+    print(f"  obs:           {batch_snap['obs'].shape}")       # (32, max_turb, 4)
+    print(f"  target_power:  {batch_snap['target_power'].shape}")
+    print(f"  obs range:     [{batch_snap['obs'].min():.3f}, {batch_snap['obs'].max():.3f}]")
+
+    print("\n" + "=" * 60)
+    print("\nChecking raw data ranges from the first file (should match expected physical ranges):")
+    print("\n" + "=" * 60)
+    with h5py.File(files[0], "r") as f:
+        ep_key = sorted(f["episodes"].keys())[0]
+        ep = f[f"episodes/{ep_key}"]
+        for feat in ["ws", "wd", "yaw", "power"]:
+            data = ep[feat][:]
+            print(f"  {feat:6s}: [{data.min():.3f}, {data.max():.3f}]")
+
+    print("\nAll good!")
