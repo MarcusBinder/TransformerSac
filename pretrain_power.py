@@ -445,17 +445,17 @@ def main():
 
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True,
-        # num_workers=args.num_workers, 
+        # num_workers=args.num_workers,  # Removed as memory is now fully in ram.
         pin_memory=True, drop_last=True,
-        persistent_workers=True,    # avoids respawning workers each epoch
-        prefetch_factor=4,          # pre-loads more batches
+        # persistent_workers=True,    # avoids respawning workers each epoch
+        # prefetch_factor=4,          # pre-loads more batches
     )
     val_loader = DataLoader(
         val_set, batch_size=args.batch_size, shuffle=False,
         # num_workers=args.num_workers, 
         pin_memory=True,
-        persistent_workers=True,    # avoids respawning workers each epoch
-        prefetch_factor=4,          # pre-loads more batches
+        # persistent_workers=True,    # avoids respawning workers each epoch
+        # prefetch_factor=4,          # pre-loads more batches
     )
 
     # --- Determine dimensions from first sample ---
