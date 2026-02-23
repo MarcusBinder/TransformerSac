@@ -282,8 +282,8 @@ class WindFarmPretrainDataset(Dataset):
               f"max_turbines={self.max_turbines}, "
               f"obs_dim={self.obs_dim} ({history_length} × {len(features)} features)")
 
-        # === Precompute all samples into tensors ===
-        print("Precomputing all samples...")
+        # === Precompute all samples into tensors (vectorized) ===
+        print("Precomputing all samples (vectorized)...")
         N = len(self.index)
         self._obs = torch.zeros(N, self.max_turbines, self.obs_dim, dtype=torch.float32)
         self._target_power = torch.zeros(N, self.max_turbines, dtype=torch.float32)
@@ -296,7 +296,6 @@ class WindFarmPretrainDataset(Dataset):
         self._mean_wd = torch.zeros(N, dtype=torch.float32)
         self._mean_ti = torch.zeros(N, dtype=torch.float32)
 
-        # Check if we have profiles
         has_profiles = "receptivity" in self.layouts[0]
         if has_profiles:
             n_dirs = self.layouts[0]["receptivity"].shape[1]
@@ -304,54 +303,80 @@ class WindFarmPretrainDataset(Dataset):
             self._influence = torch.zeros(N, self.max_turbines, n_dirs, dtype=torch.float32)
         self._has_profiles = has_profiles
 
-        for i in range(N):
-            li, ep_key, t = self.index[i]
+        # Group sample indices by (layout_idx, episode_key) for bulk processing
+        from collections import defaultdict
+        groups = defaultdict(list)  # (li, ep_key) -> [(global_idx, t), ...]
+        for global_idx, (li, ep_key, t) in enumerate(self.index):
+            groups[(li, ep_key)].append((global_idx, t))
+
+        done = 0
+        for (li, ep_key), samples in groups.items():
             layout = self.layouts[li]
             n_turb = layout["n_turbines"]
             ep_meta = layout["episode_meta"][ep_key]
             ep_data = layout["episode_data"][ep_key]
             mean_wd = ep_meta["mean_wd"]
+            H = self.history_length
 
-            # Build obs
+            global_idxs = np.array([s[0] for s in samples])
+            timesteps = np.array([s[1] for s in samples])
+            n_samples = len(timesteps)
+
+            # --- Vectorized obs: extract all history windows at once ---
+            # For each feature: data shape is (n_steps, n_turb)
+            # We want (n_samples, H, n_turb) -> normalize -> transpose to (n_samples, n_turb, H)
             obs_parts = []
             for feat in self.features:
-                hist_raw = ep_data[feat][t - self.history_length : t]
-                hist_norm = self._normalize_feature(feat, hist_raw, mean_wd)
-                obs_parts.append(hist_norm.T)
-            obs = np.concatenate(obs_parts, axis=-1)
+                feat_data = ep_data[feat]  # (n_steps, n_turb)
+                # Build index array: (n_samples, H) where each row is [t-H, t-H+1, ..., t-1]
+                window_idxs = timesteps[:, None] + np.arange(-H, 0)[None, :]  # (n_samples, H)
+                windows = feat_data[window_idxs]  # (n_samples, H, n_turb)
+                windows_norm = self._normalize_feature(feat, windows, mean_wd)
+                obs_parts.append(windows_norm.transpose(0, 2, 1))  # (n_samples, n_turb, H)
 
-            self._obs[i, :n_turb] = torch.from_numpy(obs)
-            self._target_power[i, :n_turb] = torch.from_numpy(
-                self._normalize_feature("power", ep_data["power"][t - 1], mean_wd)
-            )
-            self._actions[i, :n_turb] = torch.from_numpy(ep_data["actions"][t - 1])
-            self._attention_mask[i, :n_turb] = False
-            self._n_turbines[i] = n_turb
-            self._layout_idx[i] = li
-            self._mean_ws[i] = ep_meta["mean_ws"]
-            self._mean_wd[i] = ep_meta["mean_wd"]
-            self._mean_ti[i] = ep_meta["mean_ti"]
+            obs = np.concatenate(obs_parts, axis=-1)  # (n_samples, n_turb, H * n_features)
+            self._obs[global_idxs, :n_turb] = torch.from_numpy(obs)
 
-            # Positions
+            # --- Target power & actions (vectorized) ---
+            target_raw = ep_data["power"][timesteps - 1]  # (n_samples, n_turb)
+            target_norm = self._normalize_feature("power", target_raw, mean_wd)
+            self._target_power[global_idxs, :n_turb] = torch.from_numpy(target_norm)
+
+            actions = ep_data["actions"][timesteps - 1]  # (n_samples, n_turb)
+            self._actions[global_idxs, :n_turb] = torch.from_numpy(actions)
+
+            # --- Mask & scalar metadata (bulk assign) ---
+            self._attention_mask[global_idxs, :n_turb] = False
+            self._n_turbines[global_idxs] = n_turb
+            self._layout_idx[global_idxs] = li
+            self._mean_ws[global_idxs] = ep_meta["mean_ws"]
+            self._mean_wd[global_idxs] = ep_meta["mean_wd"]
+            self._mean_ti[global_idxs] = ep_meta["mean_ti"]
+
+            # --- Positions: same for all samples in this episode (same mean_wd) ---
             positions_norm = layout["positions"] / layout["rotor_diameter"]
             if self.use_wind_relative_pos:
                 positions_norm = rotate_positions_wind_relative(positions_norm, mean_wd)
-            self._positions[i, :n_turb] = torch.from_numpy(positions_norm)
+            pos_tensor = torch.from_numpy(positions_norm)  # (n_turb, 2)
+            self._positions[global_idxs, :n_turb] = pos_tensor.unsqueeze(0).expand(n_samples, -1, -1)
 
-            # Profiles
+            # --- Profiles: same for all samples in this episode ---
             if has_profiles:
                 recep = layout["receptivity"]
                 infl = layout["influence"]
                 if self.rotate_profiles:
                     recep = rotate_profiles_numpy(recep, mean_wd)
                     infl = rotate_profiles_numpy(infl, mean_wd)
-                self._receptivity[i, :n_turb] = torch.from_numpy(recep)
-                self._influence[i, :n_turb] = torch.from_numpy(infl)
+                recep_t = torch.from_numpy(recep)  # (n_turb, n_dirs)
+                infl_t = torch.from_numpy(infl)
+                self._receptivity[global_idxs, :n_turb] = recep_t.unsqueeze(0).expand(n_samples, -1, -1)
+                self._influence[global_idxs, :n_turb] = infl_t.unsqueeze(0).expand(n_samples, -1, -1)
 
-            if (i + 1) % 200000 == 0:
-                print(f"  Precomputed {i+1}/{N} samples...")
+            done += n_samples
+            if done % 200000 < n_samples:
+                print(f"  Precomputed {done}/{N} samples...")
 
-        # Free the raw episode data — no longer needed
+        # Free raw episode data
         for layout in self.layouts:
             del layout["episode_data"]
 
