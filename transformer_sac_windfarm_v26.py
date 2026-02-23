@@ -2011,6 +2011,7 @@ def main():
             "profile_encoding_type", "profile_encoder_hidden",
             "profile_fusion_type", "profile_embed_mode",
             "profile_encoder_kwargs",
+            "n_profile_directions",
         ]
 
         overrides = []
