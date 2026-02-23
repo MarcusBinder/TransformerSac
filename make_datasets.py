@@ -53,6 +53,7 @@ from helper_funcs import (
 
 from WindGym.Agents import GreedyAgent, PyWakeAgent
 
+# TODO - Add power output with NO wakes.
 
 # =============================================================================
 # CLI CONFIG
