@@ -868,10 +868,15 @@ def main():
     # Key: use features WITHOUT power for obs, power is the target
     # =========================================================================
     if args.global_features:
+        # Account for auto-merge: global features get added to features if missing
+        all_features = list(args.features)
+        for gf in args.global_features:
+            if gf not in all_features:
+                all_features.insert(0, gf)
         n_global = len(args.global_features)
-        n_hist = len(args.features) - n_global
+        n_hist = len(all_features) - n_global
         obs_dim_expected = n_global + args.history_length * n_hist
-        print(f"Global features: {args.global_features} | "
+        print(f"Features: {all_features} (global: {args.global_features}) | "
               f"obs_dim = {n_global} + {args.history_length}×{n_hist} = {obs_dim_expected}")
 
     input_features = args.features

@@ -243,8 +243,12 @@ class WindFarmPretrainDataset(Dataset):
         for gf in self.global_features:
             if gf not in _supported_global:
                 raise ValueError(f"Unsupported global feature: '{gf}'. Supported: {_supported_global}")
-            if gf not in features:
-                raise ValueError(f"Global feature '{gf}' not in features list: {features}")
+
+        # Auto-merge: if a global feature isn't already in features, prepend it
+        for gf in self.global_features:
+            if gf not in self.features:
+                self.features = list(self.features)
+                self.features.insert(0, gf)
 
         # Merge user-provided limits with defaults
         self.scaling_limits = dict(DEFAULT_SCALING)
@@ -252,8 +256,8 @@ class WindFarmPretrainDataset(Dataset):
             self.scaling_limits.update(scaling_limits)
 
         # Determine which features get per-turbine history vs global scalar
-        self._global_features = [f for f in features if f in self.global_features]
-        self._history_features = [f for f in features if f not in self.global_features]
+        self._global_features = [f for f in self.features if f in self.global_features]
+        self._history_features = [f for f in self.features if f not in self.global_features]
 
         # Build index: list of (layout_idx, ep_key, timestep)
         self.index = []
@@ -544,8 +548,12 @@ class WindFarmSnapshotDataset(Dataset):
         for gf in self.global_features:
             if gf not in _supported_global:
                 raise ValueError(f"Unsupported global feature: '{gf}'. Supported: {_supported_global}")
-            if gf not in features:
-                raise ValueError(f"Global feature '{gf}' not in features list: {features}")
+
+        # Auto-merge: if a global feature isn't already in features, prepend it
+        for gf in self.global_features:
+            if gf not in self.features:
+                self.features = list(self.features)
+                self.features.insert(0, gf)
 
         # Merge user-provided limits with defaults
         self.scaling_limits = dict(DEFAULT_SCALING)
@@ -553,8 +561,8 @@ class WindFarmSnapshotDataset(Dataset):
             self.scaling_limits.update(scaling_limits)
 
         # Determine which features are global vs per-turbine
-        self._global_features = [f for f in features if f in self.global_features]
-        self._snapshot_features = [f for f in features if f not in self.global_features]
+        self._global_features = [f for f in self.features if f in self.global_features]
+        self._snapshot_features = [f for f in self.features if f not in self.global_features]
 
         self.index = []
         self.layouts = []
