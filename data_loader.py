@@ -240,8 +240,21 @@ class WindFarmPretrainDataset(Dataset):
                     layout_info["receptivity"] = f["profiles/receptivity"][:].astype(np.float32)
                     layout_info["influence"] = f["profiles/influence"][:].astype(np.float32)
 
-                # Load episode-level metadata
+                # # Load episode-level metadata
+                # episode_meta = {}
+                # for ep_key in sorted(f["episodes"].keys()):
+                #     ep = f[f"episodes/{ep_key}"]
+                #     n_steps = int(ep.attrs["n_steps"])
+                #     episode_meta[ep_key] = {
+                #         "n_steps": n_steps,
+                #         "mean_ws": float(ep.attrs["mean_ws"]),
+                #         "mean_wd": float(ep.attrs["mean_wd"]),
+                #         "mean_ti": float(ep.attrs["mean_ti"]),
+                #     }
+
+                # Load episode-level metadata AND time-series into memory
                 episode_meta = {}
+                episode_data = {}
                 for ep_key in sorted(f["episodes"].keys()):
                     ep = f[f"episodes/{ep_key}"]
                     n_steps = int(ep.attrs["n_steps"])
@@ -251,12 +264,21 @@ class WindFarmPretrainDataset(Dataset):
                         "mean_wd": float(ep.attrs["mean_wd"]),
                         "mean_ti": float(ep.attrs["mean_ti"]),
                     }
+                    # Pre-load all time-series into memory
+                    episode_data[ep_key] = {
+                        feat: ep[feat][:].astype(np.float32)
+                        for feat in self.features
+                    }
+                    episode_data[ep_key]["power"] = ep["power"][:].astype(np.float32)
+                    episode_data[ep_key]["actions"] = ep["actions"][:].astype(np.float32)
+
 
                     # Valid timesteps: need history_length steps of context before
                     for t in range(history_length, n_steps):
                         self.index.append((li, ep_key, t))
 
                 layout_info["episode_meta"] = episode_meta
+                layout_info["episode_data"] = episode_data
                 self.layouts.append(layout_info)
 
                 print(f"  [{li}] {layout_info['layout_name']}: "
@@ -306,28 +328,22 @@ class WindFarmPretrainDataset(Dataset):
         ep_meta = layout["episode_meta"][ep_key]
         mean_wd = ep_meta["mean_wd"]
 
-        with h5py.File(layout["path"], "r") as f:
-            ep = f[f"episodes/{ep_key}"]
+        ep_data = layout["episode_data"][ep_key]
 
-            # Build stacked observation: (n_turb, history_length * n_features)
-            obs_parts = []
-            for feat in self.features:
-                # Slice: (history_length, n_turb)
-                hist_raw = ep[feat][t - self.history_length : t]  # (H, n_turb)
+        # Build stacked observation: (n_turb, history_length * n_features)
+        obs_parts = []
+        for feat in self.features:
+            hist_raw = ep_data[feat][t - self.history_length : t]  # (H, n_turb)
+            hist_norm = self._normalize_feature(feat, hist_raw, mean_wd)
+            obs_parts.append(hist_norm.T)  # (n_turb, H)
 
-                # Normalize each feature to [-1, 1]
-                hist_norm = self._normalize_feature(feat, hist_raw, mean_wd)
+        obs = np.concatenate(obs_parts, axis=-1)  # (n_turb, H * n_features)
 
-                obs_parts.append(hist_norm.T)  # (n_turb, H)
+        target_power_raw = ep_data["power"][t - 1]  # (n_turb,)
+        target_power = self._normalize_feature("power", target_power_raw)
 
-            obs = np.concatenate(obs_parts, axis=-1)  # (n_turb, H * n_features)
+        actions = ep_data["actions"][t - 1]  # (n_turb,)
 
-            # Target: current power at last step in history window
-            target_power_raw = ep["power"][t - 1]  # (n_turb,)
-            target_power = self._normalize_feature("power", target_power_raw)
-
-            # Current actions (for next-step prediction, if needed)
-            actions = ep["actions"][t - 1]  # (n_turb,)
 
         # --- Positions ---
         positions_norm = layout["positions"] / layout["rotor_diameter"]  # (n_turb, 2)
@@ -551,7 +567,6 @@ def create_pretrain_dataloader(
     layout_files: List[str],
     history_length: int = 15,
     batch_size: int = 256,
-    num_workers: int = 4,
     max_turbines: Optional[int] = None,
     snapshot_mode: bool = False,
     skip_steps: int = 1,
@@ -570,7 +585,6 @@ def create_pretrain_dataloader(
         layout_files: HDF5 files to load
         history_length: Timesteps of history (ignored if snapshot_mode)
         batch_size: Batch size
-        num_workers: DataLoader workers
         max_turbines: Padding target (None=auto)
         snapshot_mode: If True, use single-step snapshots instead of history
         skip_steps: Subsample every N steps (snapshot mode only)
@@ -607,7 +621,7 @@ def create_pretrain_dataloader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
+        # num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
         **kwargs,
@@ -658,7 +672,7 @@ if __name__ == "__main__":
         files,
         snapshot_mode=True,
         batch_size=32,
-        num_workers=0,
+        # num_workers=0,
         use_wd_deviation=True,
         use_wind_relative_pos=True,
         rotate_profiles=True,

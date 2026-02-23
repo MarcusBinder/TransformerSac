@@ -143,8 +143,8 @@ class Args:
     """AdamW weight decay."""
     val_split: float = 0.1
     """Fraction of data held out for validation."""
-    num_workers: int = 4
-    """DataLoader workers."""
+    # num_workers: int = 4  # Removed. We just load it all into ram now.
+    # """DataLoader workers."""
 
     # === Output / Checkpointing ===
     save_dir: str = "./pretrain_checkpoints"
@@ -289,7 +289,7 @@ def masked_mse_loss(
 # TRAINING LOOP
 # =============================================================================
 
-def train_one_epoch(model, loader, optimizer, device, epoch, log_wandb=False):
+def train_one_epoch(model, loader, optimizer, device, epoch, log_wandb=False, scaler=None):
     model.train()
     total_loss = 0.0
     n_batches = 0
@@ -299,18 +299,21 @@ def train_one_epoch(model, loader, optimizer, device, epoch, log_wandb=False):
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                  for k, v in batch.items()}
 
-        predicted_power = model(batch)
+        with torch.amp.autocast("cuda"):
+            predicted_power = model(batch)
+            loss = masked_mse_loss(
+                predicted_power,
+                batch["target_power"],
+                batch["attention_mask"],
+            )
 
-        loss = masked_mse_loss(
-            predicted_power,
-            batch["target_power"],
-            batch["attention_mask"],
-        )
 
-        optimizer.zero_grad()
-        loss.backward()
+        optimizer.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
         total_loss += loss.item()
         n_batches += 1
@@ -338,7 +341,10 @@ def evaluate(model, loader, device):
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                  for k, v in batch.items()}
 
-        predicted_power = model(batch)
+        with torch.amp.autocast("cuda"):
+            predicted_power = model(batch)
+
+        # predicted_power = model(batch)
         real_mask = ~batch["attention_mask"]
 
         # MSE
@@ -439,11 +445,17 @@ def main():
 
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True, drop_last=True,
+        # num_workers=args.num_workers, 
+        pin_memory=True, drop_last=True,
+        persistent_workers=True,    # avoids respawning workers each epoch
+        prefetch_factor=4,          # pre-loads more batches
     )
     val_loader = DataLoader(
         val_set, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True,
+        # num_workers=args.num_workers, 
+        pin_memory=True,
+        persistent_workers=True,    # avoids respawning workers each epoch
+        prefetch_factor=4,          # pre-loads more batches
     )
 
     # --- Determine dimensions from first sample ---
@@ -487,6 +499,7 @@ def main():
         args=args,  # for profile_encoder_kwargs
     )
     model = PowerPredictionModel(actor).to(device)
+    # model = torch.compile(model)  # add this line   ### Did not work directly on sophia. We need to module load GCC/12.3.0 first I think
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Total parameters: {n_params:,}")
@@ -515,6 +528,8 @@ def main():
         optimizer, T_max=args.epochs, eta_min=args.lr * 0.01
     )
 
+    scaler = torch.amp.GradScaler("cuda")  # Add scaler for mixed precision (if using CUDA)
+
     # --- Output dir ---
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -531,7 +546,7 @@ def main():
         t0 = time.time()
 
         train_mse = train_one_epoch(model, train_loader, optimizer, device, epoch,
-                                    log_wandb=use_wandb)
+                                    log_wandb=use_wandb, scaler=scaler)
         val_mse, val_mae = evaluate(model, val_loader, device)
         scheduler.step()
 
