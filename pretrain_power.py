@@ -398,13 +398,13 @@ def collect_plot_data(model, dataset, device, n_samples=256, batch_size=64):
 
 def fig_attention_on_layout(results, sample_idx=0, top_k=3):
     """
-    Attention maps overlaid on the physical farm layout.
-    Turbine nodes colored by target power, directed edges by attention weight.
+    Attention maps overlaid on the physical farm layout, per head.
 
-    Returns one figure per layer (head-averaged) + a per-head figure for the
-    last layer.
+    Returns a dict of {layer_idx: fig} where each figure has one subplot
+    per attention head, showing what each head has specialized on.
     """
     n_layers = len(results["attn_weights"])
+    n_heads = results["attn_weights"][0].shape[1]
     pos = results["positions"][sample_idx]          # (N, 2)
     mask = results["attention_mask"][sample_idx]     # (N,)
     target = results["target_power"][sample_idx]     # (N,)
@@ -444,9 +444,7 @@ def fig_attention_on_layout(results, sample_idx=0, top_k=3):
         for t in range(n):
             ax.annotate(str(t), pos_real[t], fontsize=7, ha="center",
                         va="center", fontweight="bold", color="white", zorder=6)
-        ax.set_title(title, fontsize=10)
-        ax.set_xlabel("x (norm)")
-        ax.set_ylabel("y (norm)")
+        ax.set_title(title, fontsize=9)
         ax.set_aspect("equal")
         ax.grid(True, alpha=0.3)
         return sc
@@ -456,33 +454,23 @@ def fig_attention_on_layout(results, sample_idx=0, top_k=3):
         row_max = np.where(row_max > 0, row_max, 1.0)
         return a / row_max
 
-    # --- Per-layer figure (head-averaged) ---
-    n_cols = min(n_layers, 4)
-    fig_layers, axes = plt.subplots(1, n_cols, figsize=(5 * n_cols, 5), squeeze=False)
-    axes = axes[0]
-    for l in range(n_cols):
+    # One figure per layer, with one subplot per head
+    layer_figs = {}
+    for l in range(n_layers):
         attn_l = results["attn_weights"][l][sample_idx]  # (H, N, N)
-        attn_mean = _normalize_rows(attn_l.mean(axis=0)[:n_real, :n_real])
-        sc = _draw(axes[l], attn_mean, f"Layer {l} (head avg)")
-    fig_layers.colorbar(sc, ax=axes[-1], shrink=0.8, label="Target Power (norm)")
-    fig_layers.suptitle(f"Attention on Layout — sample {sample_idx}", fontsize=12, y=1.02)
-    fig_layers.tight_layout()
 
-    # --- Per-head figure for last layer ---
-    n_heads = results["attn_weights"][-1].shape[1]
-    fig_heads = None
-    if n_heads <= 8:
-        fig_heads, axes_h = plt.subplots(1, n_heads, figsize=(4 * n_heads, 4), squeeze=False)
-        axes_h = axes_h[0]
+        fig, axes = plt.subplots(1, n_heads, figsize=(4.5 * n_heads, 4.5), squeeze=False)
+        axes = axes[0]
         for h in range(n_heads):
-            attn_h = results["attn_weights"][-1][sample_idx][h, :n_real, :n_real]
-            attn_h = _normalize_rows(attn_h)
-            _draw(axes_h[h], attn_h, f"Head {h}")
-        fig_heads.suptitle(f"Per-Head Attention (last layer, sample {sample_idx})",
-                           fontsize=12, y=1.02)
-        fig_heads.tight_layout()
+            attn_h = _normalize_rows(attn_l[h, :n_real, :n_real])
+            sc = _draw(axes[h], attn_h, f"Head {h}")
+        fig.colorbar(sc, ax=axes[-1], shrink=0.8, label="Target Power (norm)")
+        fig.suptitle(f"Layer {l} — Per-Head Attention (sample {sample_idx})",
+                     fontsize=12, y=1.02)
+        fig.tight_layout()
+        layer_figs[l] = fig
 
-    return fig_layers, fig_heads
+    return layer_figs
 
 
 def fig_pred_vs_actual(results):
@@ -686,20 +674,18 @@ def generate_diagnostic_plots(
 
     images = {}
 
-    # 1. Attention on layout — multiple sample indices for diversity
+    # 1. Attention on layout — per head, per layer, multiple samples
     n_samples_available = results["predicted_power"].shape[0]
     sample_indices = np.linspace(0, n_samples_available - 1,
                                   args.plot_n_sample_indices, dtype=int)
     for i, idx in enumerate(sample_indices):
         try:
-            fig_layers, fig_heads = fig_attention_on_layout(
+            layer_figs = fig_attention_on_layout(
                 results, sample_idx=int(idx), top_k=args.plot_attn_top_k
             )
-            images[f"plots/attention_layers_s{idx}"] = wandb.Image(fig_layers)
-            plt.close(fig_layers)
-            if fig_heads is not None:
-                images[f"plots/attention_heads_s{idx}"] = wandb.Image(fig_heads)
-                plt.close(fig_heads)
+            for layer_idx, fig in layer_figs.items():
+                images[f"plots/attention_L{layer_idx}_s{idx}"] = wandb.Image(fig)
+                plt.close(fig)
         except Exception as e:
             print(f"    Warning: attention plot failed for sample {idx}: {e}")
 
