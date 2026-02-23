@@ -98,12 +98,11 @@ class Args:
     """Subsample every N steps (snapshot mode only)."""
 
     # === Preprocessing ===
-    global_ws: bool = False
-    """Use global mean_ws instead of per-turbine ws history.
-    Replaces H-dimensional ws history with a single broadcast scalar."""
-    global_wd: bool = False
-    """Use global mean_wd instead of per-turbine wd history.
-    Replaces H-dimensional wd history with a single broadcast scalar."""
+    features: List[str] = field(default_factory=lambda: ["ws", "wd", "yaw"])
+    """Input features for pretraining (power is always the target, not an input)."""
+    global_features: List[str] = field(default_factory=list)
+    """Features to replace with episode-level scalars (broadcast to all turbines).
+    E.g. ["ws", "wd"] uses global mean_ws/mean_wd instead of per-turbine history."""
     use_wd_deviation: bool = False
     """Convert wind direction to deviation from mean."""
     use_wind_relative_pos: bool = True
@@ -490,12 +489,20 @@ def fig_pred_vs_actual(results):
     pred_flat = pred[real]
     target_flat = target[real]
 
-    # Extract wind direction for coloring (feature idx 1, last timestep)
-    n_features = 3  # ws, wd, yaw
+    # Extract wind direction for coloring (best-effort, depends on obs layout)
+    # With global features the obs layout changes, so we guard with try/except
     obs_dim = obs.shape[-1]
-    history_len = obs_dim // n_features
-    wd_idx = 1 * history_len + (history_len - 1)
-    wd_flat = obs[:, :, wd_idx][real] if wd_idx < obs_dim else np.zeros_like(pred_flat)
+    try:
+        # Standard layout: [ws_hist, wd_hist, yaw_hist] → wd is at index H to 2H
+        n_features = 3  # ws, wd, yaw
+        history_len = obs_dim // n_features
+        if obs_dim == n_features * history_len:  # evenly divisible = standard layout
+            wd_idx = 1 * history_len + (history_len - 1)
+            wd_flat = obs[:, :, wd_idx][real]
+        else:
+            wd_flat = np.zeros_like(pred_flat)
+    except Exception:
+        wd_flat = np.zeros_like(pred_flat)
 
     # Metrics
     mse = np.mean((pred_flat - target_flat) ** 2)
@@ -831,13 +838,8 @@ def main():
     if use_wandb:
         # Auto-generate a descriptive run name
         mode = "snap" if args.snapshot else f"hist{args.history_length}"
-        gw_parts = []
-        if args.global_ws:
-            gw_parts.append("gws")
-        if args.global_wd:
-            gw_parts.append("gwd")
-        gw_tag = "_" + "_".join(gw_parts) if gw_parts else ""
-        run_name = f"{args.exp_name}_{mode}{gw_tag}_e{args.embed_dim}_L{args.num_layers}_H{args.num_heads}"
+        gf_tag = "_g" + "".join(args.global_features) if args.global_features else ""
+        run_name = f"{args.exp_name}_{mode}{gf_tag}_e{args.embed_dim}_L{args.num_layers}_H{args.num_heads}"
 
         # Parse comma-separated tags
         tags = [t.strip() for t in args.wandb_tags.split(",")] if args.wandb_tags else None
@@ -865,21 +867,14 @@ def main():
     # =========================================================================
     # Key: use features WITHOUT power for obs, power is the target
     # =========================================================================
-    if args.global_ws or args.global_wd:
-        # Build feature list: only non-global features get per-turbine history
-        input_features = ["ws", "wd", "yaw"]
-        global_parts = []
-        if args.global_ws:
-            global_parts.append("mean_ws")
-        if args.global_wd:
-            global_parts.append("mean_wd")
-        n_global = int(args.global_ws) + int(args.global_wd)
-        n_hist_feats = 3 - n_global  # ws, wd, yaw minus global ones
-        obs_dim_expected = n_global + args.history_length * n_hist_feats
-        print(f"Global features: {', '.join(global_parts)} | "
-              f"obs_dim = {n_global} + {args.history_length}×{n_hist_feats} = {obs_dim_expected}")
-    else:
-        input_features = ["ws", "wd", "yaw"]
+    if args.global_features:
+        n_global = len(args.global_features)
+        n_hist = len(args.features) - n_global
+        obs_dim_expected = n_global + args.history_length * n_hist
+        print(f"Global features: {args.global_features} | "
+              f"obs_dim = {n_global} + {args.history_length}×{n_hist} = {obs_dim_expected}")
+
+    input_features = args.features
 
     scaling_limits = {"power": (0.0, args.power_max)}
 
@@ -888,8 +883,7 @@ def main():
         layout_files=files,
         max_turbines=None,  # auto
         features=input_features,
-        global_ws=args.global_ws,
-        global_wd=args.global_wd,
+        global_features=args.global_features,
         scaling_limits=scaling_limits,
         use_wd_deviation=args.use_wd_deviation,
         wd_scale_range=args.wd_scale_range,
