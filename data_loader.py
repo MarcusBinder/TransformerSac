@@ -240,18 +240,6 @@ class WindFarmPretrainDataset(Dataset):
                     layout_info["receptivity"] = f["profiles/receptivity"][:].astype(np.float32)
                     layout_info["influence"] = f["profiles/influence"][:].astype(np.float32)
 
-                # # Load episode-level metadata
-                # episode_meta = {}
-                # for ep_key in sorted(f["episodes"].keys()):
-                #     ep = f[f"episodes/{ep_key}"]
-                #     n_steps = int(ep.attrs["n_steps"])
-                #     episode_meta[ep_key] = {
-                #         "n_steps": n_steps,
-                #         "mean_ws": float(ep.attrs["mean_ws"]),
-                #         "mean_wd": float(ep.attrs["mean_wd"]),
-                #         "mean_ti": float(ep.attrs["mean_ti"]),
-                #     }
-
                 # Load episode-level metadata AND time-series into memory
                 episode_meta = {}
                 episode_data = {}
@@ -294,6 +282,81 @@ class WindFarmPretrainDataset(Dataset):
               f"max_turbines={self.max_turbines}, "
               f"obs_dim={self.obs_dim} ({history_length} × {len(features)} features)")
 
+        # === Precompute all samples into tensors ===
+        print("Precomputing all samples...")
+        N = len(self.index)
+        self._obs = torch.zeros(N, self.max_turbines, self.obs_dim, dtype=torch.float32)
+        self._target_power = torch.zeros(N, self.max_turbines, dtype=torch.float32)
+        self._actions = torch.zeros(N, self.max_turbines, dtype=torch.float32)
+        self._positions = torch.zeros(N, self.max_turbines, 2, dtype=torch.float32)
+        self._attention_mask = torch.ones(N, self.max_turbines, dtype=torch.bool)
+        self._n_turbines = torch.zeros(N, dtype=torch.long)
+        self._layout_idx = torch.zeros(N, dtype=torch.long)
+        self._mean_ws = torch.zeros(N, dtype=torch.float32)
+        self._mean_wd = torch.zeros(N, dtype=torch.float32)
+        self._mean_ti = torch.zeros(N, dtype=torch.float32)
+
+        # Check if we have profiles
+        has_profiles = "receptivity" in self.layouts[0]
+        if has_profiles:
+            n_dirs = self.layouts[0]["receptivity"].shape[1]
+            self._receptivity = torch.zeros(N, self.max_turbines, n_dirs, dtype=torch.float32)
+            self._influence = torch.zeros(N, self.max_turbines, n_dirs, dtype=torch.float32)
+        self._has_profiles = has_profiles
+
+        for i in range(N):
+            li, ep_key, t = self.index[i]
+            layout = self.layouts[li]
+            n_turb = layout["n_turbines"]
+            ep_meta = layout["episode_meta"][ep_key]
+            ep_data = layout["episode_data"][ep_key]
+            mean_wd = ep_meta["mean_wd"]
+
+            # Build obs
+            obs_parts = []
+            for feat in self.features:
+                hist_raw = ep_data[feat][t - self.history_length : t]
+                hist_norm = self._normalize_feature(feat, hist_raw, mean_wd)
+                obs_parts.append(hist_norm.T)
+            obs = np.concatenate(obs_parts, axis=-1)
+
+            self._obs[i, :n_turb] = torch.from_numpy(obs)
+            self._target_power[i, :n_turb] = torch.from_numpy(
+                self._normalize_feature("power", ep_data["power"][t - 1], mean_wd)
+            )
+            self._actions[i, :n_turb] = torch.from_numpy(ep_data["actions"][t - 1])
+            self._attention_mask[i, :n_turb] = False
+            self._n_turbines[i] = n_turb
+            self._layout_idx[i] = li
+            self._mean_ws[i] = ep_meta["mean_ws"]
+            self._mean_wd[i] = ep_meta["mean_wd"]
+            self._mean_ti[i] = ep_meta["mean_ti"]
+
+            # Positions
+            positions_norm = layout["positions"] / layout["rotor_diameter"]
+            if self.use_wind_relative_pos:
+                positions_norm = rotate_positions_wind_relative(positions_norm, mean_wd)
+            self._positions[i, :n_turb] = torch.from_numpy(positions_norm)
+
+            # Profiles
+            if has_profiles:
+                recep = layout["receptivity"]
+                infl = layout["influence"]
+                if self.rotate_profiles:
+                    recep = rotate_profiles_numpy(recep, mean_wd)
+                    infl = rotate_profiles_numpy(infl, mean_wd)
+                self._receptivity[i, :n_turb] = torch.from_numpy(recep)
+                self._influence[i, :n_turb] = torch.from_numpy(infl)
+
+            if (i + 1) % 200000 == 0:
+                print(f"  Precomputed {i+1}/{N} samples...")
+
+        # Free the raw episode data — no longer needed
+        for layout in self.layouts:
+            del layout["episode_data"]
+
+        print(f"  Done. Precomputed {N} samples.")
+
     def __len__(self):
         return len(self.index)
 
@@ -320,87 +383,21 @@ class WindFarmPretrainDataset(Dataset):
             return normalize_to_minus1_plus1(raw_values, vmin, vmax)
 
     def __getitem__(self, idx):
-        li, ep_key, t = self.index[idx]
-        layout = self.layouts[li]
-        n_turb = layout["n_turbines"]
-
-        # Episode metadata (needed for WD deviation and wind-relative transforms)
-        ep_meta = layout["episode_meta"][ep_key]
-        mean_wd = ep_meta["mean_wd"]
-
-        ep_data = layout["episode_data"][ep_key]
-
-        # Build stacked observation: (n_turb, history_length * n_features)
-        obs_parts = []
-        for feat in self.features:
-            hist_raw = ep_data[feat][t - self.history_length : t]  # (H, n_turb)
-            hist_norm = self._normalize_feature(feat, hist_raw, mean_wd)
-            obs_parts.append(hist_norm.T)  # (n_turb, H)
-
-        obs = np.concatenate(obs_parts, axis=-1)  # (n_turb, H * n_features)
-
-        target_power_raw = ep_data["power"][t - 1]  # (n_turb,)
-        target_power = self._normalize_feature("power", target_power_raw)
-
-        actions = ep_data["actions"][t - 1]  # (n_turb,)
-
-
-        # --- Positions ---
-        positions_norm = layout["positions"] / layout["rotor_diameter"]  # (n_turb, 2)
-
-        if self.use_wind_relative_pos:
-            positions_norm = rotate_positions_wind_relative(positions_norm, mean_wd)
-
-        # --- Pad to max_turbines ---
-        obs_padded = np.zeros((self.max_turbines, obs.shape[-1]), dtype=np.float32)
-        obs_padded[:n_turb] = obs
-
-        target_padded = np.zeros(self.max_turbines, dtype=np.float32)
-        target_padded[:n_turb] = target_power
-
-        actions_padded = np.zeros(self.max_turbines, dtype=np.float32)
-        actions_padded[:n_turb] = actions
-
-        positions_padded = np.zeros((self.max_turbines, 2), dtype=np.float32)
-        positions_padded[:n_turb] = positions_norm
-
-        attention_mask = np.ones(self.max_turbines, dtype=bool)  # True = padding
-        attention_mask[:n_turb] = False
-
         sample = {
-            "obs": obs_padded,                          # (max_turb, obs_dim)
-            "positions": positions_padded,              # (max_turb, 2) normalized [+ wind-relative]
-            "attention_mask": attention_mask,            # (max_turb,) True=padding
-            "target_power": target_padded,              # (max_turb,) normalized
-            "actions": actions_padded,                  # (max_turb,) raw [-1, 1]
-            "n_turbines": n_turb,                       # scalar
-            "layout_idx": li,                           # scalar
-            # Episode-level conditions
-            "mean_ws": np.float32(ep_meta["mean_ws"]),
-            "mean_wd": np.float32(ep_meta["mean_wd"]),
-            "mean_ti": np.float32(ep_meta["mean_ti"]),
+            "obs": self._obs[idx],
+            "positions": self._positions[idx],
+            "attention_mask": self._attention_mask[idx],
+            "target_power": self._target_power[idx],
+            "actions": self._actions[idx],
+            "n_turbines": self._n_turbines[idx],
+            "layout_idx": self._layout_idx[idx],
+            "mean_ws": self._mean_ws[idx],
+            "mean_wd": self._mean_wd[idx],
+            "mean_ti": self._mean_ti[idx],
         }
-
-        # Profiles (if available)
-        if "receptivity" in layout:
-            n_dirs = layout["receptivity"].shape[1]
-
-            recep = layout["receptivity"]   # (n_turb, n_dirs)
-            infl = layout["influence"]      # (n_turb, n_dirs)
-
-            # Optionally rotate profiles to wind-relative frame
-            if self.rotate_profiles:
-                recep = rotate_profiles_numpy(recep, mean_wd)
-                infl = rotate_profiles_numpy(infl, mean_wd)
-
-            recep_padded = np.zeros((self.max_turbines, n_dirs), dtype=np.float32)
-            recep_padded[:n_turb] = recep
-            sample["receptivity"] = recep_padded
-
-            infl_padded = np.zeros((self.max_turbines, n_dirs), dtype=np.float32)
-            infl_padded[:n_turb] = infl
-            sample["influence"] = infl_padded
-
+        if self._has_profiles:
+            sample["receptivity"] = self._receptivity[idx]
+            sample["influence"] = self._influence[idx]
         return sample
 
 
