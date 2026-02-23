@@ -5,13 +5,18 @@ Pretrains a transformer encoder to predict per-turbine power output
 from (ws, wd, yaw) + positions + profiles. The learned encoder weights
 can then be transferred to the SAC actor/critic for RL fine-tuning.
 
-This script uses a placeholder encoder to validate the full pipeline.
-Once confirmed working, swap in the real TransformerActor backbone.
+Includes periodic diagnostic visualizations logged to wandb:
+  - Attention maps overlaid on farm layout
+  - Predicted vs. actual power scatter
+  - Per-turbine error heatmap
+  - Attention entropy per layer/head
+  - t-SNE of token embeddings
 
 Usage:
     python pretrain_power.py --data-dir ./pretrain_data --epochs 50
     python pretrain_power.py --data-dir ./pretrain_data --snapshot  # no history
     python pretrain_power.py --data-dir ./pretrain_data --no-track  # disable wandb
+    python pretrain_power.py --data-dir ./pretrain_data --plot-every 5  # plots every 5 epochs
 
 Author: Marcus (DTU Wind Energy)
 """
@@ -19,7 +24,7 @@ Author: Marcus (DTU Wind Energy)
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import numpy as np
 import torch
@@ -29,6 +34,11 @@ from torch.utils.data import DataLoader, random_split
 from glob import glob
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")  # Non-interactive backend for HPC / headless
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+
 import tyro
 
 try:
@@ -37,6 +47,12 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
     print("wandb not installed — logging disabled. Install with: pip install wandb")
+
+try:
+    from sklearn.manifold import TSNE
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
 
 from data_loader import create_pretrain_dataloader, WindFarmPretrainDataset, WindFarmSnapshotDataset
 
@@ -131,7 +147,6 @@ class Args:
     profile_encoder_kwargs: str = "{}"
     """JSON string of encoder-specific kwargs."""
 
-
     # === Training Hyperparameters ===
     epochs: int = 50
     """Number of training epochs."""
@@ -151,6 +166,16 @@ class Args:
     """Directory for saving checkpoints."""
     save_every: int = 10
     """Save checkpoint every N epochs."""
+
+    # === Diagnostic Plots ===
+    plot_every: int = 10
+    """Generate diagnostic plots every N epochs (0 = disabled). Logged to wandb."""
+    plot_n_samples: int = 256
+    """Number of validation samples used for diagnostic plots."""
+    plot_attn_top_k: int = 3
+    """Top-K attention edges per turbine in attention layout plot."""
+    plot_n_sample_indices: int = 3
+    """Number of different samples to plot attention maps for."""
 
     # === Device ===
     device: str = "auto"
@@ -198,10 +223,20 @@ class PowerPredictionModel(nn.Module):
         attention_mask: torch.Tensor,
         receptivity: torch.Tensor = None,
         influence: torch.Tensor = None,
-    ) -> torch.Tensor:
+        need_weights: bool = False,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Replicate the actor's encoder path (forward up to transformer output).
-        This is lines 958-1004 of the RL script, minus the action heads.
+        This is lines 958-1004 of the RL script, minus the action heads. (mostly)
+
+        Args:
+            need_weights: If True, return per-layer attention weights for
+                          visualization. Slightly slower due to attention
+                          weight computation.
+
+        Returns:
+            h: (B, N, embed_dim) transformer output
+            attn_weights: list of (B, H, N, N) per layer (empty if need_weights=False)
         """
         actor = self.actor
 
@@ -242,28 +277,40 @@ class PowerPredictionModel(nn.Module):
             attn_bias = actor.rel_pos_bias(positions, attention_mask)
 
         # 6. Transformer
-        h, _ = actor.transformer(h, attention_mask, attn_bias, need_weights=False)
+        h, attn_weights = actor.transformer(
+            h, attention_mask, attn_bias, need_weights=need_weights
+        )
 
-        return h
+        return h, attn_weights
 
-    def forward(self, batch: dict) -> torch.Tensor:
+    def forward(
+        self,
+        batch: dict,
+        need_weights: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
         """
         Args:
             batch: Dict with keys: obs, positions, attention_mask,
                    [receptivity, influence]
+            need_weights: If True, also return (embeddings, attn_weights).
+
         Returns:
             predicted_power: (B, N) predicted normalized power per turbine
+            h: (B, N, embed_dim) encoder output (only if need_weights)
+            attn_weights: list of (B, H, N, N) per layer (only if need_weights)
         """
-        h = self._encode(
+        h, attn_weights = self._encode(
             obs=batch["obs"],
             positions=batch["positions"],
             attention_mask=batch["attention_mask"],
             receptivity=batch.get("receptivity"),
             influence=batch.get("influence"),
+            need_weights=need_weights,
         )
         power = self.power_head(h).squeeze(-1)
-        return power
-    
+        return power, h, attn_weights
+
+
 # =============================================================================
 # LOSS FUNCTION
 # =============================================================================
@@ -286,6 +333,415 @@ def masked_mse_loss(
 
 
 # =============================================================================
+# DIAGNOSTIC PLOT COLLECTION (inference with attention weights)
+# =============================================================================
+
+@torch.no_grad()
+def collect_plot_data(model, dataset, device, n_samples=256, batch_size=64):
+    """
+    Run inference on a subset of the dataset, collecting predictions,
+    embeddings, and attention weights for diagnostic plots.
+
+    Returns dict with numpy arrays:
+        predicted_power: (S, N)
+        target_power:    (S, N)
+        positions:       (S, N, 2)
+        attention_mask:  (S, N)  bool, True=padding
+        embeddings:      (S, N, embed_dim)
+        obs:             (S, N, obs_dim)
+        attn_weights:    list[layer] of (S, H, N, N)
+    """
+    model.eval()
+
+    # Deterministic subset
+    n = min(n_samples, len(dataset))
+    indices = torch.randperm(len(dataset), generator=torch.Generator().manual_seed(42))[:n]
+    subset = torch.utils.data.Subset(dataset, indices.tolist())
+    loader = DataLoader(subset, batch_size=batch_size, shuffle=False, pin_memory=True)
+
+    all_pred, all_target, all_pos, all_mask, all_embed, all_obs = [], [], [], [], [], []
+    all_attn = None
+
+    for batch in loader:
+        batch_dev = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                     for k, v in batch.items()}
+
+        with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+            pred, embed, attn = model(batch_dev, need_weights=True)
+
+        all_pred.append(pred.cpu().float())
+        all_target.append(batch["target_power"])
+        all_pos.append(batch["positions"])
+        all_mask.append(batch["attention_mask"])
+        all_embed.append(embed.cpu().float())
+        all_obs.append(batch["obs"])
+
+        if all_attn is None:
+            all_attn = [[] for _ in range(len(attn))]
+        for layer_idx, aw in enumerate(attn):
+            all_attn[layer_idx].append(aw.cpu().float())
+
+    return {
+        "predicted_power": torch.cat(all_pred).numpy(),
+        "target_power": torch.cat(all_target).numpy(),
+        "positions": torch.cat(all_pos).numpy(),
+        "attention_mask": torch.cat(all_mask).numpy(),
+        "embeddings": torch.cat(all_embed).numpy(),
+        "obs": torch.cat(all_obs).numpy(),
+        "attn_weights": [torch.cat(layer_list).numpy() for layer_list in all_attn],
+    }
+
+
+# =============================================================================
+# DIAGNOSTIC PLOTS (return matplotlib figure objects)
+# =============================================================================
+
+def fig_attention_on_layout(results, sample_idx=0, top_k=3):
+    """
+    Attention maps overlaid on the physical farm layout.
+    Turbine nodes colored by target power, directed edges by attention weight.
+
+    Returns one figure per layer (head-averaged) + a per-head figure for the
+    last layer.
+    """
+    n_layers = len(results["attn_weights"])
+    pos = results["positions"][sample_idx]          # (N, 2)
+    mask = results["attention_mask"][sample_idx]     # (N,)
+    target = results["target_power"][sample_idx]     # (N,)
+    real = ~mask
+    n_real = int(real.sum())
+    pos_real = pos[:n_real]
+    target_real = target[:n_real]
+
+    cmap_edge = plt.cm.Reds
+
+    def _draw(ax, attn_matrix, title):
+        """Draw attention edges + turbine scatter on axis."""
+        n = len(pos_real)
+        for i in range(n):
+            w = attn_matrix[i].copy()
+            w[i] = 0  # skip self-attention
+            if top_k > 0 and top_k < n:
+                thresh = np.sort(w)[::-1][min(top_k, n - 1)]
+                w[w < thresh] = 0
+            for j in range(n):
+                if w[j] > 0.01:
+                    ax.annotate(
+                        "", xy=pos_real[j], xytext=pos_real[i],
+                        arrowprops=dict(
+                            arrowstyle="->,head_width=0.15,head_length=0.1",
+                            color=cmap_edge(float(w[j])),
+                            alpha=float(np.clip(w[j], 0.15, 1.0)),
+                            lw=1.0 + 2.0 * float(w[j]),
+                            connectionstyle="arc3,rad=0.05",
+                        ),
+                    )
+        sc = ax.scatter(
+            pos_real[:, 0], pos_real[:, 1],
+            c=target_real, cmap="viridis", s=120,
+            edgecolors="black", linewidth=1.0, zorder=5,
+        )
+        for t in range(n):
+            ax.annotate(str(t), pos_real[t], fontsize=7, ha="center",
+                        va="center", fontweight="bold", color="white", zorder=6)
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("x (norm)")
+        ax.set_ylabel("y (norm)")
+        ax.set_aspect("equal")
+        ax.grid(True, alpha=0.3)
+        return sc
+
+    def _normalize_rows(a):
+        row_max = a.max(axis=1, keepdims=True)
+        row_max = np.where(row_max > 0, row_max, 1.0)
+        return a / row_max
+
+    # --- Per-layer figure (head-averaged) ---
+    n_cols = min(n_layers, 4)
+    fig_layers, axes = plt.subplots(1, n_cols, figsize=(5 * n_cols, 5), squeeze=False)
+    axes = axes[0]
+    for l in range(n_cols):
+        attn_l = results["attn_weights"][l][sample_idx]  # (H, N, N)
+        attn_mean = _normalize_rows(attn_l.mean(axis=0)[:n_real, :n_real])
+        sc = _draw(axes[l], attn_mean, f"Layer {l} (head avg)")
+    fig_layers.colorbar(sc, ax=axes[-1], shrink=0.8, label="Target Power (norm)")
+    fig_layers.suptitle(f"Attention on Layout — sample {sample_idx}", fontsize=12, y=1.02)
+    fig_layers.tight_layout()
+
+    # --- Per-head figure for last layer ---
+    n_heads = results["attn_weights"][-1].shape[1]
+    fig_heads = None
+    if n_heads <= 8:
+        fig_heads, axes_h = plt.subplots(1, n_heads, figsize=(4 * n_heads, 4), squeeze=False)
+        axes_h = axes_h[0]
+        for h in range(n_heads):
+            attn_h = results["attn_weights"][-1][sample_idx][h, :n_real, :n_real]
+            attn_h = _normalize_rows(attn_h)
+            _draw(axes_h[h], attn_h, f"Head {h}")
+        fig_heads.suptitle(f"Per-Head Attention (last layer, sample {sample_idx})",
+                           fontsize=12, y=1.02)
+        fig_heads.tight_layout()
+
+    return fig_layers, fig_heads
+
+
+def fig_pred_vs_actual(results):
+    """Scatter of predicted vs. actual power, colored by wind direction."""
+    pred = results["predicted_power"]
+    target = results["target_power"]
+    mask = results["attention_mask"]
+    obs = results["obs"]
+    real = ~mask
+
+    pred_flat = pred[real]
+    target_flat = target[real]
+
+    # Extract wind direction for coloring (feature idx 1, last timestep)
+    n_features = 3  # ws, wd, yaw
+    obs_dim = obs.shape[-1]
+    history_len = obs_dim // n_features
+    wd_idx = 1 * history_len + (history_len - 1)
+    wd_flat = obs[:, :, wd_idx][real] if wd_idx < obs_dim else np.zeros_like(pred_flat)
+
+    # Metrics
+    mse = np.mean((pred_flat - target_flat) ** 2)
+    mae = np.mean(np.abs(pred_flat - target_flat))
+    ss_res = np.sum((pred_flat - target_flat) ** 2)
+    ss_tot = np.sum((target_flat - target_flat.mean()) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+    fig, ax = plt.subplots(figsize=(6, 5.5))
+    sc = ax.scatter(target_flat, pred_flat, c=wd_flat, cmap="twilight", s=4, alpha=0.4)
+    lims = [min(target_flat.min(), pred_flat.min()), max(target_flat.max(), pred_flat.max())]
+    ax.plot(lims, lims, "k--", alpha=0.5, lw=1, label="Perfect")
+    fig.colorbar(sc, label="Wind Dir (norm)")
+    ax.set_xlabel("Target Power (norm)")
+    ax.set_ylabel("Predicted Power (norm)")
+    ax.set_title(f"Pred vs. Actual — MSE={mse:.6f}  MAE={mae:.4f}  R²={r2:.4f}")
+    ax.legend(fontsize=8)
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    return fig
+
+
+def fig_error_heatmap(results):
+    """Per-turbine MAE plotted on the farm grid, side-by-side with mean power."""
+    pred = results["predicted_power"]
+    target = results["target_power"]
+    pos = results["positions"]
+    mask = results["attention_mask"]
+    real = ~mask
+
+    n_samples, n_turbines = pred.shape
+    abs_errors = np.abs(pred - target)
+
+    # Per-turbine averages
+    turbine_mae = np.zeros(n_turbines)
+    avg_power = np.zeros(n_turbines)
+    avg_pos = np.zeros((n_turbines, 2))
+    active = np.zeros(n_turbines, dtype=bool)
+
+    for t in range(n_turbines):
+        valid = real[:, t]
+        if valid.sum() > 0:
+            turbine_mae[t] = abs_errors[valid, t].mean()
+            avg_power[t] = target[valid, t].mean()
+            avg_pos[t] = pos[valid, t].mean(axis=0)
+            active[t] = True
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+
+    # Left: MAE
+    sc1 = ax1.scatter(avg_pos[active, 0], avg_pos[active, 1], c=turbine_mae[active],
+                       cmap="hot_r", s=250, edgecolors="black", linewidth=1.0, zorder=5)
+    for t in np.where(active)[0]:
+        ax1.annotate(f"{turbine_mae[t]:.4f}", avg_pos[t], fontsize=6,
+                     ha="center", va="center", zorder=6)
+    fig.colorbar(sc1, ax=ax1, label="MAE")
+    ax1.set_title("Per-Turbine MAE")
+    ax1.set_aspect("equal")
+    ax1.grid(True, alpha=0.3)
+
+    # Right: Mean power
+    sc2 = ax2.scatter(avg_pos[active, 0], avg_pos[active, 1], c=avg_power[active],
+                       cmap="viridis", s=250, edgecolors="black", linewidth=1.0, zorder=5)
+    for t in np.where(active)[0]:
+        ax2.annotate(f"{avg_power[t]:.3f}", avg_pos[t], fontsize=6, ha="center",
+                     va="center", color="white", fontweight="bold", zorder=6)
+    fig.colorbar(sc2, ax=ax2, label="Mean Power (norm)")
+    ax2.set_title("Mean Target Power")
+    ax2.set_aspect("equal")
+    ax2.grid(True, alpha=0.3)
+
+    fig.suptitle("Error & Power Distribution Across Farm", fontsize=12)
+    fig.tight_layout()
+    return fig
+
+
+def fig_attention_entropy(results):
+    """Attention entropy per layer/head — lower = more structured attention."""
+    mask = results["attention_mask"]
+    n_layers = len(results["attn_weights"])
+    real = ~mask  # (S, N)
+
+    eps = 1e-8
+    layer_entropies = []
+    for l in range(n_layers):
+        attn = results["attn_weights"][l]  # (S, H, N, N)
+        entropy = -(attn * np.log(attn + eps)).sum(axis=-1)  # (S, H, N)
+        real_exp = real[:, np.newaxis, :]  # (S, 1, N)
+        per_head = (entropy * real_exp).sum(axis=(0, 2)) / real_exp.sum(axis=(0, 2))  # (H,)
+        layer_entropies.append(per_head)
+
+    layer_entropies = np.array(layer_entropies)  # (L, H)
+    n_heads = layer_entropies.shape[1]
+    n_real_avg = real.sum(axis=1).mean()
+    uniform_entropy = np.log(n_real_avg)
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    for h in range(n_heads):
+        ax.plot(range(n_layers), layer_entropies[:, h], "o-", alpha=0.4,
+                markersize=4, label=f"Head {h}")
+    ax.plot(range(n_layers), layer_entropies.mean(axis=1), "k^-",
+            linewidth=2.5, markersize=8, label="Mean", zorder=10)
+    ax.axhline(uniform_entropy, color="red", linestyle="--", alpha=0.5,
+               label=f"Uniform ({uniform_entropy:.2f})")
+    ax.set_xlabel("Layer")
+    ax.set_ylabel("Entropy (nats)")
+    ax.set_title("Attention Entropy (lower = more focused)")
+    ax.set_xticks(range(n_layers))
+    ax.legend(fontsize=7, ncol=2)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    return fig
+
+
+def fig_embedding_tsne(results, perplexity=30, max_points=2000):
+    """t-SNE of transformer output embeddings colored by power and position."""
+    if not HAS_SKLEARN:
+        return None
+
+    embeddings = results["embeddings"]
+    target = results["target_power"]
+    positions = results["positions"]
+    mask = results["attention_mask"]
+    real = ~mask
+
+    emb_flat = embeddings[real]
+    pow_flat = target[real]
+    pos_flat = positions[real]
+
+    if len(emb_flat) > max_points:
+        idx = np.random.RandomState(42).choice(len(emb_flat), max_points, replace=False)
+        emb_flat, pow_flat, pos_flat = emb_flat[idx], pow_flat[idx], pos_flat[idx]
+
+    tsne = TSNE(n_components=2, perplexity=min(perplexity, len(emb_flat) // 4),
+                random_state=42, n_iter=800)
+    emb_2d = tsne.fit_transform(emb_flat)
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
+
+    sc0 = axes[0].scatter(emb_2d[:, 0], emb_2d[:, 1], c=pow_flat, cmap="viridis", s=6, alpha=0.5)
+    fig.colorbar(sc0, ax=axes[0]).set_label("Power (norm)")
+    axes[0].set_title("By Power Output")
+
+    sc1 = axes[1].scatter(emb_2d[:, 0], emb_2d[:, 1], c=pos_flat[:, 0], cmap="coolwarm", s=6, alpha=0.5)
+    fig.colorbar(sc1, ax=axes[1]).set_label("x-pos (norm)")
+    axes[1].set_title("By Streamwise Position")
+
+    sc2 = axes[2].scatter(emb_2d[:, 0], emb_2d[:, 1], c=pos_flat[:, 1], cmap="PiYG", s=6, alpha=0.5)
+    fig.colorbar(sc2, ax=axes[2]).set_label("y-pos (norm)")
+    axes[2].set_title("By Lateral Position")
+
+    for ax in axes:
+        ax.set_xlabel("t-SNE 1")
+        ax.set_ylabel("t-SNE 2")
+        ax.grid(True, alpha=0.2)
+
+    fig.suptitle("t-SNE of Token Embeddings", fontsize=12)
+    fig.tight_layout()
+    return fig
+
+
+# =============================================================================
+# ORCHESTRATOR: generate all plots and log to wandb
+# =============================================================================
+
+def generate_diagnostic_plots(
+    model, val_dataset, device, epoch, args,
+):
+    """
+    Collect inference results and generate all diagnostic plots.
+    Returns a dict of {wandb_key: wandb.Image} ready for wandb.log().
+    """
+    print(f"  Generating diagnostic plots (n_samples={args.plot_n_samples})...")
+    t0 = time.time()
+
+    results = collect_plot_data(
+        model, val_dataset, device,
+        n_samples=args.plot_n_samples,
+        batch_size=args.batch_size,
+    )
+
+    images = {}
+
+    # 1. Attention on layout — multiple sample indices for diversity
+    n_samples_available = results["predicted_power"].shape[0]
+    sample_indices = np.linspace(0, n_samples_available - 1,
+                                  args.plot_n_sample_indices, dtype=int)
+    for i, idx in enumerate(sample_indices):
+        try:
+            fig_layers, fig_heads = fig_attention_on_layout(
+                results, sample_idx=int(idx), top_k=args.plot_attn_top_k
+            )
+            images[f"plots/attention_layers_s{idx}"] = wandb.Image(fig_layers)
+            plt.close(fig_layers)
+            if fig_heads is not None:
+                images[f"plots/attention_heads_s{idx}"] = wandb.Image(fig_heads)
+                plt.close(fig_heads)
+        except Exception as e:
+            print(f"    Warning: attention plot failed for sample {idx}: {e}")
+
+    # 2. Predicted vs. actual scatter
+    try:
+        fig = fig_pred_vs_actual(results)
+        images["plots/pred_vs_actual"] = wandb.Image(fig)
+        plt.close(fig)
+    except Exception as e:
+        print(f"    Warning: scatter plot failed: {e}")
+
+    # 3. Error heatmap
+    try:
+        fig = fig_error_heatmap(results)
+        images["plots/error_heatmap"] = wandb.Image(fig)
+        plt.close(fig)
+    except Exception as e:
+        print(f"    Warning: error heatmap failed: {e}")
+
+    # 4. Attention entropy
+    try:
+        fig = fig_attention_entropy(results)
+        images["plots/attention_entropy"] = wandb.Image(fig)
+        plt.close(fig)
+    except Exception as e:
+        print(f"    Warning: entropy plot failed: {e}")
+
+    # 5. Embedding t-SNE (skip if sklearn missing or too slow)
+    try:
+        fig = fig_embedding_tsne(results, max_points=min(2000, args.plot_n_samples * 9))
+        if fig is not None:
+            images["plots/embedding_tsne"] = wandb.Image(fig)
+            plt.close(fig)
+    except Exception as e:
+        print(f"    Warning: t-SNE plot failed: {e}")
+
+    dt = time.time() - t0
+    print(f"  Generated {len(images)} plot(s) in {dt:.1f}s")
+    return images
+
+
+# =============================================================================
 # TRAINING LOOP
 # =============================================================================
 
@@ -300,13 +756,12 @@ def train_one_epoch(model, loader, optimizer, device, epoch, log_wandb=False, sc
                  for k, v in batch.items()}
 
         with torch.amp.autocast("cuda"):
-            predicted_power = model(batch)
+            predicted_power, _, _ = model(batch, need_weights=False)
             loss = masked_mse_loss(
                 predicted_power,
                 batch["target_power"],
                 batch["attention_mask"],
             )
-
 
         optimizer.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
@@ -342,9 +797,8 @@ def evaluate(model, loader, device):
                  for k, v in batch.items()}
 
         with torch.amp.autocast("cuda"):
-            predicted_power = model(batch)
+            predicted_power, _, _ = model(batch, need_weights=False)
 
-        # predicted_power = model(batch)
         real_mask = ~batch["attention_mask"]
 
         # MSE
@@ -445,17 +899,11 @@ def main():
 
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True,
-        # num_workers=args.num_workers,  # Removed as memory is now fully in ram.
         pin_memory=True, drop_last=True,
-        # persistent_workers=True,    # avoids respawning workers each epoch
-        # prefetch_factor=4,          # pre-loads more batches
     )
     val_loader = DataLoader(
         val_set, batch_size=args.batch_size, shuffle=False,
-        # num_workers=args.num_workers, 
         pin_memory=True,
-        # persistent_workers=True,    # avoids respawning workers each epoch
-        # prefetch_factor=4,          # pre-loads more batches
     )
 
     # --- Determine dimensions from first sample ---
@@ -533,11 +981,16 @@ def main():
     # --- Output dir ---
     os.makedirs(args.save_dir, exist_ok=True)
 
+    # Determine if plots should be generated
+    do_plots = use_wandb and args.plot_every > 0
+
     # =========================================================================
     # Training
     # =========================================================================
     print(f"\n{'='*60}")
     print(f"Starting pretraining: {args.epochs} epochs")
+    if do_plots:
+        print(f"Diagnostic plots every {args.plot_every} epochs ({args.plot_n_samples} samples)")
     print(f"{'='*60}")
 
     best_val_mse = float("inf")
@@ -572,6 +1025,16 @@ def main():
             }
             # Denormalized MAE in watts for interpretability
             log_dict["val/mae_watts"] = val_mae * args.power_max
+
+            # --- Diagnostic plots (every N epochs + first + last) ---
+            if do_plots and (epoch % args.plot_every == 0
+                            or epoch == 1
+                            or epoch == args.epochs):
+                plot_images = generate_diagnostic_plots(
+                    model, val_set, device, epoch, args,
+                )
+                log_dict.update(plot_images)
+
             wandb.log(log_dict)
 
         # Save best
@@ -580,7 +1043,7 @@ def main():
             best_val_mse = val_mse
             torch.save({
                 "epoch": epoch,
-                "encoder_state_dict":get_encoder_state_dict(model.actor),
+                "encoder_state_dict": get_encoder_state_dict(model.actor),
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "val_mse": val_mse,
