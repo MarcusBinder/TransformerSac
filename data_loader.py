@@ -15,6 +15,15 @@ Preprocessing (matching the RL training pipeline):
     - Wind-relative positions: Optionally rotate positions so wind comes from 270°
     - Profile rotation: Optionally rotate profiles so wind direction aligns to index 0
 
+Global wind mode (global_ws=True and/or global_wd=True):
+    Instead of per-turbine ws/wd history, uses episode-level mean_ws/mean_wd
+    broadcast identically to all turbines. Each flag is independent:
+        global_ws=True  → ws becomes 1 broadcast scalar (instead of H history dims)
+        global_wd=True  → wd becomes 1 broadcast scalar (instead of H history dims)
+        both=True       → obs = [mean_ws, mean_wd, yaw_history] → dim = 2 + H
+    This forces the transformer to learn wake interactions through attention
+    rather than shortcutting via per-turbine wind speed → power curve lookup.
+
 Author: Marcus (DTU Wind Energy)
 """
 
@@ -163,8 +172,29 @@ class WindFarmPretrainDataset(Dataset):
     Each sample is a single timestep with history_length context,
     drawn from a random episode across all layout files.
 
+    Two observation modes per feature (controlled by global_ws / global_wd):
+        Default (global_ws=False, global_wd=False):
+            obs = [ws_history, wd_history, yaw_history] per turbine
+            obs_dim = history_length × n_features (e.g. 15 × 3 = 45)
+
+        Global ws only (global_ws=True, global_wd=False):
+            obs = [mean_ws, wd_history, yaw_history] per turbine
+            obs_dim = 1 + history_length × 2 (e.g. 1 + 15×2 = 31)
+
+        Global wd only (global_ws=False, global_wd=True):
+            obs = [ws_history, mean_wd, yaw_history] per turbine
+            obs_dim = history_length + 1 + history_length (e.g. 15 + 1 + 15 = 31)
+
+        Both global (global_ws=True, global_wd=True):
+            obs = [mean_ws, mean_wd, yaw_history] per turbine
+            obs_dim = 2 + history_length (e.g. 2 + 15 = 17)
+
+        Global features are broadcast identically to all turbines, forcing
+        the transformer to learn wake interactions through attention.
+
     Preprocessing pipeline (applied per sample in __getitem__):
         1. Stack history window for each feature → (n_turb, H * n_features)
+           OR build mixed obs with global scalars + history → (n_turb, n_global + H * n_hist)
         2. Normalize each feature to [-1, 1] using scaling limits
         3. Optionally convert WD to deviation from episode mean
         4. Pad to max_turbines with attention_mask
@@ -178,6 +208,9 @@ class WindFarmPretrainDataset(Dataset):
         history_length: int = 15,
         max_turbines: Optional[int] = None,
         features: List[str] = ["ws", "wd", "yaw", "power"],
+        # --- Global feature flags ---
+        global_ws: bool = False,
+        global_wd: bool = False,
         # --- Normalization ---
         scaling_limits: Optional[Dict[str, Tuple[float, float]]] = None,
         # --- Wind direction deviation ---
@@ -194,16 +227,25 @@ class WindFarmPretrainDataset(Dataset):
             history_length: Number of past timesteps to stack per feature
             max_turbines: Pad to this many turbines (None = auto from data)
             features: Which per-turbine features to include in obs
+            global_ws: If True, replace per-turbine ws history with a single
+                       broadcast mean_ws scalar (1 dim instead of history_length).
+            global_wd: If True, replace per-turbine wd history with a single
+                       broadcast mean_wd scalar (1 dim instead of history_length).
             scaling_limits: Dict mapping feature name → (min, max) for [-1,1] scaling.
                             Defaults to WindFarmEnv defaults if not provided.
             use_wd_deviation: If True, convert WD to deviation from episode mean_wd
-                              (matches EnhancedPerTurbineWrapper behavior)
+                              (matches EnhancedPerTurbineWrapper behavior).
+                              When global_wd=True, deviation of mean_wd from itself
+                              is always 0, so consider using use_wd_deviation=False
+                              with global_wd=True.
             wd_scale_range: ±degrees that map to [-1, 1] for WD deviation (default 90°)
             use_wind_relative_pos: If True, rotate positions so wind comes from 270°
             rotate_profiles: If True, rotate profiles so wind direction is at index 0
         """
         self.history_length = history_length
         self.features = features
+        self.global_ws = global_ws
+        self.global_wd = global_wd
         self.use_wd_deviation = use_wd_deviation
         self.wd_scale_range = wd_scale_range
         self.use_wind_relative_pos = use_wind_relative_pos
@@ -214,12 +256,31 @@ class WindFarmPretrainDataset(Dataset):
         if scaling_limits is not None:
             self.scaling_limits.update(scaling_limits)
 
+        # Determine which features get per-turbine history vs global scalar
+        self._global_features = []   # features broadcast as scalars (1 dim each)
+        self._history_features = []  # features with full history (H dims each)
+        for feat in features:
+            if (feat == "ws" and global_ws) or (feat == "wd" and global_wd):
+                self._global_features.append(feat)
+            else:
+                self._history_features.append(feat)
+
         # Build index: list of (layout_idx, ep_key, timestep)
         self.index = []
         self.layouts = []
 
+        n_global = len(self._global_features)
+        n_hist = len(self._history_features)
+        obs_dim_desc = []
+        if n_global > 0:
+            obs_dim_desc.append(f"{n_global} global ({', '.join(self._global_features)})")
+        if n_hist > 0:
+            obs_dim_desc.append(f"{n_hist}×{history_length} history ({', '.join(self._history_features)})")
+
         print(f"Loading dataset from {len(layout_files)} layout file(s)...")
-        print(f"  Normalization: ON (limits: { {k: v for k, v in self.scaling_limits.items() if k in features} })")
+        print(f"  Observation: {' + '.join(obs_dim_desc)}"
+              f" → dim={n_global + history_length * n_hist}")
+        print(f"  Normalization: ON (limits: { {k: v for k, v in self.scaling_limits.items() if k in features or k in ('ws', 'wd')} })")
         print(f"  WD deviation: {'ON' if use_wd_deviation else 'OFF'}"
               f"{f' (±{wd_scale_range}°→[-1,1])' if use_wd_deviation else ''}")
         print(f"  Wind-relative positions: {'ON' if use_wind_relative_pos else 'OFF'}")
@@ -252,14 +313,15 @@ class WindFarmPretrainDataset(Dataset):
                         "mean_wd": float(ep.attrs["mean_wd"]),
                         "mean_ti": float(ep.attrs["mean_ti"]),
                     }
-                    # Pre-load all time-series into memory
-                    episode_data[ep_key] = {
-                        feat: ep[feat][:].astype(np.float32)
-                        for feat in self.features
-                    }
-                    episode_data[ep_key]["power"] = ep["power"][:].astype(np.float32)
-                    episode_data[ep_key]["actions"] = ep["actions"][:].astype(np.float32)
-
+                    # Pre-load time-series into memory
+                    # Only load features that need history; global features come from episode attrs
+                    ep_series = {}
+                    for feat in self._history_features:
+                        ep_series[feat] = ep[feat][:].astype(np.float32)
+                    # Always load power and actions for targets
+                    ep_series["power"] = ep["power"][:].astype(np.float32)
+                    ep_series["actions"] = ep["actions"][:].astype(np.float32)
+                    episode_data[ep_key] = ep_series
 
                     # Valid timesteps: need history_length steps of context before
                     for t in range(history_length, n_steps):
@@ -276,11 +338,13 @@ class WindFarmPretrainDataset(Dataset):
 
         # Determine max turbines for padding
         self.max_turbines = max_turbines or max(l["n_turbines"] for l in self.layouts)
-        self.obs_dim = history_length * len(features)
+
+        # Compute obs_dim based on which features are global vs history
+        self.obs_dim = len(self._global_features) + history_length * len(self._history_features)
 
         print(f"Dataset ready: {len(self.index)} samples, "
               f"max_turbines={self.max_turbines}, "
-              f"obs_dim={self.obs_dim} ({history_length} × {len(features)} features)")
+              f"obs_dim={self.obs_dim}")
 
         # === Precompute all samples into tensors (vectorized) ===
         print("Precomputing all samples (vectorized)...")
@@ -315,6 +379,7 @@ class WindFarmPretrainDataset(Dataset):
             n_turb = layout["n_turbines"]
             ep_meta = layout["episode_meta"][ep_key]
             ep_data = layout["episode_data"][ep_key]
+            mean_ws = ep_meta["mean_ws"]
             mean_wd = ep_meta["mean_wd"]
             H = self.history_length
 
@@ -322,19 +387,34 @@ class WindFarmPretrainDataset(Dataset):
             timesteps = np.array([s[1] for s in samples])
             n_samples = len(timesteps)
 
-            # --- Vectorized obs: extract all history windows at once ---
-            # For each feature: data shape is (n_steps, n_turb)
-            # We want (n_samples, H, n_turb) -> normalize -> transpose to (n_samples, n_turb, H)
+            # --- Build observation: global scalars + per-turbine history ---
             obs_parts = []
-            for feat in self.features:
+
+            # Global features: broadcast scalar to (n_samples, n_turb, 1)
+            for feat in self._global_features:
+                if feat == "ws":
+                    ws_min, ws_max = self.scaling_limits["ws"]
+                    val_norm = np.float32((2.0 * (mean_ws - ws_min) / (ws_max - ws_min)) - 1.0)
+                elif feat == "wd":
+                    if self.use_wd_deviation:
+                        val_norm = np.float32(0.0)  # deviation from itself
+                    else:
+                        wd_min, wd_max = self.scaling_limits["wd"]
+                        val_norm = np.float32((2.0 * (mean_wd - wd_min) / (wd_max - wd_min)) - 1.0)
+                else:
+                    raise ValueError(f"Unsupported global feature: {feat}")
+                obs_parts.append(np.full((n_samples, n_turb, 1), val_norm, dtype=np.float32))
+
+            # History features: (n_samples, n_turb, H) each
+            for feat in self._history_features:
                 feat_data = ep_data[feat]  # (n_steps, n_turb)
-                # Build index array: (n_samples, H) where each row is [t-H, t-H+1, ..., t-1]
-                window_idxs = timesteps[:, None] + np.arange(-H, 0)[None, :]  # (n_samples, H)
+                window_idxs = timesteps[:, None] + np.arange(-H, 0)[None, :]
                 windows = feat_data[window_idxs]  # (n_samples, H, n_turb)
                 windows_norm = self._normalize_feature(feat, windows, mean_wd)
                 obs_parts.append(windows_norm.transpose(0, 2, 1))  # (n_samples, n_turb, H)
 
-            obs = np.concatenate(obs_parts, axis=-1)  # (n_samples, n_turb, H * n_features)
+            obs = np.concatenate(obs_parts, axis=-1)
+
             self._obs[global_idxs, :n_turb] = torch.from_numpy(obs)
 
             # --- Target power & actions (vectorized) ---
@@ -349,8 +429,8 @@ class WindFarmPretrainDataset(Dataset):
             self._attention_mask[global_idxs, :n_turb] = False
             self._n_turbines[global_idxs] = n_turb
             self._layout_idx[global_idxs] = li
-            self._mean_ws[global_idxs] = ep_meta["mean_ws"]
-            self._mean_wd[global_idxs] = ep_meta["mean_wd"]
+            self._mean_ws[global_idxs] = mean_ws
+            self._mean_wd[global_idxs] = mean_wd
             self._mean_ti[global_idxs] = ep_meta["mean_ti"]
 
             # --- Positions: same for all samples in this episode (same mean_wd) ---
@@ -434,8 +514,12 @@ class WindFarmSnapshotDataset(Dataset):
     """
     Simplified dataset for snapshot-based pretraining (history_length=1).
 
-    Each sample is a single timestep with per-turbine (ws, wd, yaw, power).
-    Obs dim = n_features (4), not n_features * history.
+    Each sample is a single timestep with per-turbine features.
+    Obs dim = n_features (not n_features * history).
+
+    Supports global_ws / global_wd flags (same as history dataset):
+        global_ws=True → replaces per-turbine ws with broadcast mean_ws (1 dim)
+        global_wd=True → replaces per-turbine wd with broadcast mean_wd (1 dim)
 
     Useful for:
     - Masked turbine prediction from PyWake steady-state data
@@ -448,6 +532,9 @@ class WindFarmSnapshotDataset(Dataset):
         max_turbines: Optional[int] = None,
         features: List[str] = ["ws", "wd", "yaw", "power"],
         skip_steps: int = 1,
+        # --- Global feature flags ---
+        global_ws: bool = False,
+        global_wd: bool = False,
         # --- Normalization ---
         scaling_limits: Optional[Dict[str, Tuple[float, float]]] = None,
         # --- Wind direction deviation ---
@@ -459,6 +546,8 @@ class WindFarmSnapshotDataset(Dataset):
         rotate_profiles: bool = True,
     ):
         self.features = features
+        self.global_ws = global_ws
+        self.global_wd = global_wd
         self.use_wd_deviation = use_wd_deviation
         self.wd_scale_range = wd_scale_range
         self.use_wind_relative_pos = use_wind_relative_pos
@@ -468,6 +557,15 @@ class WindFarmSnapshotDataset(Dataset):
         self.scaling_limits = dict(DEFAULT_SCALING)
         if scaling_limits is not None:
             self.scaling_limits.update(scaling_limits)
+
+        # Determine which features are global vs per-turbine
+        self._global_features = []
+        self._snapshot_features = []
+        for feat in features:
+            if (feat == "ws" and global_ws) or (feat == "wd" and global_wd):
+                self._global_features.append(feat)
+            else:
+                self._snapshot_features.append(feat)
 
         self.index = []
         self.layouts = []
@@ -484,13 +582,14 @@ class WindFarmSnapshotDataset(Dataset):
                     layout_info["receptivity"] = f["profiles/receptivity"][:].astype(np.float32)
                     layout_info["influence"] = f["profiles/influence"][:].astype(np.float32)
 
-                # Store episode metadata for WD deviation
+                # Store episode metadata
                 episode_meta = {}
                 for ep_key in sorted(f["episodes"].keys()):
                     ep = f[f"episodes/{ep_key}"]
                     n_steps = int(ep.attrs["n_steps"])
                     episode_meta[ep_key] = {
                         "n_steps": n_steps,
+                        "mean_ws": float(ep.attrs["mean_ws"]),
                         "mean_wd": float(ep.attrs["mean_wd"]),
                     }
                     for t in range(0, n_steps, skip_steps):
@@ -500,7 +599,9 @@ class WindFarmSnapshotDataset(Dataset):
                 self.layouts.append(layout_info)
 
         self.max_turbines = max_turbines or max(l["n_turbines"] for l in self.layouts)
-        print(f"Snapshot dataset: {len(self.index)} samples, max_turb={self.max_turbines}")
+        global_str = [f for f in ["ws", "wd"] if (f == "ws" and global_ws) or (f == "wd" and global_wd)]
+        print(f"Snapshot dataset: {len(self.index)} samples, max_turb={self.max_turbines}"
+              f"{', global: ' + ','.join(global_str) if global_str else ''}")
 
     def __len__(self):
         return len(self.index)
@@ -518,19 +619,35 @@ class WindFarmSnapshotDataset(Dataset):
         li, ep_key, t = self.index[idx]
         layout = self.layouts[li]
         n_turb = layout["n_turbines"]
-        mean_wd = layout["episode_meta"][ep_key]["mean_wd"]
+        ep_meta = layout["episode_meta"][ep_key]
+        mean_ws = ep_meta["mean_ws"]
+        mean_wd = ep_meta["mean_wd"]
 
         with h5py.File(layout["path"], "r") as f:
             ep = f[f"episodes/{ep_key}"]
 
-            # Load and normalize each feature
             obs_parts = []
-            for feat in self.features:
+
+            # Global features: broadcast scalar to (n_turb, 1)
+            for feat in self._global_features:
+                if feat == "ws":
+                    ws_min, ws_max = self.scaling_limits["ws"]
+                    val_norm = np.float32((2.0 * (mean_ws - ws_min) / (ws_max - ws_min)) - 1.0)
+                elif feat == "wd":
+                    if self.use_wd_deviation:
+                        val_norm = np.float32(0.0)
+                    else:
+                        wd_min, wd_max = self.scaling_limits["wd"]
+                        val_norm = np.float32((2.0 * (mean_wd - wd_min) / (wd_max - wd_min)) - 1.0)
+                obs_parts.append(np.full((n_turb, 1), val_norm, dtype=np.float32))
+
+            # Per-turbine features: load from HDF5
+            for feat in self._snapshot_features:
                 raw = ep[feat][t]  # (n_turb,)
                 norm = self._normalize_feature(feat, raw, mean_wd)
-                obs_parts.append(norm)
+                obs_parts.append(norm[:, None])  # (n_turb, 1)
 
-            obs = np.stack(obs_parts, axis=-1)  # (n_turb, n_features)
+            obs = np.concatenate(obs_parts, axis=-1)  # (n_turb, n_global + n_snapshot)
             target_power = self._normalize_feature("power", ep["power"][t])
 
         # Positions
@@ -538,8 +655,11 @@ class WindFarmSnapshotDataset(Dataset):
         if self.use_wind_relative_pos:
             positions_norm = rotate_positions_wind_relative(positions_norm, mean_wd)
 
+        # Determine obs width for padding
+        obs_width = obs.shape[-1]
+
         # Pad
-        obs_padded = np.zeros((self.max_turbines, len(self.features)), dtype=np.float32)
+        obs_padded = np.zeros((self.max_turbines, obs_width), dtype=np.float32)
         obs_padded[:n_turb] = obs
 
         target_padded = np.zeros(self.max_turbines, dtype=np.float32)
@@ -592,6 +712,9 @@ def create_pretrain_dataloader(
     max_turbines: Optional[int] = None,
     snapshot_mode: bool = False,
     skip_steps: int = 1,
+    # --- Global feature flags ---
+    global_ws: bool = False,
+    global_wd: bool = False,
     # --- Preprocessing flags ---
     scaling_limits: Optional[Dict[str, Tuple[float, float]]] = None,
     use_wd_deviation: bool = False,
@@ -610,6 +733,8 @@ def create_pretrain_dataloader(
         max_turbines: Padding target (None=auto)
         snapshot_mode: If True, use single-step snapshots instead of history
         skip_steps: Subsample every N steps (snapshot mode only)
+        global_ws: If True, use global mean_ws instead of per-turbine ws
+        global_wd: If True, use global mean_wd instead of per-turbine wd
         scaling_limits: Dict of feature → (min, max) for normalization
         use_wd_deviation: Convert WD to deviation from episode mean
         wd_scale_range: ±degrees for WD deviation scaling
@@ -617,6 +742,8 @@ def create_pretrain_dataloader(
         rotate_profiles: Rotate profiles to wind-relative frame
     """
     common_kwargs = dict(
+        global_ws=global_ws,
+        global_wd=global_wd,
         scaling_limits=scaling_limits,
         use_wd_deviation=use_wd_deviation,
         wd_scale_range=wd_scale_range,
@@ -665,8 +792,9 @@ if __name__ == "__main__":
         print(f"No layout files found in {data_dir}")
         sys.exit(1)
 
+    # --- Test standard mode ---
     print("=" * 60)
-    print("Testing history dataset (history_length=15, all preprocessing ON)")
+    print("Testing STANDARD history dataset (per-turbine ws/wd/yaw)")
     print("=" * 60)
     loader = create_pretrain_dataloader(
         files,
@@ -678,40 +806,65 @@ if __name__ == "__main__":
         rotate_profiles=True,
     )
     batch = next(iter(loader))
-    print(f"  obs:           {batch['obs'].shape}")            # (32, max_turb, 60)
-    print(f"  positions:     {batch['positions'].shape}")      # (32, max_turb, 2)
-    print(f"  attention_mask:{batch['attention_mask'].shape}")  # (32, max_turb)
-    print(f"  target_power:  {batch['target_power'].shape}")   # (32, max_turb)
+    print(f"  obs:           {batch['obs'].shape}")            # (32, max_turb, 45)
+    print(f"  positions:     {batch['positions'].shape}")
+    print(f"  attention_mask:{batch['attention_mask'].shape}")
+    print(f"  target_power:  {batch['target_power'].shape}")
     print(f"  obs range:     [{batch['obs'].min():.3f}, {batch['obs'].max():.3f}]")
-    print(f"  target range:  [{batch['target_power'].min():.3f}, {batch['target_power'].max():.3f}]")
     if "receptivity" in batch:
-        print(f"  receptivity:   {batch['receptivity'].shape}")  # (32, max_turb, 360)
+        print(f"  receptivity:   {batch['receptivity'].shape}")
 
+    # --- Test global_ws only (obs_dim = 1 + 15*2 = 31) ---
     print("\n" + "=" * 60)
-    print("Testing snapshot dataset (all preprocessing ON)")
+    print("Testing GLOBAL WS only (mean_ws + wd_history + yaw_history)")
+    print("=" * 60)
+    loader_gws = create_pretrain_dataloader(
+        files,
+        history_length=15,
+        batch_size=32,
+        num_workers=0,
+        global_ws=True,
+        global_wd=False,
+    )
+    batch_gws = next(iter(loader_gws))
+    print(f"  obs:           {batch_gws['obs'].shape}")         # (32, max_turb, 31)
+    n_turb = (~batch_gws['attention_mask'][0]).sum().item()
+    ws_vals = batch_gws['obs'][0, :n_turb, 0]
+    print(f"  ws identical across turbines: {ws_vals.std().item() < 1e-6}")
+    print(f"  wd varies across turbines:    {batch_gws['obs'][0, :n_turb, 1:16].std(dim=0).mean().item() > 0}")
+
+    # --- Test both global (obs_dim = 2 + 15 = 17) ---
+    print("\n" + "=" * 60)
+    print("Testing GLOBAL WS+WD (mean_ws + mean_wd + yaw_history)")
+    print("=" * 60)
+    loader_both = create_pretrain_dataloader(
+        files,
+        history_length=15,
+        batch_size=32,
+        num_workers=0,
+        global_ws=True,
+        global_wd=True,
+    )
+    batch_both = next(iter(loader_both))
+    print(f"  obs:           {batch_both['obs'].shape}")        # (32, max_turb, 17)
+    ws_vals = batch_both['obs'][0, :n_turb, 0]
+    wd_vals = batch_both['obs'][0, :n_turb, 1]
+    print(f"  ws identical across turbines: {ws_vals.std().item() < 1e-6}")
+    print(f"  wd identical across turbines: {wd_vals.std().item() < 1e-6}")
+    print(f"  yaw varies across turbines:   {batch_both['obs'][0, :n_turb, 2:].std(dim=0).mean().item() > 0}")
+
+    # --- Test global snapshot mode ---
+    print("\n" + "=" * 60)
+    print("Testing GLOBAL WS snapshot dataset")
     print("=" * 60)
     loader_snap = create_pretrain_dataloader(
         files,
         snapshot_mode=True,
         batch_size=32,
-        # num_workers=0,
-        use_wd_deviation=True,
-        use_wind_relative_pos=True,
-        rotate_profiles=True,
+        global_ws=True,
     )
     batch_snap = next(iter(loader_snap))
-    print(f"  obs:           {batch_snap['obs'].shape}")       # (32, max_turb, 4)
-    print(f"  target_power:  {batch_snap['target_power'].shape}")
+    print(f"  obs:           {batch_snap['obs'].shape}")
     print(f"  obs range:     [{batch_snap['obs'].min():.3f}, {batch_snap['obs'].max():.3f}]")
-
-    print("\n" + "=" * 60)
-    print("\nChecking raw data ranges from the first file (should match expected physical ranges):")
-    print("\n" + "=" * 60)
-    with h5py.File(files[0], "r") as f:
-        ep_key = sorted(f["episodes"].keys())[0]
-        ep = f[f"episodes/{ep_key}"]
-        for feat in ["ws", "wd", "yaw", "power"]:
-            data = ep[feat][:]
-            print(f"  {feat:6s}: [{data.min():.3f}, {data.max():.3f}]")
 
     print("\nAll good!")
