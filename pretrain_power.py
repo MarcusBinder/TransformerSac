@@ -1183,7 +1183,7 @@ def main():
             "n_params": n_params,
             "n_layout_files": len(files),
         }, allow_val_change=True)
-        wandb.watch(model, log="all", log_freq=100)
+        wandb.watch(model, log="all", log_freq=500)
 
     # --- Optimizer ---
     optimizer = torch.optim.AdamW(
