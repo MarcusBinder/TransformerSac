@@ -44,7 +44,7 @@ import h5py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, Subset
 from glob import glob
 from pathlib import Path
 
@@ -306,10 +306,14 @@ class WindFarmBCDataset(Dataset):
             max_turbines = max(all_n_turbs) if all_n_turbs else 0
         self.max_turbines = max_turbines
 
+        # Episode boundaries: list of (start_idx, end_idx, layout_file, ep_key)
+        self.episode_boundaries = []
+
         for fpath in layout_files:
             self._load_layout(fpath)
 
-        print(f"  Total BC samples: {len(self.samples)}")
+        print(f"  Total BC samples: {len(self.samples)} "
+              f"from {len(self.episode_boundaries)} episodes")
 
     def _load_layout(self, fpath: str):
         """Load all episodes from a single layout file."""
@@ -391,6 +395,7 @@ class WindFarmBCDataset(Dataset):
 
                 # Create sliding window samples
                 H = self.history_length
+                ep_start = len(self.samples)
                 for t in range(H - 1, n_steps):
                     # Build obs: (max_turbines, n_features × H)
                     # For each feature, take history [t-H+1, ..., t] per turbine
@@ -412,11 +417,69 @@ class WindFarmBCDataset(Dataset):
 
                     self.samples.append(sample)
 
+                ep_end = len(self.samples)
+                if ep_end > ep_start:
+                    self.episode_boundaries.append(
+                        (ep_start, ep_end, fpath, ep_key)
+                    )
+
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         return self.samples[idx]
+
+    def episode_split(
+        self,
+        val_fraction: float = 0.1,
+        seed: int = 42,
+    ) -> Tuple["Subset", "Subset"]:
+        """
+        Split into train/val by entire episodes (no window overlap leakage).
+
+        Episodes are shuffled and assigned to val until the cumulative sample
+        count reaches val_fraction of the total. This guarantees that no two
+        sliding windows from the same episode end up in different splits.
+
+        Args:
+            val_fraction: Target fraction of *samples* in the validation set.
+            seed: Random seed for reproducible episode shuffling.
+
+        Returns:
+            (train_subset, val_subset) as torch Subset views into this dataset.
+        """
+        n_episodes = len(self.episode_boundaries)
+        if n_episodes == 0:
+            raise ValueError("No episodes loaded — cannot split.")
+
+        rng = np.random.RandomState(seed)
+        ep_indices = rng.permutation(n_episodes)
+
+        target_val_samples = int(len(self.samples) * val_fraction)
+        val_sample_ids = []
+        train_sample_ids = []
+        val_ep_count = 0
+
+        for ep_idx in ep_indices:
+            start, end, _, _ = self.episode_boundaries[ep_idx]
+            ep_sample_ids = list(range(start, end))
+
+            if len(val_sample_ids) < target_val_samples:
+                val_sample_ids.extend(ep_sample_ids)
+                val_ep_count += 1
+            else:
+                train_sample_ids.extend(ep_sample_ids)
+
+        # Diagnostics
+        n_train_ep = n_episodes - val_ep_count
+        print(f"  Episode split: {n_train_ep} train episodes ({len(train_sample_ids)} samples), "
+              f"{val_ep_count} val episodes ({len(val_sample_ids)} samples)")
+
+        # Sanity check
+        assert len(train_sample_ids) + len(val_sample_ids) == len(self.samples), \
+            "Episode split lost samples — boundary tracking bug"
+
+        return Subset(self, train_sample_ids), Subset(self, val_sample_ids)
 
 
 # =============================================================================
@@ -829,13 +892,13 @@ def main():
         print("ERROR: No valid samples found. Check data and history_length.")
         return
 
-    # Train/val split
-    n_val = int(len(dataset) * args.val_split)
-    n_train = len(dataset) - n_val
-    train_set, val_set = random_split( #TODO dont use random_split. We should split the training and validation based on episodes or layouts, not randomly across samples.
-        dataset, [n_train, n_val],
-        generator=torch.Generator().manual_seed(args.seed),
+    # Train/val split (by episode to avoid window-overlap leakage)
+    train_set, val_set = dataset.episode_split(
+        val_fraction=args.val_split,
+        seed=args.seed,
     )
+    n_train = len(train_set)
+    n_val = len(val_set)
     print(f"Train: {n_train} samples, Val: {n_val} samples")
 
     train_loader = DataLoader(
