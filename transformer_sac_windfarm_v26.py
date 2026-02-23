@@ -62,6 +62,7 @@ POSITIONAL ENCODING OPTIONS (--pos_encoding_type):
 - "RelativePositionalBiasWithWind": Relative bias incorporating wind direction
 
 MAIN TASKS:
+[ ] Also load in the action heads, if pretrained encoder checkpoint contains them (for full fine-tuning, not just encoder pretraining) TODO at least if we did BC
 [ ] Consider separate profile encoder instances for target networks if profiles become wind-direction-dependent (e.g. FourierProfileEncoderWithContext). Currently shared = soft-update is a no-op for encoder params.
 [ ] Implement FourierProfileEncoderWithContext that takes wind direction as input
 [ ] Add RelativePositionalBiasWithWind that takes wind direction as input
