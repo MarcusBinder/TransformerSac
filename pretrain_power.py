@@ -366,6 +366,10 @@ def collect_plot_data(model, dataset, device, n_samples=256, batch_size=64):
 
     all_pred, all_target, all_pos, all_mask, all_embed, all_obs = [], [], [], [], [], []
     all_attn = None
+    all_recep_embed, all_influence_embed, all_profile_embed = [], [], []
+
+    actor = model.actor
+    has_profiles = actor.recep_encoder is not None
 
     for batch in loader:
         batch_dev = {k: v.to(device) if isinstance(v, torch.Tensor) else v
@@ -373,6 +377,20 @@ def collect_plot_data(model, dataset, device, n_samples=256, batch_size=64):
 
         with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
             pred, embed, attn = model(batch_dev, need_weights=True)
+
+            # Collect profile embeddings if available
+            if has_profiles and "receptivity" in batch_dev and "influence" in batch_dev:
+                recep_emb = actor.recep_encoder(batch_dev["receptivity"])
+                infl_emb = actor.influence_encoder(batch_dev["influence"])
+                if actor.profile_fusion_type == "joint":
+                    prof_emb = actor.profile_fusion(
+                        torch.cat([recep_emb, infl_emb], dim=-1)
+                    )
+                else:
+                    prof_emb = recep_emb + infl_emb
+                all_recep_embed.append(recep_emb.cpu().float())
+                all_influence_embed.append(infl_emb.cpu().float())
+                all_profile_embed.append(prof_emb.cpu().float())
 
         all_pred.append(pred.cpu().float())
         all_target.append(batch["target_power"])
@@ -386,7 +404,7 @@ def collect_plot_data(model, dataset, device, n_samples=256, batch_size=64):
         for layer_idx, aw in enumerate(attn):
             all_attn[layer_idx].append(aw.cpu().float())
 
-    return {
+    out = {
         "predicted_power": torch.cat(all_pred).numpy(),
         "target_power": torch.cat(all_target).numpy(),
         "positions": torch.cat(all_pos).numpy(),
@@ -395,6 +413,13 @@ def collect_plot_data(model, dataset, device, n_samples=256, batch_size=64):
         "obs": torch.cat(all_obs).numpy(),
         "attn_weights": [torch.cat(layer_list).numpy() for layer_list in all_attn],
     }
+
+    if all_recep_embed:
+        out["recep_embed"] = torch.cat(all_recep_embed).numpy()
+        out["influence_embed"] = torch.cat(all_influence_embed).numpy()
+        out["profile_embed"] = torch.cat(all_profile_embed).numpy()
+
+    return out
 
 
 # =============================================================================
@@ -527,7 +552,18 @@ def fig_pred_vs_actual(results):
 
 
 def fig_error_heatmap(results):
-    """Per-turbine MAE plotted on the farm grid, side-by-side with mean power."""
+    """
+    Per-turbine error plotted on the farm grid:
+      - Absolute MAE
+      - Mean target power
+      - Relative error (NMAE = MAE / mean_power), showing error as a
+        fraction of each turbine's operating point. This normalizes out
+        the effect of different power levels — a turbine at 80% capacity
+        with 0.02 MAE is doing better than one at 10% with the same MAE.
+
+    Returns (fig, scalar_stats) where scalar_stats contains farm-wide
+    summary metrics for wandb logging.
+    """
     pred = results["predicted_power"]
     target = results["target_power"]
     pos = results["positions"]
@@ -540,6 +576,7 @@ def fig_error_heatmap(results):
     # Per-turbine averages
     turbine_mae = np.zeros(n_turbines)
     avg_power = np.zeros(n_turbines)
+    turbine_nmae = np.zeros(n_turbines)
     avg_pos = np.zeros((n_turbines, 2))
     active = np.zeros(n_turbines, dtype=bool)
 
@@ -550,21 +587,33 @@ def fig_error_heatmap(results):
             avg_power[t] = target[valid, t].mean()
             avg_pos[t] = pos[valid, t].mean(axis=0)
             active[t] = True
+            # Relative error: MAE / mean_power (guard against near-zero power)
+            if avg_power[t] > 1e-4:
+                turbine_nmae[t] = turbine_mae[t] / avg_power[t]
+            else:
+                turbine_nmae[t] = 0.0
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+    # Farm-wide scalar stats
+    stats = {}
+    if active.any():
+        stats["val/farm_mae"] = float(turbine_mae[active].mean())
+        stats["val/farm_nmae"] = float(turbine_nmae[active].mean())
+        stats["val/farm_nmae_max"] = float(turbine_nmae[active].max())
 
-    # Left: MAE
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(19, 5))
+
+    # Left: Absolute MAE
     sc1 = ax1.scatter(avg_pos[active, 0], avg_pos[active, 1], c=turbine_mae[active],
                        cmap="hot_r", s=250, edgecolors="black", linewidth=1.0, zorder=5)
     for t in np.where(active)[0]:
         ax1.annotate(f"{turbine_mae[t]:.4f}", avg_pos[t], fontsize=6,
                      ha="center", va="center", zorder=6)
     fig.colorbar(sc1, ax=ax1, label="MAE")
-    ax1.set_title("Per-Turbine MAE")
+    ax1.set_title("Per-Turbine MAE (absolute)")
     ax1.set_aspect("equal")
     ax1.grid(True, alpha=0.3)
 
-    # Right: Mean power
+    # Center: Mean power
     sc2 = ax2.scatter(avg_pos[active, 0], avg_pos[active, 1], c=avg_power[active],
                        cmap="viridis", s=250, edgecolors="black", linewidth=1.0, zorder=5)
     for t in np.where(active)[0]:
@@ -575,47 +624,61 @@ def fig_error_heatmap(results):
     ax2.set_aspect("equal")
     ax2.grid(True, alpha=0.3)
 
+    # Right: Relative error (NMAE = MAE / mean_power)
+    sc3 = ax3.scatter(avg_pos[active, 0], avg_pos[active, 1], c=turbine_nmae[active],
+                       cmap="hot_r", s=250, edgecolors="black", linewidth=1.0, zorder=5)
+    for t in np.where(active)[0]:
+        ax3.annotate(f"{turbine_nmae[t]:.1%}", avg_pos[t], fontsize=6,
+                     ha="center", va="center", zorder=6)
+    fig.colorbar(sc3, ax=ax3, label="NMAE (MAE / Power)")
+    ax3.set_title("Per-Turbine NMAE (relative)")
+    ax3.set_aspect("equal")
+    ax3.grid(True, alpha=0.3)
+
     fig.suptitle("Error & Power Distribution Across Farm", fontsize=12)
     fig.tight_layout()
-    return fig
+    return fig, stats
 
 
-def fig_attention_entropy(results):
-    """Attention entropy per layer/head — lower = more structured attention."""
+def compute_attention_entropy(results):
+    """
+    Compute attention entropy per layer/head as scalar metrics.
+
+    Returns a dict of floats suitable for direct wandb.log(), which
+    produces native interactive line charts over epochs — much more
+    useful for tracking than a static matplotlib figure.
+
+    Keys:
+        attn_entropy/L{l}_H{h}:  per layer/head
+        attn_entropy/L{l}_mean:  per layer mean
+        attn_entropy/mean:       global mean
+        attn_entropy/uniform:    uniform baseline (log N)
+    """
     mask = results["attention_mask"]
     n_layers = len(results["attn_weights"])
     real = ~mask  # (S, N)
 
     eps = 1e-8
-    layer_entropies = []
+    stats = {}
+    all_means = []
+
+    n_real_avg = real.sum(axis=1).mean()
+    stats["attn_entropy/uniform"] = float(np.log(n_real_avg))
+
     for l in range(n_layers):
         attn = results["attn_weights"][l]  # (S, H, N, N)
         entropy = -(attn * np.log(attn + eps)).sum(axis=-1)  # (S, H, N)
         real_exp = real[:, np.newaxis, :]  # (S, 1, N)
         per_head = (entropy * real_exp).sum(axis=(0, 2)) / real_exp.sum(axis=(0, 2))  # (H,)
-        layer_entropies.append(per_head)
 
-    layer_entropies = np.array(layer_entropies)  # (L, H)
-    n_heads = layer_entropies.shape[1]
-    n_real_avg = real.sum(axis=1).mean()
-    uniform_entropy = np.log(n_real_avg)
+        for h in range(len(per_head)):
+            stats[f"attn_entropy/L{l}_H{h}"] = float(per_head[h])
+        layer_mean = float(per_head.mean())
+        stats[f"attn_entropy/L{l}_mean"] = layer_mean
+        all_means.append(layer_mean)
 
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    for h in range(n_heads):
-        ax.plot(range(n_layers), layer_entropies[:, h], "o-", alpha=0.4,
-                markersize=4, label=f"Head {h}")
-    ax.plot(range(n_layers), layer_entropies.mean(axis=1), "k^-",
-            linewidth=2.5, markersize=8, label="Mean", zorder=10)
-    ax.axhline(uniform_entropy, color="red", linestyle="--", alpha=0.5,
-               label=f"Uniform ({uniform_entropy:.2f})")
-    ax.set_xlabel("Layer")
-    ax.set_ylabel("Entropy (nats)")
-    ax.set_title("Attention Entropy (lower = more focused)")
-    ax.set_xticks(range(n_layers))
-    ax.legend(fontsize=7, ncol=2)
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    return fig
+    stats["attn_entropy/mean"] = float(np.mean(all_means))
+    return stats
 
 
 def fig_embedding_tsne(results, perplexity=30, max_points=2000):
@@ -665,6 +728,138 @@ def fig_embedding_tsne(results, perplexity=30, max_points=2000):
     return fig
 
 
+def fig_profile_embeddings(results, sample_indices=None):
+    """
+    Profile encoding diagnostics:
+      - Per-turbine embedding norms (receptivity, influence, fused)
+      - Pairwise cosine similarity of fused profile embeddings
+      - Comparison: do nearby turbines get similar profiles?
+
+    This reveals whether the profile encoder differentiates turbines
+    spatially — the main signal it provides to the transformer.
+
+    Returns (fig, scalar_stats) where scalar_stats is a dict of
+    summary metrics suitable for wandb logging.
+    """
+    if "profile_embed" not in results:
+        return None, {}
+
+    profile_embed = results["profile_embed"]   # (S, N, D)
+    recep_embed = results["recep_embed"]       # (S, N, D)
+    influence_embed = results["influence_embed"]  # (S, N, D)
+    mask = results["attention_mask"]            # (S, N) bool
+    positions = results["positions"]            # (S, N, 2)
+    real = ~mask
+
+    # --- Scalar stats (averaged over all real turbines) ---
+    stats = {}
+
+    def _masked_norm_stats(embed, name):
+        norms = np.linalg.norm(embed, axis=-1)  # (S, N)
+        real_norms = norms[real]
+        stats[f"profile/{name}_norm_mean"] = float(real_norms.mean())
+        stats[f"profile/{name}_norm_std"] = float(real_norms.std())
+        return norms
+
+    fused_norms = _masked_norm_stats(profile_embed, "fused")
+    recep_norms = _masked_norm_stats(recep_embed, "receptivity")
+    infl_norms = _masked_norm_stats(influence_embed, "influence")
+
+    # --- Pick sample indices for visualization ---
+    n_samples = profile_embed.shape[0]
+    if sample_indices is None:
+        sample_indices = np.linspace(0, n_samples - 1, min(3, n_samples), dtype=int)
+
+    # We visualize for the first sample
+    si = sample_indices[0]
+    n_real_i = int(real[si].sum())
+    prof_i = profile_embed[si, :n_real_i]   # (n_real, D)
+    pos_i = positions[si, :n_real_i]         # (n_real, 2)
+    recep_i = recep_embed[si, :n_real_i]
+    infl_i = influence_embed[si, :n_real_i]
+
+    # Cosine similarity matrix
+    def _cosine_sim(a):
+        norms = np.linalg.norm(a, axis=-1, keepdims=True)
+        norms = np.clip(norms, 1e-8, None)
+        a_normed = a / norms
+        return a_normed @ a_normed.T
+
+    cos_sim_fused = _cosine_sim(prof_i)
+    cos_sim_recep = _cosine_sim(recep_i)
+    cos_sim_infl = _cosine_sim(infl_i)
+
+    # Distance matrix for correlation check
+    dx = pos_i[:, 0:1] - pos_i[:, 0:1].T
+    dy = pos_i[:, 1:2] - pos_i[:, 1:2].T
+    dist_matrix = np.sqrt(dx**2 + dy**2)
+
+    # Correlation between spatial distance and embedding similarity
+    triu_idx = np.triu_indices(n_real_i, k=1)
+    if len(triu_idx[0]) > 1:
+        dists_flat = dist_matrix[triu_idx]
+        sims_flat = cos_sim_fused[triu_idx]
+        corr = np.corrcoef(dists_flat, sims_flat)[0, 1]
+        stats["profile/dist_sim_correlation"] = float(corr)
+
+    # Off-diagonal mean similarity (lower = more differentiated)
+    off_diag_fused = cos_sim_fused[triu_idx].mean() if len(triu_idx[0]) > 0 else 0.0
+    stats["profile/mean_off_diag_cosine_sim"] = float(off_diag_fused)
+
+    # --- Figure: 2×2 grid ---
+    fig, axes = plt.subplots(2, 2, figsize=(13, 11))
+
+    # Top-left: fused profile cosine similarity heatmap
+    im0 = axes[0, 0].imshow(cos_sim_fused, cmap="RdBu_r", vmin=-1, vmax=1, aspect="equal")
+    axes[0, 0].set_title("Fused Profile Cosine Similarity")
+    axes[0, 0].set_xlabel("Turbine")
+    axes[0, 0].set_ylabel("Turbine")
+    fig.colorbar(im0, ax=axes[0, 0], shrink=0.8)
+
+    # Top-right: receptivity vs influence cosine sim (side by side as triangles)
+    combined = np.zeros_like(cos_sim_fused)
+    combined[np.triu_indices(n_real_i, k=0)] = cos_sim_recep[np.triu_indices(n_real_i, k=0)]
+    combined[np.tril_indices(n_real_i, k=-1)] = cos_sim_infl[np.tril_indices(n_real_i, k=-1)]
+    im1 = axes[0, 1].imshow(combined, cmap="RdBu_r", vmin=-1, vmax=1, aspect="equal")
+    axes[0, 1].set_title("Recep (upper △) vs Influence (lower △)")
+    axes[0, 1].set_xlabel("Turbine")
+    axes[0, 1].set_ylabel("Turbine")
+    fig.colorbar(im1, ax=axes[0, 1], shrink=0.8)
+
+    # Bottom-left: embedding norms on the farm layout
+    norm_i = np.linalg.norm(prof_i, axis=-1)
+    sc2 = axes[1, 0].scatter(
+        pos_i[:, 0], pos_i[:, 1], c=norm_i, cmap="plasma",
+        s=200, edgecolors="black", linewidth=1.0, zorder=5,
+    )
+    for t in range(n_real_i):
+        axes[1, 0].annotate(f"{norm_i[t]:.2f}", pos_i[t], fontsize=6,
+                            ha="center", va="center", color="white",
+                            fontweight="bold", zorder=6)
+    fig.colorbar(sc2, ax=axes[1, 0], shrink=0.8, label="L2 Norm")
+    axes[1, 0].set_title("Fused Profile Embedding Norms")
+    axes[1, 0].set_aspect("equal")
+    axes[1, 0].grid(True, alpha=0.3)
+
+    # Bottom-right: spatial distance vs embedding similarity scatter
+    if len(triu_idx[0]) > 1:
+        axes[1, 1].scatter(dists_flat, sims_flat, s=12, alpha=0.5, color="steelblue")
+        # Trend line
+        z = np.polyfit(dists_flat, sims_flat, 1)
+        x_line = np.linspace(dists_flat.min(), dists_flat.max(), 50)
+        axes[1, 1].plot(x_line, np.polyval(z, x_line), "r--", alpha=0.7,
+                        label=f"r = {stats.get('profile/dist_sim_correlation', 0):.3f}")
+        axes[1, 1].legend(fontsize=8)
+    axes[1, 1].set_xlabel("Spatial Distance (norm)")
+    axes[1, 1].set_ylabel("Cosine Similarity")
+    axes[1, 1].set_title("Distance vs. Profile Similarity")
+    axes[1, 1].grid(True, alpha=0.3)
+
+    fig.suptitle(f"Profile Encoding Diagnostics (sample {si})", fontsize=13)
+    fig.tight_layout()
+    return fig, stats
+
+
 # =============================================================================
 # ORCHESTRATOR: generate all plots and log to wandb
 # =============================================================================
@@ -710,21 +905,21 @@ def generate_diagnostic_plots(
     except Exception as e:
         print(f"    Warning: scatter plot failed: {e}")
 
-    # 3. Error heatmap
+    # 3. Error heatmap (with NMAE relative error panel)
     try:
-        fig = fig_error_heatmap(results)
+        fig, error_stats = fig_error_heatmap(results)
         images["plots/error_heatmap"] = wandb.Image(fig)
         plt.close(fig)
+        images.update(error_stats)
     except Exception as e:
         print(f"    Warning: error heatmap failed: {e}")
 
-    # 4. Attention entropy
+    # 4. Attention entropy (as scalar metrics for native wandb line charts)
     try:
-        fig = fig_attention_entropy(results)
-        images["plots/attention_entropy"] = wandb.Image(fig)
-        plt.close(fig)
+        entropy_stats = compute_attention_entropy(results)
+        images.update(entropy_stats)
     except Exception as e:
-        print(f"    Warning: entropy plot failed: {e}")
+        print(f"    Warning: entropy computation failed: {e}")
 
     # 5. Embedding t-SNE (skip if sklearn missing or too slow)
     try:
@@ -734,6 +929,17 @@ def generate_diagnostic_plots(
             plt.close(fig)
     except Exception as e:
         print(f"    Warning: t-SNE plot failed: {e}")
+
+    # 6. Profile embedding diagnostics (if profiles are enabled)
+    try:
+        fig, profile_stats = fig_profile_embeddings(results)
+        if fig is not None:
+            images["plots/profile_embeddings"] = wandb.Image(fig)
+            plt.close(fig)
+        # Add scalar profile stats to the image dict so they get logged
+        images.update(profile_stats)
+    except Exception as e:
+        print(f"    Warning: profile embedding plot failed: {e}")
 
     dt = time.time() - t0
     print(f"  Generated {len(images)} plot(s) in {dt:.1f}s")
@@ -754,7 +960,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, log_wandb=False, sc
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                  for k, v in batch.items()}
 
-        with torch.amp.autocast("cuda"):
+        with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
             predicted_power, _, _ = model(batch, need_weights=False)
             loss = masked_mse_loss(
                 predicted_power,
@@ -779,7 +985,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, log_wandb=False, sc
                 "train/step_loss": loss.item(),
                 "train/grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
                 "global_step": global_step,
-            }, step=global_step)
+            })
 
     return total_loss / max(n_batches, 1)
 
@@ -795,7 +1001,7 @@ def evaluate(model, loader, device):
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                  for k, v in batch.items()}
 
-        with torch.amp.autocast("cuda"):
+        with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
             predicted_power, _, _ = model(batch, need_weights=False)
 
         real_mask = ~batch["attention_mask"]
@@ -977,7 +1183,7 @@ def main():
             "n_params": n_params,
             "n_layout_files": len(files),
         }, allow_val_change=True)
-        wandb.watch(model, log="gradients", log_freq=100)
+        wandb.watch(model, log="all", log_freq=100)
 
     # --- Optimizer ---
     optimizer = torch.optim.AdamW(
@@ -989,7 +1195,7 @@ def main():
         optimizer, T_max=args.epochs, eta_min=args.lr * 0.01
     )
 
-    scaler = torch.amp.GradScaler("cuda")  # Add scaler for mixed precision (if using CUDA)
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
     # --- Output dir ---
     os.makedirs(args.save_dir, exist_ok=True)
