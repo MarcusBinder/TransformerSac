@@ -637,7 +637,7 @@ def fig_embedding_tsne(results, perplexity=30, max_points=2000):
         emb_flat, pow_flat, pos_flat = emb_flat[idx], pow_flat[idx], pos_flat[idx]
 
     tsne = TSNE(n_components=2, perplexity=min(perplexity, len(emb_flat) // 4),
-                random_state=42, n_iter=800)
+                random_state=42, max_iter=800)
     emb_2d = tsne.fit_transform(emb_flat)
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
