@@ -2530,7 +2530,30 @@ def main():
                 batch_receptivity = data.get("receptivity", None)
                 batch_influence = data.get("influence", None)
 
-
+                # === TEMPORARY DEBUG (remove after fix) ===
+                if total_gradient_steps == 0:
+                    print(f"[DEBUG] PyTorch version: {torch.__version__}")
+                    print(f"[DEBUG] Device: {data['next_observations'].device}")
+                    for k, v in data.items():
+                        if isinstance(v, torch.Tensor) and v.is_floating_point():
+                            print(f"[DEBUG] data[{k}]: NaN={torch.isnan(v).any().item()}, "
+                                f"Inf={torch.isinf(v).any().item()}, dtype={v.dtype}")
+                    
+                    # Test forward pass explicitly
+                    test_mean, test_ls, _ = actor.forward(
+                        data["next_observations"], data["positions"], 
+                        data["attention_mask"],
+                        recep_profile=batch_receptivity,
+                        influence_profile=batch_influence,
+                    )
+                    print(f"[DEBUG] actor mean NaN={torch.isnan(test_mean).any().item()}, "
+                        f"log_std NaN={torch.isnan(test_ls).any().item()}")
+                    
+                    # Check weight health
+                    nan_params = [(n, p.shape) for n, p in actor.named_parameters() if torch.isnan(p).any()]
+                    if nan_params:
+                        print(f"[DEBUG] NaN in actor params: {nan_params}")
+                # === END DEBUG ===
                 # -----------------------------------------------------------------
                 # Update Critics
                 # -----------------------------------------------------------------
@@ -2639,7 +2662,18 @@ def main():
                             max_norm=args.grad_clip_max_norm
                         )
                     actor_optimizer.step()
-
+                    # After line 2641 (actor_optimizer.step()):
+                    if any(torch.isnan(p).any() for p in actor.parameters()):
+                        print(f"[NaN DETECTED] Step {global_step}, grad_step {total_gradient_steps}")
+                        print(f"  actor_loss: {actor_loss.item()}")
+                        print(f"  qf1_loss: {qf1_loss.item()}, qf2_loss: {qf2_loss.item()}")
+                        print(f"  alpha: {alpha}")
+                        for n, p in actor.named_parameters():
+                            if torch.isnan(p).any():
+                                print(f"  NaN param: {n}, shape={p.shape}")
+                        # Save the offending batch for analysis
+                        torch.save(data, f"debug_nan_batch_step{global_step}.pt")
+                        raise RuntimeError("NaN in actor weights after optimizer step")
                     if debug_logger.should_log_gradients(total_gradient_steps):
                         debug_logger.log_actor_gradient_norms(actor, writer, global_step)
 
