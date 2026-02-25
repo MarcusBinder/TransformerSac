@@ -415,9 +415,9 @@ def evaluate_run_on_layout(run_name, eval_layout, n_envs):
 if __name__ == "__main__":
 
     # ---- Configuration ----
-    BASE_DIR = "/project/project_465002609/nilsenma/runs"
-    OUTPUT_DIR = "/project/project_465002609/nilsenma/evals"
-    TURBBOX_PATH = "/project/project_465002609/nilsenma/Boxes/V80env/"  # <-- UPDATE if different on LUMI
+    BASE_DIR = "/users/nilsenma/runs"
+    OUTPUT_DIR = "/users/nilsenma/evals"
+    TURBBOX_PATH = "/users/nilsenma/Boxes/V80env/"  # <-- UPDATE if different on LUMI
 
     INPUT_SEED = 42
     N_ENVS = 20          # 100 episodes / 20 envs = 5 batches
