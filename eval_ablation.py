@@ -296,22 +296,23 @@ def evaluate_run_on_layout(run_name, eval_layout, n_envs):
     actor = TransformerActor(
         obs_dim_per_turbine=obs_dim_per_turbine,
         action_dim_per_turbine=1,
-        embed_dim=args["embed_dim"],
-        pos_embed_dim=args["pos_embed_dim"],
-        num_heads=args["num_heads"],
-        num_layers=args["num_layers"],
-        mlp_ratio=args["mlp_ratio"],
+        embed_dim=args_ns.embed_dim,
+        pos_embed_dim=args_ns.pos_embed_dim,
+        num_heads=args_ns.num_heads,
+        num_layers=args_ns.num_layers,
+        mlp_ratio=args_ns.mlp_ratio,
         dropout=0.0,
         action_scale=action_scale,
         action_bias=action_bias,
-        pos_encoding_type=args["pos_encoding_type"],
-        rel_pos_hidden_dim=args["rel_pos_hidden_dim"],
-        rel_pos_per_head=args["rel_pos_per_head"],
-        pos_embedding_mode=args["pos_embedding_mode"],
-        profile_encoding=args["profile_encoding_type"],
-        profile_encoder_hidden=args["profile_encoder_hidden"],
-        n_profile_directions=args["n_profile_directions"],
-        profile_fusion_type=args["profile_fusion_type"],
+        pos_encoding_type=args_ns.pos_encoding_type,
+        rel_pos_hidden_dim=args_ns.rel_pos_hidden_dim,
+        rel_pos_per_head=args_ns.rel_pos_per_head,
+        pos_embedding_mode=args_ns.pos_embedding_mode,
+        profile_encoding=args_ns.profile_encoding_type,
+        profile_encoder_hidden=args_ns.profile_encoder_hidden,
+        n_profile_directions=args_ns.n_profile_directions,
+        profile_fusion_type=args_ns.profile_fusion_type,
+        profile_embed_mode=args_ns.profile_embed_mode,
         shared_recep_encoder=shared_recep_encoder,
         shared_influence_encoder=shared_influence_encoder,
         args=args_ns,
@@ -343,8 +344,13 @@ def evaluate_run_on_layout(run_name, eval_layout, n_envs):
             print(f"    Checkpoint step {step_number} ({file})")
 
         checkpoint, _ = load_actor_from_checkpoint(file_path, device)
-        # actor.load_state_dict(checkpoint["actor_state_dict"])
-        actor.load_state_dict(checkpoint["actor_state_dict"], strict=False)
+        actor.load_state_dict(checkpoint["actor_state_dict"])
+        # actor.load_state_dict(checkpoint["actor_state_dict"], strict=False)
+        # result = actor.load_state_dict(checkpoint["actor_state_dict"], strict=False)
+        # if result.unexpected_keys:
+        #     print(f"    [WARN] Unexpected keys (ignored): {result.unexpected_keys}")
+        # if result.missing_keys:
+        #     print(f"    [WARN] Missing keys (not loaded): {result.missing_keys}")
         actor.eval()
 
         episodes = evaluate_checkpoint_episodes(
