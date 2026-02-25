@@ -343,7 +343,8 @@ def evaluate_run_on_layout(run_name, eval_layout, n_envs):
             print(f"    Checkpoint step {step_number} ({file})")
 
         checkpoint, _ = load_actor_from_checkpoint(file_path, device)
-        actor.load_state_dict(checkpoint["actor_state_dict"])
+        # actor.load_state_dict(checkpoint["actor_state_dict"])
+        actor.load_state_dict(checkpoint["actor_state_dict"], strict=False)
         actor.eval()
 
         episodes = evaluate_checkpoint_episodes(
