@@ -17,8 +17,7 @@ def load_actor_from_checkpoint(checkpoint_path: str, device: torch.device):
     data = torch.load(checkpoint_path, map_location=device, weights_only=False)
     checkpoint = data
     args = data["args"]
-    if hasattr(args, '__dict__'):
-        args = vars(args)
+    # Keep as namespace for attribute access; convert to dict only when needed via vars()
     return checkpoint, args
 
 
@@ -247,7 +246,16 @@ def evaluate_run_on_layout(run_name, eval_layout, n_envs):
 
     # Load args from first checkpoint
     first_path = os.path.join(checkpoint_dir, files[0])
-    _, args = load_actor_from_checkpoint(first_path, device)
+
+    # Convert args to dict for dict-style access where needed,
+    # but keep the original namespace for passing to TransformerActor
+    _, args_ns = load_actor_from_checkpoint(first_path, device)
+    args = vars(args_ns) if hasattr(args_ns, '__dict__') and not isinstance(args_ns, dict) else args_ns
+
+    # _, args = load_actor_from_checkpoint(first_path, device)
+
+    # # Add defaults for keys that may be missing in older checkpoints:
+    # args.setdefault("profile_encoder_kwargs", "{}")
 
     # Create env for eval layout
     env, wind_turbine = create_eval_env(layout=eval_layout, args=args, seed=INPUT_SEED, n_envs=n_envs)
@@ -273,6 +281,17 @@ def evaluate_run_on_layout(run_name, eval_layout, n_envs):
         shared_recep_encoder = None
         shared_influence_encoder = None
 
+
+    # Convert back to namespace for the constructor
+    from argparse import Namespace
+    args_ns = Namespace(**args) if isinstance(args, dict) else args
+
+    # # Fill in defaults for keys missing in older checkpoints
+    # for k, v in {"profile_encoder_kwargs": "{}", "profile_embed_mode": "add"}.items():
+    #     if not hasattr(args_ns, k):
+    #         setattr(args_ns, k, v)
+
+
     # Build actor
     actor = TransformerActor(
         obs_dim_per_turbine=obs_dim_per_turbine,
@@ -295,6 +314,7 @@ def evaluate_run_on_layout(run_name, eval_layout, n_envs):
         profile_fusion_type=args["profile_fusion_type"],
         shared_recep_encoder=shared_recep_encoder,
         shared_influence_encoder=shared_influence_encoder,
+        args=args_ns,
     ).to(device)
 
     agent = WindFarmAgent(
