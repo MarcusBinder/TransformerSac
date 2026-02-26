@@ -1,22 +1,39 @@
 """
-Power Prediction Pretraining for Wind Farm Transformer
+Unified Pretraining for Wind Farm Transformer
 
-Pretrains a transformer encoder to predict per-turbine power output
-from (ws, wd, yaw) + positions + profiles. The learned encoder weights
-can then be transferred to the SAC actor/critic for RL fine-tuning.
+Supports multiple pretraining objectives:
+  1. "power"  – Predict per-turbine power from (ws, wd, yaw) + positions + profiles
+  2. "masked" – BERT-style: mask random turbines and reconstruct their features
+
+Both modes use the REAL TransformerActor backbone so that saved encoder weights
+have identical keys to the RL agent and can be loaded directly.
 
 Includes periodic diagnostic visualizations logged to wandb:
   - Attention maps overlaid on farm layout
-  - Predicted vs. actual power scatter
-  - Per-turbine error heatmap
+  - Predicted vs. actual power scatter (power mode)
+  - Per-turbine error heatmap (power mode)
   - Attention entropy per layer/head
   - t-SNE of token embeddings
+  - Profile embedding diagnostics
 
 Usage:
-    python pretrain_power.py --data-dir ./pretrain_data --epochs 50
-    python pretrain_power.py --data-dir ./pretrain_data --snapshot  # no history
-    python pretrain_power.py --data-dir ./pretrain_data --no-track  # disable wandb
-    python pretrain_power.py --data-dir ./pretrain_data --plot-every 5  # plots every 5 epochs
+    # Power prediction (default)
+    python pretraining.py --pretrain-mode power --data-dir ./pretrain_data
+
+    # Power with global wind features
+    python pretraining.py --pretrain-mode power --global-features ws wd
+
+    # BERT-style masked turbine prediction
+    python pretraining.py --pretrain-mode masked --data-dir ./pretrain_data
+
+    # Masked mode with custom mask ratio and snapshot data
+    python pretraining.py --pretrain-mode masked --mask-ratio 0.25 --snapshot
+
+    # Disable wandb
+    python pretraining.py --no-track
+
+    # Diagnostic plots every 5 epochs
+    python pretraining.py --plot-every 5
 
 Author: Marcus (DTU Wind Energy)
 """
@@ -71,10 +88,14 @@ from transformer_sac_windfarm_v26 import (
 
 @dataclass
 class Args:
-    """Command-line arguments for power prediction pretraining."""
+    """Command-line arguments for wind farm pretraining."""
+
+    # === Pretraining Mode ===
+    pretrain_mode: str = "power"
+    """Pretraining objective: 'power' or 'masked'."""
 
     # === Experiment Settings ===
-    exp_name: str = os.path.basename(__file__)[: -len(".py")]
+    exp_name: str = "pretrain"
     """Experiment name (used for run naming)."""
     seed: int = 42
     """Random seed for reproducibility."""
@@ -99,7 +120,8 @@ class Args:
 
     # === Preprocessing ===
     features: List[str] = field(default_factory=lambda: ["ws", "wd", "yaw"])
-    """Input features for pretraining (power is always the target, not an input)."""
+    """Input features for pretraining. In power mode, power is always the target
+    (not an input). In masked mode, 'power' is automatically added if missing."""
     global_features: List[str] = field(default_factory=list)
     """Features to replace with episode-level scalars (broadcast to all turbines).
     E.g. ["ws", "wd"] uses global mean_ws/mean_wd instead of per-turbine history."""
@@ -152,6 +174,17 @@ class Args:
     profile_encoder_kwargs: str = "{}"
     """JSON string of encoder-specific kwargs."""
 
+    # === BERT-style Masking (masked mode only) ===
+    mask_ratio: float = 0.20
+    """Fraction of real turbines to mask per sample."""
+    mask_replace_prob: float = 0.80
+    """Probability of replacing masked token with [MASK] embedding."""
+    mask_random_prob: float = 0.10
+    """Probability of replacing masked token with random noise."""
+    # Remaining (1 - replace - random) = keep original but still predict.
+    predict_power_weight: float = 1.0
+    """Weight for power features in masked reconstruction loss (vs other features)."""
+
     # === Training Hyperparameters ===
     epochs: int = 50
     """Number of training epochs."""
@@ -163,8 +196,7 @@ class Args:
     """AdamW weight decay."""
     val_split: float = 0.1
     """Fraction of data held out for validation."""
-    # num_workers: int = 4  # Removed. We just load it all into ram now.
-    # """DataLoader workers."""
+    # Data is loaded into RAM — no num_workers needed.
 
     # === Output / Checkpointing ===
     save_dir: str = "./pretrain_checkpoints"
@@ -188,7 +220,7 @@ class Args:
 
 
 # =============================================================================
-# PRETRAINING MODEL (real TransformerActor backbone + power head)
+# SHARED UTILITIES
 # =============================================================================
 
 # Keys that belong to the actor head, NOT the encoder
@@ -203,12 +235,81 @@ def get_encoder_state_dict(actor: TransformerActor) -> dict:
     }
 
 
+def _encode_with_actor(
+    actor: TransformerActor,
+    obs: torch.Tensor,
+    positions: torch.Tensor,
+    attention_mask: torch.Tensor,
+    receptivity: torch.Tensor = None,
+    influence: torch.Tensor = None,
+    need_weights: bool = False,
+) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    """
+    Run the actor's encoder path (everything before the action heads).
+    Replicates lines 958-1004 of the RL script.
+
+    Args:
+        need_weights: If True, return per-layer attention weights for
+                      visualization. Slightly slower due to attention
+                      weight computation.
+
+    Returns:
+        h: (B, N, embed_dim) contextualised token embeddings
+        attn_weights: list of (B, H, N, N) per layer (empty if need_weights=False)
+    """
+    # 1. Encode observations
+    h = actor.obs_encoder(obs)  # (B, N, embed_dim)
+
+    # 2. Positional encoding
+    if actor.embedding_mode == "concat" and actor.pos_encoder is not None:
+        pos_embed = actor.pos_encoder(positions)
+        h = torch.cat([h, pos_embed], dim=-1)
+    elif actor.embedding_mode == "add" and actor.pos_encoder is not None:
+        pos_embed = actor.pos_encoder(positions)
+        h = h + pos_embed
+
+    # 3. Project to embed_dim
+    h = actor.input_proj(h)
+
+    # 4. Profile encoding
+    if actor.recep_encoder and receptivity is not None and influence is not None:
+        recep_embed = actor.recep_encoder(receptivity)
+        influence_embed = actor.influence_encoder(influence)
+
+        if actor.profile_fusion_type == "joint":
+            profile_embed = actor.profile_fusion(
+                torch.cat([recep_embed, influence_embed], dim=-1)
+            )
+        else:
+            profile_embed = recep_embed + influence_embed
+
+        if actor.profile_embed_mode == "concat":
+            h = actor.profile_proj(torch.cat([h, profile_embed], dim=-1))
+        else:
+            h = h + profile_embed
+
+    # 5. Relative position bias
+    attn_bias = None
+    if actor.rel_pos_bias is not None:
+        attn_bias = actor.rel_pos_bias(positions, attention_mask)
+
+    # 6. Transformer
+    h, attn_weights = actor.transformer(
+        h, attention_mask, attn_bias, need_weights=need_weights
+    )
+
+    return h, attn_weights
+
+
+# =============================================================================
+# MODE 1: POWER PREDICTION MODEL
+# =============================================================================
+
 class PowerPredictionModel(nn.Module):
     """
-    Wraps the REAL TransformerActor backbone + power prediction head.
+    Wraps the REAL TransformerActor backbone + a power prediction head.
 
-    Uses the actor's encoder path (obs_encoder → pos_encoder → input_proj
-    → profiles → transformer) so that saved weights have identical keys
+    Uses the actor's encoder path so that saved weights have identical keys
     to the RL agent. The power_head is discarded after pretraining.
     """
 
@@ -220,73 +321,6 @@ class PowerPredictionModel(nn.Module):
             nn.GELU(),
             nn.Linear(actor.embed_dim // 2, 1),
         )
-
-    def _encode(
-        self,
-        obs: torch.Tensor,
-        positions: torch.Tensor,
-        attention_mask: torch.Tensor,
-        receptivity: torch.Tensor = None,
-        influence: torch.Tensor = None,
-        need_weights: bool = False,
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        """
-        Replicate the actor's encoder path (forward up to transformer output).
-        This is lines 958-1004 of the RL script, minus the action heads. (mostly)
-
-        Args:
-            need_weights: If True, return per-layer attention weights for
-                          visualization. Slightly slower due to attention
-                          weight computation.
-
-        Returns:
-            h: (B, N, embed_dim) transformer output
-            attn_weights: list of (B, H, N, N) per layer (empty if need_weights=False)
-        """
-        actor = self.actor
-
-        # 1. Encode observations
-        h = actor.obs_encoder(obs)  # (B, N, embed_dim)
-
-        # 2. Positional encoding
-        if actor.embedding_mode == "concat" and actor.pos_encoder is not None:
-            pos_embed = actor.pos_encoder(positions)
-            h = torch.cat([h, pos_embed], dim=-1)
-        elif actor.embedding_mode == "add" and actor.pos_encoder is not None:
-            pos_embed = actor.pos_encoder(positions)
-            h = h + pos_embed
-
-        # 3. Project to embed_dim
-        h = actor.input_proj(h)
-
-        # 4. Profile encoding
-        if actor.recep_encoder and receptivity is not None and influence is not None:
-            recep_embed = actor.recep_encoder(receptivity)
-            influence_embed = actor.influence_encoder(influence)
-
-            if actor.profile_fusion_type == "joint":
-                profile_embed = actor.profile_fusion(
-                    torch.cat([recep_embed, influence_embed], dim=-1)
-                )
-            else:
-                profile_embed = recep_embed + influence_embed
-
-            if actor.profile_embed_mode == "concat":
-                h = actor.profile_proj(torch.cat([h, profile_embed], dim=-1))
-            else:
-                h = h + profile_embed
-
-        # 5. Relative position bias
-        attn_bias = None
-        if actor.rel_pos_bias is not None:
-            attn_bias = actor.rel_pos_bias(positions, attention_mask)
-
-        # 6. Transformer
-        h, attn_weights = actor.transformer(
-            h, attention_mask, attn_bias, need_weights=need_weights
-        )
-
-        return h, attn_weights
 
     def forward(
         self,
@@ -301,10 +335,11 @@ class PowerPredictionModel(nn.Module):
 
         Returns:
             predicted_power: (B, N) predicted normalized power per turbine
-            h: (B, N, embed_dim) encoder output (only if need_weights)
-            attn_weights: list of (B, H, N, N) per layer (only if need_weights)
+            h: (B, N, embed_dim) encoder output
+            attn_weights: list of (B, H, N, N) per layer (empty if need_weights=False)
         """
-        h, attn_weights = self._encode(
+        h, attn_weights = _encode_with_actor(
+            self.actor,
             obs=batch["obs"],
             positions=batch["positions"],
             attention_mask=batch["attention_mask"],
@@ -317,15 +352,204 @@ class PowerPredictionModel(nn.Module):
 
 
 # =============================================================================
-# LOSS FUNCTION
+# MODE 2: BERT-STYLE MASKED TURBINE MODEL
+# =============================================================================
+
+class MaskedTurbineModel(nn.Module):
+    """
+    BERT-style pretraining: mask random turbine tokens and reconstruct
+    their original observations.
+
+    Masking strategy (following BERT):
+      - Select `mask_ratio` fraction of real (non-padded) turbines
+      - Of those: 80% → replace obs with learnable [MASK] embedding
+                  10% → replace obs with random noise (uniform [-1, 1])
+                  10% → keep original obs (but still predict)
+      - Predict original obs for ALL selected turbines
+
+    The encoder still sees positions and profiles for masked turbines —
+    only the observation features are masked. This forces the transformer
+    to learn spatial wake interactions: "given the surrounding turbines'
+    states and this turbine's position, what should its conditions be?"
+
+    Architecture:
+        obs → [masking] → actor encoder → reconstruction_head → predicted obs
+    """
+
+    def __init__(
+        self,
+        actor: TransformerActor,
+        obs_dim: int,
+        mask_ratio: float = 0.20,
+        mask_replace_prob: float = 0.80,
+        mask_random_prob: float = 0.10,
+    ):
+        super().__init__()
+        self.actor = actor
+        self.obs_dim = obs_dim
+        self.mask_ratio = mask_ratio
+        self.mask_replace_prob = mask_replace_prob
+        self.mask_random_prob = mask_random_prob
+
+        assert mask_replace_prob + mask_random_prob <= 1.0, \
+            "mask_replace_prob + mask_random_prob must be <= 1.0"
+
+        # Learnable [MASK] embedding (replaces obs for masked turbines)
+        # Same dimension as raw obs input (before obs_encoder)
+        self.mask_token = nn.Parameter(torch.zeros(obs_dim))
+        nn.init.normal_(self.mask_token, std=0.02)
+
+        # Reconstruction head: predict original obs from contextualised embedding
+        self.reconstruction_head = nn.Sequential(
+            nn.Linear(actor.embed_dim, actor.embed_dim),
+            nn.GELU(),
+            nn.Linear(actor.embed_dim, obs_dim),
+        )
+
+    def _create_mask(
+        self,
+        attention_mask: torch.Tensor,   # (B, N) True = padding
+    ) -> torch.Tensor:
+        """
+        Create a boolean mask indicating which turbines to predict.
+
+        Returns:
+            predict_mask: (B, N) True = this turbine is selected for prediction
+        """
+        B, N = attention_mask.shape
+        device = attention_mask.device
+
+        real_mask = ~attention_mask  # True = real turbine
+        n_real = real_mask.sum(dim=1)  # (B,)
+
+        # Number to mask per sample (at least 1)
+        n_mask = (n_real.float() * self.mask_ratio).clamp(min=1).long()  # (B,)
+
+        # Generate random scores, set padded turbines to -inf so they're never selected
+        scores = torch.rand(B, N, device=device)
+        scores[attention_mask] = -1.0
+
+        # Select top-k per sample (variable k via loop — fast enough for typical N<100)
+        predict_mask = torch.zeros(B, N, dtype=torch.bool, device=device)
+        for i in range(B):
+            k = n_mask[i].item()
+            _, topk_idx = scores[i].topk(k)
+            predict_mask[i, topk_idx] = True
+
+        return predict_mask
+
+    def _apply_masking(
+        self,
+        obs: torch.Tensor,          # (B, N, obs_dim)
+        predict_mask: torch.Tensor,  # (B, N) True = selected for prediction
+    ) -> torch.Tensor:
+        """
+        Apply BERT-style corruption to selected turbines' observations.
+
+        Of the selected turbines:
+          - mask_replace_prob → replace with [MASK] token
+          - mask_random_prob  → replace with uniform noise in [-1, 1]
+          - remainder         → keep original (model must still predict)
+        """
+        B, N, D = obs.shape
+        device = obs.device
+
+        # Start with a copy
+        obs_masked = obs.clone()
+
+        # Indices of selected turbines
+        selected = predict_mask.nonzero(as_tuple=False)  # (M, 2) where M = total masked
+        M = selected.shape[0]
+
+        if M == 0:
+            return obs_masked
+
+        # Randomly assign each selected turbine to replace / random / keep
+        rand_vals = torch.rand(M, device=device)
+        replace_idx = rand_vals < self.mask_replace_prob
+        random_idx = (rand_vals >= self.mask_replace_prob) & \
+                     (rand_vals < self.mask_replace_prob + self.mask_random_prob)
+        # keep_idx = everything else (no action needed)
+
+        # Apply [MASK] token
+        if replace_idx.any():
+            rows = selected[replace_idx, 0]
+            cols = selected[replace_idx, 1]
+            obs_masked[rows, cols] = self.mask_token
+
+        # Apply random noise
+        if random_idx.any():
+            rows = selected[random_idx, 0]
+            cols = selected[random_idx, 1]
+            obs_masked[rows, cols] = torch.rand(rows.shape[0], D, device=device) * 2 - 1
+
+        return obs_masked
+
+    def forward(
+        self,
+        batch: dict,
+        need_weights: bool = False,
+        return_details: bool = False,
+    ) -> dict:
+        """
+        Forward pass with masking.
+
+        Returns dict with:
+            predicted_obs: (B, N, obs_dim) reconstructed obs (only meaningful at masked positions)
+            predict_mask:  (B, N)           which turbines were masked
+            original_obs:  (B, N, obs_dim)  original unmasked obs (targets)
+            h:             (B, N, embed_dim) encoder output (if need_weights or return_details)
+            attn_weights:  list of (B, H, N, N) (if need_weights)
+        """
+        obs = batch["obs"]                         # (B, N, obs_dim)
+        positions = batch["positions"]             # (B, N, 2)
+        attention_mask = batch["attention_mask"]    # (B, N)
+
+        # 1. Create mask (which turbines to predict)
+        predict_mask = self._create_mask(attention_mask)
+
+        # 2. Apply corruption to obs
+        obs_masked = self._apply_masking(obs, predict_mask)
+
+        # 3. Encode (masked obs but real positions + profiles)
+        h, attn_weights = _encode_with_actor(
+            self.actor,
+            obs=obs_masked,
+            positions=positions,
+            attention_mask=attention_mask,
+            receptivity=batch.get("receptivity"),
+            influence=batch.get("influence"),
+            need_weights=need_weights,
+        )
+
+        # 4. Reconstruct obs at all positions (loss only at masked ones)
+        predicted_obs = self.reconstruction_head(h)  # (B, N, obs_dim)
+
+        result = {
+            "predicted_obs": predicted_obs,
+            "predict_mask": predict_mask,
+            "original_obs": obs,
+        }
+
+        if need_weights or return_details:
+            result["h"] = h
+            result["attn_weights"] = attn_weights
+        if return_details:
+            result["obs_masked"] = obs_masked
+
+        return result
+
+
+# =============================================================================
+# LOSS FUNCTIONS
 # =============================================================================
 
 def masked_mse_loss(
-    predicted: torch.Tensor,    # (B, N)
-    target: torch.Tensor,       # (B, N)
-    attention_mask: torch.Tensor,  # (B, N) True=padding
+    predicted: torch.Tensor,       # (B, N)
+    target: torch.Tensor,          # (B, N)
+    attention_mask: torch.Tensor,  # (B, N) True = padding
 ) -> torch.Tensor:
-    """MSE loss computed only over real (non-padded) turbines."""
+    """MSE loss computed only over real (non-padded) turbines. For power mode."""
     real_mask = ~attention_mask  # True = real turbine
     n_real = real_mask.sum()
 
@@ -337,24 +561,74 @@ def masked_mse_loss(
     return loss
 
 
+def bert_reconstruction_loss(
+    predicted_obs: torch.Tensor,    # (B, N, obs_dim)
+    original_obs: torch.Tensor,     # (B, N, obs_dim)
+    predict_mask: torch.Tensor,     # (B, N) True = predict this turbine
+    feature_weights: torch.Tensor = None,  # (obs_dim,) optional per-feature weights
+) -> dict:
+    """
+    MSE reconstruction loss over masked turbines only.
+
+    Returns dict with:
+        loss:        scalar total loss
+        per_feature: (obs_dim,) per-feature MSE for logging
+    """
+    # Expand mask to feature dim
+    mask = predict_mask.unsqueeze(-1).float()  # (B, N, 1)
+    n_masked = predict_mask.sum()
+
+    if n_masked == 0:
+        obs_dim = predicted_obs.shape[-1]
+        return {
+            "loss": torch.tensor(0.0, device=predicted_obs.device),
+            "per_feature": torch.zeros(obs_dim, device=predicted_obs.device),
+        }
+
+    # Per-feature squared error at masked positions
+    sq_err = (predicted_obs - original_obs) ** 2  # (B, N, obs_dim)
+    masked_sq_err = sq_err * mask                  # zero out non-masked
+
+    # Per-feature MSE (for logging)
+    per_feature_mse = masked_sq_err.sum(dim=(0, 1)) / n_masked  # (obs_dim,)
+
+    # Weighted total loss
+    if feature_weights is not None:
+        loss = (per_feature_mse * feature_weights).mean()
+    else:
+        loss = per_feature_mse.mean()
+
+    return {
+        "loss": loss,
+        "per_feature": per_feature_mse.detach(),
+    }
+
+
 # =============================================================================
 # DIAGNOSTIC PLOT COLLECTION (inference with attention weights)
 # =============================================================================
 
 @torch.no_grad()
-def collect_plot_data(model, dataset, device, n_samples=256, batch_size=64):
+def collect_plot_data(model, dataset, device, n_samples=256, batch_size=64,
+                      pretrain_mode="power"):
     """
     Run inference on a subset of the dataset, collecting predictions,
     embeddings, and attention weights for diagnostic plots.
 
-    Returns dict with numpy arrays:
-        predicted_power: (S, N)
-        target_power:    (S, N)
+    Returns dict with numpy arrays. Contents depend on pretrain_mode:
+      Common:
         positions:       (S, N, 2)
         attention_mask:  (S, N)  bool, True=padding
         embeddings:      (S, N, embed_dim)
         obs:             (S, N, obs_dim)
         attn_weights:    list[layer] of (S, H, N, N)
+      Power mode:
+        predicted_power: (S, N)
+        target_power:    (S, N)
+      Masked mode:
+        predicted_obs:   (S, N, obs_dim)
+        original_obs:    (S, N, obs_dim)
+        predict_mask:    (S, N) bool
     """
     model.eval()
 
@@ -364,9 +638,13 @@ def collect_plot_data(model, dataset, device, n_samples=256, batch_size=64):
     subset = torch.utils.data.Subset(dataset, indices.tolist())
     loader = DataLoader(subset, batch_size=batch_size, shuffle=False, pin_memory=True)
 
-    all_pred, all_target, all_pos, all_mask, all_embed, all_obs = [], [], [], [], [], []
+    all_pos, all_mask, all_embed, all_obs = [], [], [], []
     all_attn = None
     all_recep_embed, all_influence_embed, all_profile_embed = [], [], []
+
+    # Mode-specific collectors
+    all_pred_power, all_target_power = [], []
+    all_pred_obs, all_orig_obs, all_predict_mask = [], [], []
 
     actor = model.actor
     has_profiles = actor.recep_encoder is not None
@@ -376,7 +654,19 @@ def collect_plot_data(model, dataset, device, n_samples=256, batch_size=64):
                      for k, v in batch.items()}
 
         with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-            pred, embed, attn = model(batch_dev, need_weights=True)
+            if pretrain_mode == "power":
+                pred, embed, attn = model(batch_dev, need_weights=True)
+                all_pred_power.append(pred.cpu().float())
+                all_target_power.append(batch["target_power"])
+                all_embed.append(embed.cpu().float())
+            else:
+                result = model(batch_dev, need_weights=True)
+                all_pred_obs.append(result["predicted_obs"].cpu().float())
+                all_orig_obs.append(result["original_obs"].cpu().float())
+                all_predict_mask.append(result["predict_mask"].cpu())
+                embed = result["h"]
+                attn = result["attn_weights"]
+                all_embed.append(embed.cpu().float())
 
             # Collect profile embeddings if available
             if has_profiles and "receptivity" in batch_dev and "influence" in batch_dev:
@@ -392,11 +682,8 @@ def collect_plot_data(model, dataset, device, n_samples=256, batch_size=64):
                 all_influence_embed.append(infl_emb.cpu().float())
                 all_profile_embed.append(prof_emb.cpu().float())
 
-        all_pred.append(pred.cpu().float())
-        all_target.append(batch["target_power"])
         all_pos.append(batch["positions"])
         all_mask.append(batch["attention_mask"])
-        all_embed.append(embed.cpu().float())
         all_obs.append(batch["obs"])
 
         if all_attn is None:
@@ -405,14 +692,20 @@ def collect_plot_data(model, dataset, device, n_samples=256, batch_size=64):
             all_attn[layer_idx].append(aw.cpu().float())
 
     out = {
-        "predicted_power": torch.cat(all_pred).numpy(),
-        "target_power": torch.cat(all_target).numpy(),
         "positions": torch.cat(all_pos).numpy(),
         "attention_mask": torch.cat(all_mask).numpy(),
         "embeddings": torch.cat(all_embed).numpy(),
         "obs": torch.cat(all_obs).numpy(),
         "attn_weights": [torch.cat(layer_list).numpy() for layer_list in all_attn],
     }
+
+    if pretrain_mode == "power":
+        out["predicted_power"] = torch.cat(all_pred_power).numpy()
+        out["target_power"] = torch.cat(all_target_power).numpy()
+    else:
+        out["predicted_obs"] = torch.cat(all_pred_obs).numpy()
+        out["original_obs"] = torch.cat(all_orig_obs).numpy()
+        out["predict_mask"] = torch.cat(all_predict_mask).numpy()
 
     if all_recep_embed:
         out["recep_embed"] = torch.cat(all_recep_embed).numpy()
@@ -423,7 +716,7 @@ def collect_plot_data(model, dataset, device, n_samples=256, batch_size=64):
 
 
 # =============================================================================
-# DIAGNOSTIC PLOTS (return matplotlib figure objects)
+# DIAGNOSTIC PLOTS
 # =============================================================================
 
 def fig_attention_on_layout(results, sample_idx=0, top_k=3):
@@ -437,11 +730,17 @@ def fig_attention_on_layout(results, sample_idx=0, top_k=3):
     n_heads = results["attn_weights"][0].shape[1]
     pos = results["positions"][sample_idx]          # (N, 2)
     mask = results["attention_mask"][sample_idx]     # (N,)
-    target = results["target_power"][sample_idx]     # (N,)
     real = ~mask
     n_real = int(real.sum())
     pos_real = pos[:n_real]
-    target_real = target[:n_real]
+
+    # Color turbines by power if available, otherwise by position
+    if "target_power" in results:
+        color_vals = results["target_power"][sample_idx][:n_real]
+        color_label = "Target Power (norm)"
+    else:
+        color_vals = pos_real[:, 0]
+        color_label = "x-position (norm)"
 
     cmap_edge = plt.cm.Reds
 
@@ -468,7 +767,7 @@ def fig_attention_on_layout(results, sample_idx=0, top_k=3):
                     )
         sc = ax.scatter(
             pos_real[:, 0], pos_real[:, 1],
-            c=target_real, cmap="viridis", s=120,
+            c=color_vals, cmap="viridis", s=120,
             edgecolors="black", linewidth=1.0, zorder=5,
         )
         for t in range(n):
@@ -494,7 +793,7 @@ def fig_attention_on_layout(results, sample_idx=0, top_k=3):
         for h in range(n_heads):
             attn_h = _normalize_rows(attn_l[h, :n_real, :n_real])
             sc = _draw(axes[h], attn_h, f"Head {h}")
-        fig.colorbar(sc, ax=axes[-1], shrink=0.8, label="Target Power (norm)")
+        fig.colorbar(sc, ax=axes[-1], shrink=0.8, label=color_label)
         fig.suptitle(f"Layer {l} — Per-Head Attention (sample {sample_idx})",
                      fontsize=12, y=1.02)
         fig.tight_layout()
@@ -504,7 +803,11 @@ def fig_attention_on_layout(results, sample_idx=0, top_k=3):
 
 
 def fig_pred_vs_actual(results):
-    """Scatter of predicted vs. actual power, colored by wind direction."""
+    """Scatter of predicted vs. actual power, colored by wind direction.
+    Only applicable to power mode."""
+    if "predicted_power" not in results:
+        return None
+
     pred = results["predicted_power"]
     target = results["target_power"]
     mask = results["attention_mask"]
@@ -515,13 +818,11 @@ def fig_pred_vs_actual(results):
     target_flat = target[real]
 
     # Extract wind direction for coloring (best-effort, depends on obs layout)
-    # With global features the obs layout changes, so we guard with try/except
     obs_dim = obs.shape[-1]
     try:
-        # Standard layout: [ws_hist, wd_hist, yaw_hist] → wd is at index H to 2H
         n_features = 3  # ws, wd, yaw
         history_len = obs_dim // n_features
-        if obs_dim == n_features * history_len:  # evenly divisible = standard layout
+        if obs_dim == n_features * history_len:
             wd_idx = 1 * history_len + (history_len - 1)
             wd_flat = obs[:, :, wd_idx][real]
         else:
@@ -553,17 +854,16 @@ def fig_pred_vs_actual(results):
 
 def fig_error_heatmap(results):
     """
-    Per-turbine error plotted on the farm grid:
+    Per-turbine error plotted on the farm grid (power mode only):
       - Absolute MAE
       - Mean target power
-      - Relative error (NMAE = MAE / mean_power), showing error as a
-        fraction of each turbine's operating point. This normalizes out
-        the effect of different power levels — a turbine at 80% capacity
-        with 0.02 MAE is doing better than one at 10% with the same MAE.
+      - Relative error (NMAE = MAE / mean_power)
 
-    Returns (fig, scalar_stats) where scalar_stats contains farm-wide
-    summary metrics for wandb logging.
+    Returns (fig, scalar_stats).
     """
+    if "predicted_power" not in results:
+        return None, {}
+
     pred = results["predicted_power"]
     target = results["target_power"]
     pos = results["positions"]
@@ -587,7 +887,6 @@ def fig_error_heatmap(results):
             avg_power[t] = target[valid, t].mean()
             avg_pos[t] = pos[valid, t].mean(axis=0)
             active[t] = True
-            # Relative error: MAE / mean_power (guard against near-zero power)
             if avg_power[t] > 1e-4:
                 turbine_nmae[t] = turbine_mae[t] / avg_power[t]
             else:
@@ -640,19 +939,79 @@ def fig_error_heatmap(results):
     return fig, stats
 
 
+def fig_masked_reconstruction(results):
+    """
+    Masked mode diagnostics: scatter of predicted vs original obs
+    at masked positions, plus per-feature MSE bars.
+
+    Returns (fig, scalar_stats).
+    """
+    if "predicted_obs" not in results:
+        return None, {}
+
+    pred_obs = results["predicted_obs"]     # (S, N, obs_dim)
+    orig_obs = results["original_obs"]      # (S, N, obs_dim)
+    predict_mask = results["predict_mask"]  # (S, N) bool
+    mask = results["attention_mask"]        # (S, N) bool
+
+    stats = {}
+
+    # Flatten to masked positions only
+    pred_flat = pred_obs[predict_mask]   # (M, obs_dim)
+    orig_flat = orig_obs[predict_mask]   # (M, obs_dim)
+
+    if len(pred_flat) == 0:
+        return None, stats
+
+    # Per-feature MSE
+    per_feat_mse = np.mean((pred_flat - orig_flat) ** 2, axis=0)  # (obs_dim,)
+    overall_mse = per_feat_mse.mean()
+    stats["val/masked_mse"] = float(overall_mse)
+
+    # Cosine similarity
+    pred_norms = np.linalg.norm(pred_flat, axis=-1, keepdims=True)
+    orig_norms = np.linalg.norm(orig_flat, axis=-1, keepdims=True)
+    cos_sim = (pred_flat * orig_flat).sum(axis=-1) / (
+        np.clip(pred_norms.squeeze() * orig_norms.squeeze(), 1e-8, None)
+    )
+    stats["val/masked_cosine_sim"] = float(cos_sim.mean())
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Left: scatter of predicted vs original (first few obs dims averaged)
+    pred_mean = pred_flat.mean(axis=-1)
+    orig_mean = orig_flat.mean(axis=-1)
+    n_plot = min(5000, len(pred_mean))
+    idx = np.random.RandomState(42).choice(len(pred_mean), n_plot, replace=False)
+    axes[0].scatter(orig_mean[idx], pred_mean[idx], s=4, alpha=0.3, color="steelblue")
+    lims = [min(orig_mean.min(), pred_mean.min()), max(orig_mean.max(), pred_mean.max())]
+    axes[0].plot(lims, lims, "k--", alpha=0.5, lw=1, label="Perfect")
+    axes[0].set_xlabel("Original (mean across features)")
+    axes[0].set_ylabel("Predicted (mean across features)")
+    axes[0].set_title(f"Masked Reconstruction — MSE={overall_mse:.6f}  cos_sim={cos_sim.mean():.4f}")
+    axes[0].legend(fontsize=8)
+    axes[0].set_aspect("equal")
+    axes[0].grid(True, alpha=0.3)
+
+    # Right: per-feature MSE bars
+    n_feats = len(per_feat_mse)
+    axes[1].bar(range(n_feats), per_feat_mse, color="coral", edgecolor="black", linewidth=0.5)
+    axes[1].set_xlabel("Feature Index")
+    axes[1].set_ylabel("MSE")
+    axes[1].set_title("Per-Feature Reconstruction MSE")
+    axes[1].grid(True, alpha=0.3, axis="y")
+
+    fig.suptitle("Masked Turbine Reconstruction", fontsize=12)
+    fig.tight_layout()
+    return fig, stats
+
+
 def compute_attention_entropy(results):
     """
     Compute attention entropy per layer/head as scalar metrics.
 
-    Returns a dict of floats suitable for direct wandb.log(), which
-    produces native interactive line charts over epochs — much more
-    useful for tracking than a static matplotlib figure.
-
-    Keys:
-        attn_entropy/L{l}_H{h}:  per layer/head
-        attn_entropy/L{l}_mean:  per layer mean
-        attn_entropy/mean:       global mean
-        attn_entropy/uniform:    uniform baseline (log N)
+    Returns a dict of floats suitable for direct wandb.log(), producing
+    native interactive line charts over epochs.
     """
     mask = results["attention_mask"]
     n_layers = len(results["attn_weights"])
@@ -687,14 +1046,20 @@ def fig_embedding_tsne(results, perplexity=30, max_points=2000):
         return None
 
     embeddings = results["embeddings"]
-    target = results["target_power"]
     positions = results["positions"]
     mask = results["attention_mask"]
     real = ~mask
 
     emb_flat = embeddings[real]
-    pow_flat = target[real]
     pos_flat = positions[real]
+
+    # Color by power if available, otherwise by x-position
+    if "target_power" in results:
+        pow_flat = results["target_power"][real]
+        pow_label = "Power (norm)"
+    else:
+        pow_flat = pos_flat[:, 0]
+        pow_label = "x-pos (norm)"
 
     if len(emb_flat) > max_points:
         idx = np.random.RandomState(42).choice(len(emb_flat), max_points, replace=False)
@@ -707,8 +1072,8 @@ def fig_embedding_tsne(results, perplexity=30, max_points=2000):
     fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
 
     sc0 = axes[0].scatter(emb_2d[:, 0], emb_2d[:, 1], c=pow_flat, cmap="viridis", s=6, alpha=0.5)
-    fig.colorbar(sc0, ax=axes[0]).set_label("Power (norm)")
-    axes[0].set_title("By Power Output")
+    fig.colorbar(sc0, ax=axes[0]).set_label(pow_label)
+    axes[0].set_title(f"By {pow_label}")
 
     sc1 = axes[1].scatter(emb_2d[:, 0], emb_2d[:, 1], c=pos_flat[:, 0], cmap="coolwarm", s=6, alpha=0.5)
     fig.colorbar(sc1, ax=axes[1]).set_label("x-pos (norm)")
@@ -735,20 +1100,16 @@ def fig_profile_embeddings(results, sample_indices=None):
       - Pairwise cosine similarity of fused profile embeddings
       - Comparison: do nearby turbines get similar profiles?
 
-    This reveals whether the profile encoder differentiates turbines
-    spatially — the main signal it provides to the transformer.
-
-    Returns (fig, scalar_stats) where scalar_stats is a dict of
-    summary metrics suitable for wandb logging.
+    Returns (fig, scalar_stats).
     """
     if "profile_embed" not in results:
         return None, {}
 
-    profile_embed = results["profile_embed"]   # (S, N, D)
-    recep_embed = results["recep_embed"]       # (S, N, D)
-    influence_embed = results["influence_embed"]  # (S, N, D)
-    mask = results["attention_mask"]            # (S, N) bool
-    positions = results["positions"]            # (S, N, 2)
+    profile_embed = results["profile_embed"]       # (S, N, D)
+    recep_embed = results["recep_embed"]           # (S, N, D)
+    influence_embed = results["influence_embed"]   # (S, N, D)
+    mask = results["attention_mask"]               # (S, N) bool
+    positions = results["positions"]               # (S, N, 2)
     real = ~mask
 
     # --- Scalar stats (averaged over all real turbines) ---
@@ -770,7 +1131,6 @@ def fig_profile_embeddings(results, sample_indices=None):
     if sample_indices is None:
         sample_indices = np.linspace(0, n_samples - 1, min(3, n_samples), dtype=int)
 
-    # We visualize for the first sample
     si = sample_indices[0]
     n_real_i = int(real[si].sum())
     prof_i = profile_embed[si, :n_real_i]   # (n_real, D)
@@ -802,7 +1162,7 @@ def fig_profile_embeddings(results, sample_indices=None):
         corr = np.corrcoef(dists_flat, sims_flat)[0, 1]
         stats["profile/dist_sim_correlation"] = float(corr)
 
-    # Off-diagonal mean similarity (lower = more differentiated)
+    # Off-diagonal mean similarity
     off_diag_fused = cos_sim_fused[triu_idx].mean() if len(triu_idx[0]) > 0 else 0.0
     stats["profile/mean_off_diag_cosine_sim"] = float(off_diag_fused)
 
@@ -816,7 +1176,7 @@ def fig_profile_embeddings(results, sample_indices=None):
     axes[0, 0].set_ylabel("Turbine")
     fig.colorbar(im0, ax=axes[0, 0], shrink=0.8)
 
-    # Top-right: receptivity vs influence cosine sim (side by side as triangles)
+    # Top-right: receptivity vs influence cosine sim
     combined = np.zeros_like(cos_sim_fused)
     combined[np.triu_indices(n_real_i, k=0)] = cos_sim_recep[np.triu_indices(n_real_i, k=0)]
     combined[np.tril_indices(n_real_i, k=-1)] = cos_sim_infl[np.tril_indices(n_real_i, k=-1)]
@@ -844,7 +1204,6 @@ def fig_profile_embeddings(results, sample_indices=None):
     # Bottom-right: spatial distance vs embedding similarity scatter
     if len(triu_idx[0]) > 1:
         axes[1, 1].scatter(dists_flat, sims_flat, s=12, alpha=0.5, color="steelblue")
-        # Trend line
         z = np.polyfit(dists_flat, sims_flat, 1)
         x_line = np.linspace(dists_flat.min(), dists_flat.max(), 50)
         axes[1, 1].plot(x_line, np.polyval(z, x_line), "r--", alpha=0.7,
@@ -878,12 +1237,13 @@ def generate_diagnostic_plots(
         model, val_dataset, device,
         n_samples=args.plot_n_samples,
         batch_size=args.batch_size,
+        pretrain_mode=args.pretrain_mode,
     )
 
     images = {}
 
     # 1. Attention on layout — per head, per layer, multiple samples
-    n_samples_available = results["predicted_power"].shape[0]
+    n_samples_available = results["positions"].shape[0]
     sample_indices = np.linspace(0, n_samples_available - 1,
                                   args.plot_n_sample_indices, dtype=int)
     for i, idx in enumerate(sample_indices):
@@ -897,31 +1257,46 @@ def generate_diagnostic_plots(
         except Exception as e:
             print(f"    Warning: attention plot failed for sample {idx}: {e}")
 
-    # 2. Predicted vs. actual scatter
-    try:
-        fig = fig_pred_vs_actual(results)
-        images["plots/pred_vs_actual"] = wandb.Image(fig)
-        plt.close(fig)
-    except Exception as e:
-        print(f"    Warning: scatter plot failed: {e}")
+    # 2. Predicted vs. actual scatter (power mode only)
+    if args.pretrain_mode == "power":
+        try:
+            fig = fig_pred_vs_actual(results)
+            if fig is not None:
+                images["plots/pred_vs_actual"] = wandb.Image(fig)
+                plt.close(fig)
+        except Exception as e:
+            print(f"    Warning: scatter plot failed: {e}")
 
-    # 3. Error heatmap (with NMAE relative error panel)
-    try:
-        fig, error_stats = fig_error_heatmap(results)
-        images["plots/error_heatmap"] = wandb.Image(fig)
-        plt.close(fig)
-        images.update(error_stats)
-    except Exception as e:
-        print(f"    Warning: error heatmap failed: {e}")
+    # 3. Error heatmap (power mode only)
+    if args.pretrain_mode == "power":
+        try:
+            fig, error_stats = fig_error_heatmap(results)
+            if fig is not None:
+                images["plots/error_heatmap"] = wandb.Image(fig)
+                plt.close(fig)
+                images.update(error_stats)
+        except Exception as e:
+            print(f"    Warning: error heatmap failed: {e}")
 
-    # 4. Attention entropy (as scalar metrics for native wandb line charts)
+    # 4. Masked reconstruction diagnostics (masked mode only)
+    if args.pretrain_mode == "masked":
+        try:
+            fig, masked_stats = fig_masked_reconstruction(results)
+            if fig is not None:
+                images["plots/masked_reconstruction"] = wandb.Image(fig)
+                plt.close(fig)
+                images.update(masked_stats)
+        except Exception as e:
+            print(f"    Warning: masked reconstruction plot failed: {e}")
+
+    # 5. Attention entropy (as scalar metrics for native wandb line charts)
     try:
         entropy_stats = compute_attention_entropy(results)
         images.update(entropy_stats)
     except Exception as e:
         print(f"    Warning: entropy computation failed: {e}")
 
-    # 5. Embedding t-SNE (skip if sklearn missing or too slow)
+    # 6. Embedding t-SNE (skip if sklearn missing or too slow)
     try:
         fig = fig_embedding_tsne(results, max_points=min(2000, args.plot_n_samples * 9))
         if fig is not None:
@@ -930,13 +1305,12 @@ def generate_diagnostic_plots(
     except Exception as e:
         print(f"    Warning: t-SNE plot failed: {e}")
 
-    # 6. Profile embedding diagnostics (if profiles are enabled)
+    # 7. Profile embedding diagnostics (if profiles are enabled)
     try:
         fig, profile_stats = fig_profile_embeddings(results)
         if fig is not None:
             images["plots/profile_embeddings"] = wandb.Image(fig)
             plt.close(fig)
-        # Add scalar profile stats to the image dict so they get logged
         images.update(profile_stats)
     except Exception as e:
         print(f"    Warning: profile embedding plot failed: {e}")
@@ -947,25 +1321,25 @@ def generate_diagnostic_plots(
 
 
 # =============================================================================
-# TRAINING LOOP
+# TRAINING LOOPS
 # =============================================================================
 
-def train_one_epoch(model, loader, optimizer, device, epoch, log_wandb=False, scaler=None):
+# --- Power mode ---
+
+def train_one_epoch_power(model, loader, optimizer, device, epoch,
+                          log_wandb=False, scaler=None):
     model.train()
     total_loss = 0.0
     n_batches = 0
 
     for batch in loader:
-        # Move to device
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                  for k, v in batch.items()}
 
         with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
             predicted_power, _, _ = model(batch, need_weights=False)
             loss = masked_mse_loss(
-                predicted_power,
-                batch["target_power"],
-                batch["attention_mask"],
+                predicted_power, batch["target_power"], batch["attention_mask"],
             )
 
         optimizer.zero_grad(set_to_none=True)
@@ -978,7 +1352,6 @@ def train_one_epoch(model, loader, optimizer, device, epoch, log_wandb=False, sc
         total_loss += loss.item()
         n_batches += 1
 
-        # Log per-step metrics for richer training curves
         if log_wandb:
             global_step = (epoch - 1) * len(loader) + n_batches
             wandb.log({
@@ -991,7 +1364,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, log_wandb=False, sc
 
 
 @torch.no_grad()
-def evaluate(model, loader, device):
+def evaluate_power(model, loader, device):
     model.eval()
     total_loss = 0.0
     total_mae = 0.0
@@ -1006,11 +1379,9 @@ def evaluate(model, loader, device):
 
         real_mask = ~batch["attention_mask"]
 
-        # MSE
         mse = masked_mse_loss(predicted_power, batch["target_power"], batch["attention_mask"])
         total_loss += mse.item()
 
-        # MAE (in normalized units)
         mae = ((predicted_power - batch["target_power"]).abs() * real_mask.float()).sum()
         mae = mae / real_mask.sum()
         total_mae += mae.item()
@@ -1022,6 +1393,110 @@ def evaluate(model, loader, device):
     return avg_mse, avg_mae
 
 
+# --- Masked mode ---
+
+def train_one_epoch_masked(model, loader, optimizer, device, epoch,
+                           feature_weights=None, log_wandb=False, scaler=None):
+    model.train()
+    total_loss = 0.0
+    n_batches = 0
+
+    for batch in loader:
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+
+        with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+            result = model(batch)
+            loss_dict = bert_reconstruction_loss(
+                result["predicted_obs"],
+                result["original_obs"],
+                result["predict_mask"],
+                feature_weights=feature_weights,
+            )
+            loss = loss_dict["loss"]
+
+        optimizer.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
+
+        total_loss += loss.item()
+        n_batches += 1
+
+        if log_wandb:
+            global_step = (epoch - 1) * len(loader) + n_batches
+            wandb.log({
+                "train/step_loss": loss.item(),
+                "train/grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                "global_step": global_step,
+            })
+
+    return total_loss / max(n_batches, 1)
+
+
+@torch.no_grad()
+def evaluate_masked(model, loader, device, feature_names, feature_weights=None):
+    """
+    Evaluate masked reconstruction.
+
+    Returns:
+        avg_loss: scalar
+        per_feature_mse: dict mapping feature_name → MSE
+        avg_cosine_sim: mean cosine similarity at masked positions
+    """
+    model.eval()
+    total_loss = 0.0
+    total_per_feature = None
+    total_cosine_sim = 0.0
+    n_batches = 0
+
+    for batch in loader:
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+
+        with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+            result = model(batch)
+            loss_dict = bert_reconstruction_loss(
+                result["predicted_obs"],
+                result["original_obs"],
+                result["predict_mask"],
+                feature_weights=feature_weights,
+            )
+
+        total_loss += loss_dict["loss"].item()
+
+        pf = loss_dict["per_feature"]
+        if total_per_feature is None:
+            total_per_feature = pf
+        else:
+            total_per_feature = total_per_feature + pf
+
+        # Cosine similarity at masked positions
+        mask = result["predict_mask"]
+        if mask.sum() > 0:
+            pred_flat = result["predicted_obs"][mask]
+            orig_flat = result["original_obs"][mask]
+            cos_sim = F.cosine_similarity(pred_flat, orig_flat, dim=-1).mean()
+            total_cosine_sim += cos_sim.item()
+
+        n_batches += 1
+
+    avg_loss = total_loss / max(n_batches, 1)
+    avg_per_feature = total_per_feature / max(n_batches, 1) if total_per_feature is not None else {}
+    avg_cosine_sim = total_cosine_sim / max(n_batches, 1)
+
+    # Build per-feature dict
+    per_feature_dict = {}
+    if total_per_feature is not None:
+        for i, name in enumerate(feature_names):
+            if i < avg_per_feature.shape[0]:
+                per_feature_dict[name] = avg_per_feature[i].item()
+
+    return avg_loss, per_feature_dict, avg_cosine_sim
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -1029,12 +1504,16 @@ def evaluate(model, loader, device):
 def main():
     args = tyro.cli(Args)
 
+    assert args.pretrain_mode in ("power", "masked"), \
+        f"Invalid pretrain_mode: {args.pretrain_mode}. Must be 'power' or 'masked'."
+
     # Device
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(args.device)
     print(f"Device: {device}")
+    print(f"Pretraining mode: {args.pretrain_mode}")
 
     # =========================================================================
     # Wandb init
@@ -1042,13 +1521,17 @@ def main():
     use_wandb = WANDB_AVAILABLE and args.track
 
     if use_wandb:
-        # Auto-generate a descriptive run name
         mode = "snap" if args.snapshot else f"hist{args.history_length}"
         gf_tag = "_g" + "".join(args.global_features) if args.global_features else ""
-        run_name = f"{args.exp_name}_{mode}{gf_tag}_e{args.embed_dim}_L{args.num_layers}_H{args.num_heads}"
+        run_name = (f"{args.exp_name}_{args.pretrain_mode}_{mode}{gf_tag}"
+                    f"_e{args.embed_dim}_L{args.num_layers}_H{args.num_heads}")
+        if args.pretrain_mode == "masked":
+            run_name += f"_m{args.mask_ratio:.0%}"
 
-        # Parse comma-separated tags
         tags = [t.strip() for t in args.wandb_tags.split(",")] if args.wandb_tags else None
+        if tags is None:
+            tags = []
+        tags.append(args.pretrain_mode)
 
         wandb.init(
             project=args.wandb_project_name,
@@ -1063,19 +1546,30 @@ def main():
     else:
         print("Wandb: disabled (--no-track)")
 
-    # Find data files
+    # =========================================================================
+    # Data
+    # =========================================================================
     files = sorted(glob(f"{args.data_dir}/layout_*.h5"))
     if not files:
         print(f"No layout files found in {args.data_dir}")
         return
     print(f"Found {len(files)} layout file(s)")
 
-    # =========================================================================
-    # Key: use features WITHOUT power for obs, power is the target
-    # =========================================================================
+    # --- Choose input features based on mode ---
+    if args.pretrain_mode == "power":
+        # Power mode: use configured features, power is always the target (not an input)
+        input_features = list(args.features)
+    else:
+        # Masked mode: all features are both input AND target.
+        # Auto-add 'power' if not already present, since the model
+        # should learn to predict it from spatial context.
+        input_features = list(args.features)
+        if "power" not in input_features:
+            input_features.append("power")
+
+    # Log global feature configuration
     if args.global_features:
-        # Account for auto-merge: global features get added to features if missing
-        all_features = list(args.features)
+        all_features = list(input_features)
         for gf in args.global_features:
             if gf not in all_features:
                 all_features.insert(0, gf)
@@ -1085,11 +1579,9 @@ def main():
         print(f"Features: {all_features} (global: {args.global_features}) | "
               f"obs_dim = {n_global} + {args.history_length}×{n_hist} = {obs_dim_expected}")
 
-    input_features = args.features
-
     scaling_limits = {"power": (0.0, args.power_max)}
 
-    # --- Create dataset (not dataloader, so we can split) ---
+    # --- Create dataset ---
     common_kwargs = dict(
         layout_files=files,
         max_turbines=None,  # auto
@@ -1133,12 +1625,18 @@ def main():
     n_profile_dirs = sample["receptivity"].shape[-1] if has_profiles else 0
 
     print(f"\nModel config:")
+    print(f"  pretrain_mode: {args.pretrain_mode}")
+    print(f"  input features: {input_features}")
     print(f"  obs_dim (input features × history): {obs_dim}")
     print(f"  max_turbines: {max_turbines}")
     print(f"  profiles: {'yes, ' + str(n_profile_dirs) + ' dirs' if has_profiles else 'no'}")
     print(f"  embed_dim: {args.embed_dim}")
     print(f"  num_heads: {args.num_heads}")
     print(f"  num_layers: {args.num_layers}")
+    if args.pretrain_mode == "masked":
+        print(f"  mask_ratio: {args.mask_ratio}")
+        print(f"  mask_replace_prob: {args.mask_replace_prob}")
+        print(f"  mask_random_prob: {args.mask_random_prob}")
 
     # --- Build model (using REAL TransformerActor backbone) ---
     actor = TransformerActor(
@@ -1165,11 +1663,48 @@ def main():
         profile_embed_mode=args.profile_embed_mode,
         args=args,  # for profile_encoder_kwargs
     )
-    model = PowerPredictionModel(actor).to(device)
-    # model = torch.compile(model)  # add this line   ### Did not work directly on sophia. We need to module load GCC/12.3.0 first I think
+
+    if args.pretrain_mode == "power":
+        model = PowerPredictionModel(actor).to(device)
+    else:
+        model = MaskedTurbineModel(
+            actor=actor,
+            obs_dim=obs_dim,
+            mask_ratio=args.mask_ratio,
+            mask_replace_prob=args.mask_replace_prob,
+            mask_random_prob=args.mask_random_prob,
+        ).to(device)
+    # model = torch.compile(model)  # requires GCC/12.3.0 on some HPC systems
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Total parameters: {n_params:,}")
+
+    # Build feature weights for masked mode (optionally upweight power prediction)
+    feature_weights = None
+    if args.pretrain_mode == "masked" and args.predict_power_weight != 1.0:
+        n_raw = len(input_features)
+        w = torch.ones(obs_dim, device=device)
+
+        power_idx = input_features.index("power") if "power" in input_features else -1
+        if power_idx >= 0:
+            if args.snapshot:
+                w[power_idx] = args.predict_power_weight
+            else:
+                H = obs_dim // n_raw
+                w[power_idx * H : (power_idx + 1) * H] = args.predict_power_weight
+        feature_weights = w
+        print(f"  Feature weights: {feature_weights.tolist()}")
+
+    # Construct per-obs-dim feature names for logging (masked mode)
+    feature_names = []
+    if args.pretrain_mode == "masked":
+        if args.snapshot or obs_dim == len(input_features):
+            feature_names = list(input_features)
+        else:
+            H = obs_dim // len(input_features)
+            for feat in input_features:
+                for t in range(H):
+                    feature_names.append(f"{feat}_t{t}")
 
     # Log dataset and model info to wandb
     if use_wandb:
@@ -1182,6 +1717,7 @@ def main():
             "n_val": n_val,
             "n_params": n_params,
             "n_layout_files": len(files),
+            "input_features": input_features,
         }, allow_val_change=True)
         wandb.watch(model, log="all", log_freq=500)
 
@@ -1192,7 +1728,7 @@ def main():
         weight_decay=args.weight_decay,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=args.lr * 0.01
+        optimizer, T_max=args.epochs, eta_min=args.lr * 0.01,
     )
 
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
@@ -1207,43 +1743,76 @@ def main():
     # Training
     # =========================================================================
     print(f"\n{'='*60}")
-    print(f"Starting pretraining: {args.epochs} epochs")
+    print(f"Starting {args.pretrain_mode} pretraining: {args.epochs} epochs")
     if do_plots:
         print(f"Diagnostic plots every {args.plot_every} epochs ({args.plot_n_samples} samples)")
     print(f"{'='*60}")
 
-    best_val_mse = float("inf")
+    best_val_loss = float("inf")
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
 
-        train_mse = train_one_epoch(model, train_loader, optimizer, device, epoch,
-                                    log_wandb=use_wandb, scaler=scaler)
-        val_mse, val_mae = evaluate(model, val_loader, device)
-        scheduler.step()
+        # ---- Train ----
+        if args.pretrain_mode == "power":
+            train_loss = train_one_epoch_power(
+                model, train_loader, optimizer, device, epoch,
+                log_wandb=use_wandb, scaler=scaler,
+            )
+        else:
+            train_loss = train_one_epoch_masked(
+                model, train_loader, optimizer, device, epoch,
+                feature_weights=feature_weights, log_wandb=use_wandb,
+                scaler=scaler,
+            )
 
+        # ---- Validate ----
+        if args.pretrain_mode == "power":
+            val_mse, val_mae = evaluate_power(model, val_loader, device)
+            val_loss = val_mse
+        else:
+            val_loss, per_feature_mse, cosine_sim = evaluate_masked(
+                model, val_loader, device, feature_names, feature_weights,
+            )
+
+        scheduler.step()
         dt = time.time() - t0
         lr_now = optimizer.param_groups[0]["lr"]
 
-        print(f"Epoch {epoch:3d}/{args.epochs} | "
-              f"train_mse: {train_mse:.6f} | "
-              f"val_mse: {val_mse:.6f} | "
-              f"val_mae: {val_mae:.4f} | "
-              f"lr: {lr_now:.2e} | "
-              f"{dt:.1f}s")
+        # ---- Print ----
+        if args.pretrain_mode == "power":
+            print(f"Epoch {epoch:3d}/{args.epochs} | "
+                  f"train_mse: {train_loss:.6f} | "
+                  f"val_mse: {val_mse:.6f} | "
+                  f"val_mae: {val_mae:.4f} | "
+                  f"lr: {lr_now:.2e} | {dt:.1f}s")
+        else:
+            feat_str = "  ".join(f"{k}: {v:.5f}" for k, v in per_feature_mse.items())
+            print(f"Epoch {epoch:3d}/{args.epochs} | "
+                  f"train: {train_loss:.6f} | "
+                  f"val: {val_loss:.6f} | "
+                  f"cos_sim: {cosine_sim:.4f} | "
+                  f"lr: {lr_now:.2e} | {dt:.1f}s")
+            if feat_str:
+                print(f"  per-feature MSE: {feat_str}")
 
-        # Log epoch-level metrics to wandb
+        # ---- Wandb logging ----
         if use_wandb:
             log_dict = {
                 "epoch": epoch,
-                "train/mse": train_mse,
-                "val/mse": val_mse,
-                "val/mae": val_mae,
+                "train/loss": train_loss,
+                "val/loss": val_loss,
                 "lr": lr_now,
                 "epoch_time_s": dt,
             }
-            # Denormalized MAE in watts for interpretability
-            log_dict["val/mae_watts"] = val_mae * args.power_max
+            if args.pretrain_mode == "power":
+                log_dict["val/mse"] = val_mse
+                log_dict["val/mae"] = val_mae
+                log_dict["val/mae_watts"] = val_mae * args.power_max
+            else:
+                log_dict["val/cosine_sim"] = cosine_sim
+                for k, v in per_feature_mse.items():
+                    log_dict[f"val/mse_{k}"] = v
 
             # --- Diagnostic plots (every N epochs + first + last) ---
             if do_plots and (epoch % args.plot_every == 0
@@ -1256,73 +1825,85 @@ def main():
 
             wandb.log(log_dict)
 
-        # Save best
-        is_best = val_mse < best_val_mse
+        # ---- Checkpointing ----
+        is_best = val_loss < best_val_loss
         if is_best:
-            best_val_mse = val_mse
-            torch.save({
+            best_val_loss = val_loss
+            checkpoint = {
                 "epoch": epoch,
+                "pretrain_mode": args.pretrain_mode,
                 "encoder_state_dict": get_encoder_state_dict(model.actor),
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
-                "val_mse": val_mse,
-                "val_mae": val_mae,
+                "val_loss": val_loss,
                 "args": vars(args),
                 "obs_dim": obs_dim,
                 "max_turbines": max_turbines,
                 "n_profile_dirs": n_profile_dirs,
                 "input_features": input_features,
-            }, f"{args.save_dir}/best.pt")
-            print(f"  → Saved best model (val_mse={val_mse:.6f})")
+            }
+            if args.pretrain_mode == "power":
+                checkpoint["val_mse"] = val_mse
+                checkpoint["val_mae"] = val_mae
+            torch.save(checkpoint, f"{args.save_dir}/best.pt")
+            print(f"  → Saved best model (val_loss={val_loss:.6f})")
 
             if use_wandb:
-                wandb.run.summary["best_val_mse"] = best_val_mse
-                wandb.run.summary["best_val_mae"] = val_mae
+                wandb.run.summary["best_val_loss"] = best_val_loss
                 wandb.run.summary["best_epoch"] = epoch
+                if args.pretrain_mode == "power":
+                    wandb.run.summary["best_val_mae"] = val_mae
 
         # Periodic save
         if epoch % args.save_every == 0:
             torch.save({
                 "epoch": epoch,
+                "pretrain_mode": args.pretrain_mode,
                 "encoder_state_dict": get_encoder_state_dict(model.actor),
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
-                "val_mse": val_mse,
+                "val_loss": val_loss,
                 "args": vars(args),
             }, f"{args.save_dir}/epoch_{epoch:04d}.pt")
 
-    # Final save
-    torch.save({
+    # ---- Final save ----
+    final_checkpoint = {
         "epoch": args.epochs,
+        "pretrain_mode": args.pretrain_mode,
         "encoder_state_dict": get_encoder_state_dict(model.actor),
         "model_state_dict": model.state_dict(),
-        "val_mse": val_mse,
-        "val_mae": val_mae,
+        "val_loss": val_loss,
         "args": vars(args),
         "obs_dim": obs_dim,
         "max_turbines": max_turbines,
         "n_profile_dirs": n_profile_dirs,
         "input_features": input_features,
-    }, f"{args.save_dir}/final.pt")
+    }
+    if args.pretrain_mode == "power":
+        final_checkpoint["val_mae"] = val_mae
+    torch.save(final_checkpoint, f"{args.save_dir}/final.pt")
 
     print(f"\n{'='*60}")
-    print(f"Pretraining complete!")
-    print(f"  Best val MSE: {best_val_mse:.6f}")
+    print(f"Pretraining complete! ({args.pretrain_mode} mode)")
+    print(f"  Best val loss: {best_val_loss:.6f}")
     print(f"  Checkpoints saved to: {args.save_dir}/")
     print(f"{'='*60}")
 
-    # Save best model as wandb artifact for easy retrieval
+    # ---- Wandb artifact ----
     if use_wandb:
-        wandb.run.summary["final_val_mse"] = val_mse
-        wandb.run.summary["final_val_mae"] = val_mae
+        wandb.run.summary["final_val_loss"] = val_loss
+        if args.pretrain_mode == "power":
+            wandb.run.summary["final_val_mae"] = val_mae
 
         best_path = f"{args.save_dir}/best.pt"
         if os.path.exists(best_path):
             artifact = wandb.Artifact(
-                name="pretrained-encoder",
+                name=f"pretrained-encoder-{args.pretrain_mode}",
                 type="model",
-                description=f"Best pretrained encoder (val_mse={best_val_mse:.6f})",
+                description=f"Best {args.pretrain_mode} pretrained encoder "
+                            f"(val_loss={best_val_loss:.6f})",
                 metadata={
+                    "pretrain_mode": args.pretrain_mode,
                     "best_epoch": int(wandb.run.summary.get("best_epoch", -1)),
                     "obs_dim": obs_dim,
                     "embed_dim": args.embed_dim,
