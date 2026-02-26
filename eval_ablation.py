@@ -143,15 +143,21 @@ def create_eval_env(layout: str, args: dict, seed: int = 42, n_envs: int = 1):
     return env, wind_turbine
 
 
-def evaluate_checkpoint_episodes(env, agent, num_batches, num_envs, num_steps, deterministic):
+def evaluate_checkpoint_episodes(env, agent, num_batches, num_envs, num_steps, deterministic, seed=None):
     all_episodes = []
 
     for batch in range(num_batches):
-        obs, infos = env.reset()
+        # Deterministic seeding: each batch gets a unique but reproducible seed
+        # so every checkpoint sees the exact same set of episodes.
+        if seed is not None:
+            batch_seed = seed + batch * num_envs
+            obs, infos = env.reset(seed=batch_seed)
+        else:
+            obs, infos = env.reset()
         wind_speeds = infos["Wind speed Global"]
         wind_directions = infos["Wind direction Global"]
 
-        rewards_per_env = [[] for _ in range(num_envs)]
+        rewards_per_env = [[0.0] for _ in range(num_envs)]
         powers_per_env = [[] for _ in range(num_envs)]
         baseline_powers_per_env = [[] for _ in range(num_envs)]
         yaws_per_env = [[] for _ in range(num_envs)]
@@ -185,7 +191,7 @@ def evaluate_checkpoint_episodes(env, agent, num_batches, num_envs, num_steps, d
                 "powers": powers_per_env[i],
                 "baseline_powers": baseline_powers_per_env[i],
                 "yaw_angles": yaws_per_env[i],
-                "episode_return": sum(rewards_per_env[i]),
+                "episode_return": float(sum(rewards_per_env[i])),
                 "episode_length": len(rewards_per_env[i]),
                 "mean_power": np.mean(powers_per_env[i]) if powers_per_env[i] else None,
                 "mean_baseline_power": np.mean(baseline_powers_per_env[i]) if baseline_powers_per_env[i] else None,
@@ -354,7 +360,7 @@ def evaluate_run_on_layout(run_name, eval_layout, n_envs):
         actor.eval()
 
         episodes = evaluate_checkpoint_episodes(
-            env, agent, num_batches, num_envs, NUM_STEPS, DETERMINISTIC
+            env, agent, num_batches, num_envs, NUM_STEPS, DETERMINISTIC, seed=INPUT_SEED
         )
 
         episode_returns = [ep["episode_return"] for ep in episodes]
@@ -385,11 +391,34 @@ def evaluate_run_on_layout(run_name, eval_layout, n_envs):
     n_turbines = len(sample_yaws[0])
 
     yaw_array = np.full((n_checkpoints, NUM_EPISODES, max_time, n_turbines), np.nan)
+    power_array = np.full((n_checkpoints, NUM_EPISODES, max_time), np.nan)
+    baseline_power_array = np.full((n_checkpoints, NUM_EPISODES, max_time), np.nan)
+    reward_array = np.full((n_checkpoints, NUM_EPISODES, max_time), np.nan)
+    episode_return_array = np.full((n_checkpoints, NUM_EPISODES), np.nan)
+
     for ci, s in enumerate(steps):
         for ei, ep in enumerate(all_results[s]["episodes"]):
             yaws = ep["yaw_angles"]
             for ti, yaw_snapshot in enumerate(yaws):
                 yaw_array[ci, ei, ti, :] = yaw_snapshot
+
+            powers = ep["powers"]
+            for ti, p in enumerate(powers):
+                power_array[ci, ei, ti] = p
+
+            bp = ep["baseline_powers"]
+            for ti, b in enumerate(bp):
+                baseline_power_array[ci, ei, ti] = b
+
+            rews = ep["rewards"]
+            for ti, r in enumerate(rews):
+                reward_array[ci, ei, ti] = r
+
+            episode_return_array[ci, ei] = ep["episode_return"]
+
+    # Compute per-timestep power gain percentage
+    with np.errstate(divide="ignore", invalid="ignore"):
+        power_gain_pct_ts = (power_array / baseline_power_array - 1.0) * 100.0
 
     config_name, train_layout, train_seed = parse_run_name(run_name)
 
@@ -402,6 +431,11 @@ def evaluate_run_on_layout(run_name, eval_layout, n_envs):
             "power_gain_pct": ("step", [all_results[s]["power_gain_pct"] for s in steps]),
             "mean_length": ("step", [all_results[s]["mean_length"] for s in steps]),
             "yaw_angles": (["step", "episode", "time", "turbine"], yaw_array),
+            "power": (["step", "episode", "time"], power_array),
+            "baseline_power": (["step", "episode", "time"], baseline_power_array),
+            "power_gain_pct_ts": (["step", "episode", "time"], power_gain_pct_ts),
+            "reward": (["step", "episode", "time"], reward_array),
+            "episode_return": (["step", "episode"], episode_return_array),
             "wind_speed": (
                 ["step", "episode"],
                 [[ep["wind_speed"] for ep in all_results[s]["episodes"]] for s in steps],
