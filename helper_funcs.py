@@ -432,7 +432,8 @@ def get_layout_positions(layout_type: str, wind_turbine) -> Tuple[np.ndarray, np
         "E2": lambda: generate_square_grid(turbine=wind_turbine, nx=3, ny=3, xDist=5, yDist=5),
         "E3": lambda: generate_square_grid(turbine=wind_turbine, nx=4, ny=3, xDist=5, yDist=5),
         "E4": lambda: (lambda x, y: (y, x))(*generate_staggered_grid(turbine=wind_turbine, nx=2, ny=3, xDist=5, yDist=5, y_stagger_offset=[0, 2.5])),
-        "E5": lambda: (np.array([0, 6, 2, 11, 8, 14, 5]) * wind_turbine.diameter(),np.array([0, 3, 8, 1, 7, 5, 13]) * wind_turbine.diameter()),
+        "E5": lambda: (np.array([730.0624, 444.7964, 1180.635, 93.5193, 1377.9328, 7.4321]),
+                       np.array([1016.8061, 452.8746, 437.7612, 1031.7807, 1061.6575, 2.6086])),
         # --- Grid training layouts ---
         "g1": lambda: generate_square_grid(turbine=wind_turbine, nx=3, ny=2, xDist=5, yDist=5),
         "g2": lambda: generate_square_grid(turbine=wind_turbine, nx=2, ny=3, xDist=5, yDist=5),
