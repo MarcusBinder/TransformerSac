@@ -196,6 +196,10 @@ class Args:
     """Weight for log-prob loss when using 'combined'."""
     mse_weight: float = 1.0
     """Weight for MSE loss when using 'combined'."""
+    target_log_std: float = -1.0
+    """Target log_std for regularization (pre-tanh space)."""
+    std_reg_weight: float = 0.1
+    """Weight for log_std regularization loss."""
 
     # === Pretrained Encoder Loading ===
     pretrain_checkpoint: Optional[str] = None
@@ -623,7 +627,7 @@ def masked_logprob_loss(
 
     # Tanh Jacobian correction
     y_t = torch.tanh(x_t)
-    log_jac = torch.log((1 - y_t.pow(2)).clamp(min=eps)) #NOTE: we dont have the action scaling here. But if we always use 1, then its fine.
+    log_jac = torch.log((1 - y_t.pow(2)).clamp(min=eps))  # NOTE: no action scaling here. Fine if scale=1.
 
     # Full log-prob with correction
     log_prob = log_p - log_jac  # (B, N, action_dim)
@@ -640,6 +644,20 @@ def masked_logprob_loss(
     return nll
 
 
+def masked_std_reg_loss(
+    log_std: torch.Tensor,         # (B, N, action_dim)
+    target: float,                 # scalar target log_std
+    attention_mask: torch.Tensor,  # (B, N) True = padding
+) -> torch.Tensor:
+    """Pull log_std toward a target value over real turbines."""
+    real_mask = (~attention_mask).unsqueeze(-1).float()
+    n_real = real_mask.sum()
+    if n_real == 0:
+        return torch.tensor(0.0, device=log_std.device)
+    diff = (log_std - target) ** 2
+    return (diff * real_mask).sum() / (n_real * log_std.shape[-1])
+
+
 # =============================================================================
 # TRAINING / EVALUATION
 # =============================================================================
@@ -654,12 +672,17 @@ def train_one_epoch(
     mse_weight: float = 1.0,
     logprob_weight: float = 1.0,
     log_wandb: bool = False,
+    target_log_std: float = -1.0,
+    std_reg_weight: float = 0.0,
 ) -> dict:
     """Train for one epoch. Returns dict of average losses."""
     actor.train()
     total_mse = 0.0
     total_logprob = 0.0
+    total_std_reg = 0.0
     total_loss = 0.0
+    total_log_std = 0.0
+    total_std = 0.0
     n_batches = 0
 
     for batch in loader:
@@ -681,6 +704,18 @@ def train_one_epoch(
             influence_profile=infl,
         )
 
+        # Log std diagnostics (safe defaults if no real turbines)
+        batch_mean_log_std = 0.0
+        batch_mean_std = 0.0
+        with torch.no_grad():
+            real_mask_bool = ~mask
+            if real_mask_bool.any():
+                real_log_std = log_std[real_mask_bool.unsqueeze(-1).expand_as(log_std)]
+                batch_mean_log_std = real_log_std.mean().item()
+                batch_mean_std = real_log_std.exp().mean().item()
+        total_log_std += batch_mean_log_std
+        total_std += batch_mean_std
+
         # Mean action (deterministic output)
         mean_action = torch.tanh(mean) * actor.action_scale + actor.action_bias_val
 
@@ -701,6 +736,12 @@ def train_one_epoch(
             loss = loss + logprob_weight * nll
             total_logprob += nll.item()
 
+        # Std regularization (always applied when weight > 0)
+        if std_reg_weight > 0:
+            std_reg = masked_std_reg_loss(log_std, target_log_std, mask)
+            loss = loss + std_reg_weight * std_reg
+            total_std_reg += std_reg.item()
+
         optimizer.zero_grad()
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=1.0)
@@ -714,12 +755,16 @@ def train_one_epoch(
             log_dict = {
                 "train/step_loss": loss.item(),
                 "train/grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                "train/mean_log_std": batch_mean_log_std,
+                "train/mean_std": batch_mean_std,
                 "global_step": global_step,
             }
             if loss_type in ("mse", "combined"):
                 log_dict["train/step_mse"] = mse.item()
             if loss_type in ("logprob", "combined"):
                 log_dict["train/step_nll"] = nll.item()
+            if std_reg_weight > 0:
+                log_dict["train/step_std_reg"] = std_reg.item()
             wandb.log(log_dict, step=global_step)
 
     n = max(n_batches, 1)
@@ -727,6 +772,9 @@ def train_one_epoch(
         "loss": total_loss / n,
         "mse": total_mse / n if loss_type in ("mse", "combined") else 0.0,
         "nll": total_logprob / n if loss_type in ("logprob", "combined") else 0.0,
+        "std_reg": total_std_reg / n if std_reg_weight > 0 else 0.0,
+        "mean_log_std": total_log_std / n,
+        "mean_std": total_std / n,
     }
 
 
@@ -738,13 +786,18 @@ def evaluate(
     loss_type: str = "mse",
     mse_weight: float = 1.0,
     logprob_weight: float = 1.0,
+    target_log_std: float = -1.0,
+    std_reg_weight: float = 0.0,
 ) -> dict:
     """Evaluate on validation set. Returns dict of average losses + metrics."""
     actor.eval()
     total_mse = 0.0
     total_logprob = 0.0
+    total_std_reg = 0.0
     total_loss = 0.0
     total_mae = 0.0
+    total_log_std = 0.0
+    total_std = 0.0
     n_batches = 0
 
     for batch in loader:
@@ -765,6 +818,13 @@ def evaluate(
             influence_profile=infl,
         )
 
+        # Std diagnostics
+        real_mask_bool = ~mask
+        if real_mask_bool.any():
+            real_log_std = log_std[real_mask_bool.unsqueeze(-1).expand_as(log_std)]
+            total_log_std += real_log_std.mean().item()
+            total_std += real_log_std.exp().mean().item()
+
         mean_action = torch.tanh(mean) * actor.action_scale + actor.action_bias_val
 
         # Losses
@@ -783,6 +843,12 @@ def evaluate(
             )
             loss = loss + logprob_weight * nll
             total_logprob += nll.item()
+
+        # Std regularization (include in val loss for consistent early stopping)
+        if std_reg_weight > 0:
+            std_reg = masked_std_reg_loss(log_std, target_log_std, mask)
+            loss = loss + std_reg_weight * std_reg
+            total_std_reg += std_reg.item()
 
         total_loss += loss.item()
 
@@ -805,6 +871,9 @@ def evaluate(
         "mse": total_mse / n,
         "nll": total_logprob / n if loss_type in ("logprob", "combined") else 0.0,
         "mae": total_mae / n,
+        "std_reg": total_std_reg / n if std_reg_weight > 0 else 0.0,
+        "mean_log_std": total_log_std / n,
+        "mean_std": total_std / n,
     }
 
 
@@ -995,6 +1064,8 @@ def main():
     print(f"  num_heads: {args.num_heads}")
     print(f"  num_layers: {args.num_layers}")
     print(f"  loss_type: {args.loss_type}")
+    if args.std_reg_weight > 0:
+        print(f"  std_reg: weight={args.std_reg_weight}, target_log_std={args.target_log_std}")
 
     # =========================================================================
     # Build actor
@@ -1123,6 +1194,8 @@ def main():
     print(f"\n{'='*60}")
     print(f"Starting behavioral cloning: {args.epochs} epochs")
     print(f"  Loss: {args.loss_type} | Early stopping patience: {args.patience}")
+    if args.std_reg_weight > 0:
+        print(f"  Std reg: weight={args.std_reg_weight}, target={args.target_log_std}")
     if args.pretrain_checkpoint:
         print(f"  Encoder: pretrained (freeze {args.freeze_encoder_epochs} epochs)")
     else:
@@ -1163,6 +1236,8 @@ def main():
             mse_weight=args.mse_weight,
             logprob_weight=args.logprob_weight,
             log_wandb=use_wandb,
+            target_log_std=args.target_log_std,
+            std_reg_weight=args.std_reg_weight,
         )
 
         # Evaluate
@@ -1171,6 +1246,8 @@ def main():
             loss_type=args.loss_type,
             mse_weight=args.mse_weight,
             logprob_weight=args.logprob_weight,
+            target_log_std=args.target_log_std,
+            std_reg_weight=args.std_reg_weight,
         )
 
         scheduler.step()
@@ -1185,6 +1262,7 @@ def main():
             f"val_loss: {val_metrics['loss']:.6f} | "
             f"val_mse: {val_metrics['mse']:.6f} | "
             f"val_mae: {val_metrics['mae']:.4f} | "
+            f"log_std: {val_metrics['mean_log_std']:.2f} | "
             f"lr: {lr_enc:.2e}/{lr_head:.2e} | "
             f"{dt:.1f}s"
         )
@@ -1196,10 +1274,16 @@ def main():
                 "train/loss": train_metrics["loss"],
                 "train/mse": train_metrics["mse"],
                 "train/nll": train_metrics["nll"],
+                "train/std_reg": train_metrics["std_reg"],
+                "train/mean_log_std": train_metrics["mean_log_std"],
+                "train/mean_std": train_metrics["mean_std"],
                 "val/loss": val_metrics["loss"],
                 "val/mse": val_metrics["mse"],
                 "val/nll": val_metrics["nll"],
                 "val/mae": val_metrics["mae"],
+                "val/std_reg": val_metrics["std_reg"],
+                "val/mean_log_std": val_metrics["mean_log_std"],
+                "val/mean_std": val_metrics["mean_std"],
                 "lr_encoder": lr_enc,
                 "lr_head": lr_head,
                 "epoch_time_s": dt,
@@ -1262,6 +1346,8 @@ def main():
         loss_type=args.loss_type,
         mse_weight=args.mse_weight,
         logprob_weight=args.logprob_weight,
+        target_log_std=args.target_log_std,
+        std_reg_weight=args.std_reg_weight,
     )
 
     torch.save({
@@ -1283,6 +1369,7 @@ def main():
     print(f"  Best val loss:  {best_val_loss:.6f} (epoch {best_epoch})")
     print(f"  Best val MSE:   {best_val_mse:.6f}")
     print(f"  Final val MAE:  {final_val['mae']:.4f}")
+    print(f"  Final log_std:  {final_val['mean_log_std']:.3f}")
     print(f"  Checkpoints:    {args.save_dir}/")
     print(f"{'='*60}")
     print(f"\nTo use in RL (step 3):")
@@ -1295,6 +1382,7 @@ def main():
         wandb.run.summary["final_val_loss"] = final_val["loss"]
         wandb.run.summary["final_val_mse"] = final_val["mse"]
         wandb.run.summary["final_val_mae"] = final_val["mae"]
+        wandb.run.summary["final_mean_log_std"] = final_val["mean_log_std"]
 
         best_path = f"{args.save_dir}/best.pt"
         if os.path.exists(best_path):
