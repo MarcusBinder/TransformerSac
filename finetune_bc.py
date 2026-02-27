@@ -188,8 +188,6 @@ class Args:
     """Fraction of data held out for validation."""
     patience: int = 15
     """Early stopping patience (epochs without improvement)."""
-    num_workers: int = 4
-    """DataLoader workers."""
 
     # === Loss Settings ===
     loss_type: str = "mse"
@@ -224,8 +222,8 @@ class WindFarmBCDataset(Dataset):
     """
     Behavioral cloning dataset from HDF5 files.
 
-    Constructs observation histories matching the RL environment format
-    and pairs them with expert actions.
+    All data is loaded into memory and pre-stacked into contiguous tensors
+    for fast indexing without multiprocessing DataLoader workers.
 
     Each sample contains:
         obs:             (n_turbines, n_features × history_length) scaled to [-1, 1]
@@ -266,9 +264,17 @@ class WindFarmBCDataset(Dataset):
             "power": (0.0, 10e6),
         }
 
-        # Load all data
-        self.samples = []
+        # Temporary list for accumulation during loading
+        self._samples_list: List[dict] = []
+
+        # Episode boundaries: list of (start_idx, end_idx, layout_file, ep_key)
+        self.episode_boundaries: List[Tuple[int, int, str, str]] = []
+
+        # Load all data into self._samples_list
         self._load_all(layout_files, max_turbines)
+
+        # Stack into contiguous tensors and free the list
+        self._consolidate_tensors()
 
     def _scale_feature(self, data: np.ndarray, feature: str) -> np.ndarray:
         """Scale a feature array to [-1, 1] using known ranges."""
@@ -306,13 +312,10 @@ class WindFarmBCDataset(Dataset):
             max_turbines = max(all_n_turbs) if all_n_turbs else 0
         self.max_turbines = max_turbines
 
-        # Episode boundaries: list of (start_idx, end_idx, layout_file, ep_key)
-        self.episode_boundaries = []
-
         for fpath in layout_files:
             self._load_layout(fpath)
 
-        print(f"  Total BC samples: {len(self.samples)} "
+        print(f"  Total BC samples: {len(self._samples_list)} "
               f"from {len(self.episode_boundaries)} episodes")
 
     def _load_layout(self, fpath: str):
@@ -395,10 +398,9 @@ class WindFarmBCDataset(Dataset):
 
                 # Create sliding window samples
                 H = self.history_length
-                ep_start = len(self.samples)
+                ep_start = len(self._samples_list)
                 for t in range(H - 1, n_steps):
                     # Build obs: (max_turbines, n_features × H)
-                    # For each feature, take history [t-H+1, ..., t] per turbine
                     obs_parts = []
                     for feat in self.features:
                         feat_hist = scaled[feat][t - H + 1 : t + 1, :].T  # (max_turb, H)
@@ -415,19 +417,86 @@ class WindFarmBCDataset(Dataset):
                         sample["receptivity"] = recep.astype(np.float32)
                         sample["influence"] = infl.astype(np.float32)
 
-                    self.samples.append(sample)
+                    self._samples_list.append(sample)
 
-                ep_end = len(self.samples)
+                ep_end = len(self._samples_list)
                 if ep_end > ep_start:
                     self.episode_boundaries.append(
                         (ep_start, ep_end, fpath, ep_key)
                     )
 
+    def _consolidate_tensors(self):
+        """Stack all samples into contiguous tensors for fast indexing."""
+        n = len(self._samples_list)
+        if n == 0:
+            self.obs = torch.empty(0)
+            self.positions = torch.empty(0)
+            self.attention_mask = torch.empty(0)
+            self.expert_actions = torch.empty(0)
+            self.receptivity = None
+            self.influence = None
+            self._n_samples = 0
+            del self._samples_list
+            return
+
+        has_profiles = "receptivity" in self._samples_list[0]
+
+        print(f"  Consolidating {n} samples into contiguous tensors...")
+        t0 = time.time()
+
+        self.obs = torch.from_numpy(
+            np.stack([s["obs"] for s in self._samples_list])
+        )
+        self.positions = torch.from_numpy(
+            np.stack([s["positions"] for s in self._samples_list])
+        )
+        self.attention_mask = torch.from_numpy(
+            np.stack([s["attention_mask"] for s in self._samples_list])
+        )
+        self.expert_actions = torch.from_numpy(
+            np.stack([s["expert_actions"] for s in self._samples_list])
+        )
+
+        if has_profiles:
+            self.receptivity = torch.from_numpy(
+                np.stack([s["receptivity"] for s in self._samples_list])
+            )
+            self.influence = torch.from_numpy(
+                np.stack([s["influence"] for s in self._samples_list])
+            )
+        else:
+            self.receptivity = None
+            self.influence = None
+
+        self._n_samples = n
+
+        # Free the temporary list
+        del self._samples_list
+
+        mem_mb = (
+            self.obs.nbytes + self.positions.nbytes +
+            self.attention_mask.nbytes + self.expert_actions.nbytes
+        ) / 1e6
+        if self.receptivity is not None:
+            mem_mb += (self.receptivity.nbytes + self.influence.nbytes) / 1e6
+
+        print(f"  Consolidated in {time.time() - t0:.1f}s "
+              f"({mem_mb:.1f} MB in tensors)")
+
     def __len__(self):
-        return len(self.samples)
+        return self._n_samples
 
     def __getitem__(self, idx):
-        return self.samples[idx]
+        sample = {
+            "obs": self.obs[idx],
+            "positions": self.positions[idx],
+            "attention_mask": self.attention_mask[idx],
+            "expert_actions": self.expert_actions[idx],
+        }
+        if self.receptivity is not None:
+            sample["receptivity"] = self.receptivity[idx]
+            sample["influence"] = self.influence[idx]
+        return sample
 
     def episode_split(
         self,
@@ -455,7 +524,7 @@ class WindFarmBCDataset(Dataset):
         rng = np.random.RandomState(seed)
         ep_indices = rng.permutation(n_episodes)
 
-        target_val_samples = int(len(self.samples) * val_fraction)
+        target_val_samples = int(self._n_samples * val_fraction)
         val_sample_ids = []
         train_sample_ids = []
         val_ep_count = 0
@@ -476,7 +545,7 @@ class WindFarmBCDataset(Dataset):
               f"{val_ep_count} val episodes ({len(val_sample_ids)} samples)")
 
         # Sanity check
-        assert len(train_sample_ids) + len(val_sample_ids) == len(self.samples), \
+        assert len(train_sample_ids) + len(val_sample_ids) == self._n_samples, \
             "Episode split lost samples — boundary tracking bug"
 
         return Subset(self, train_sample_ids), Subset(self, val_sample_ids)
@@ -903,11 +972,11 @@ def main():
 
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True, drop_last=True,
+        num_workers=0, pin_memory=True, drop_last=True,
     )
     val_loader = DataLoader(
         val_set, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True,
+        num_workers=0, pin_memory=True,
     )
 
     # --- Dimensions from first sample ---
