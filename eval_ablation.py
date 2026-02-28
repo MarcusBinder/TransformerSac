@@ -491,33 +491,19 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Support running a single run via command-line arg (for SLURM array jobs)
-    if len(sys.argv) > 1:
-        run_name = sys.argv[1]
-        print(f"\n{'='*60}")
-        print(f"Run: {run_name}")
-        print(f"{'='*60}")
+    # Evaluate all runs in BASE_DIR
+    all_runs = sorted(os.listdir(BASE_DIR))
+    all_runs = [r for r in all_runs if r.startswith("A")]
+    random.shuffle(all_runs)
+
+    for run_name in all_runs:
         config_name, layout_str, seed = parse_run_name(run_name)
         if config_name is None:
-            print(f"[ERROR] Cannot parse run name: {run_name}")
-            sys.exit(1)
-        print(f"  config={config_name}, train_layout={layout_str}, seed={seed}")
-        print(f"  Evaluating on: {EVAL_LAYOUT}")
+            print(f"[SKIP] Cannot parse run name: {run_name}")
+            continue
+
+        print(f"\n{'='*60}")
+        print(f"Run: {run_name}  (config={config_name}, train_layout={layout_str}, seed={seed})")
+        print(f"{'='*60}")
+
         evaluate_run_on_layout(run_name, EVAL_LAYOUT, n_envs=N_ENVS)
-
-    else:
-        # Fallback: evaluate all runs in BASE_DIR
-        all_runs = sorted(os.listdir(BASE_DIR))
-        random.shuffle(all_runs)
-
-        for run_name in all_runs:
-            config_name, layout_str, seed = parse_run_name(run_name)
-            if config_name is None:
-                print(f"[SKIP] Cannot parse run name: {run_name}")
-                continue
-
-            print(f"\n{'='*60}")
-            print(f"Run: {run_name}  (config={config_name}, train_layout={layout_str}, seed={seed})")
-            print(f"{'='*60}")
-
-            evaluate_run_on_layout(run_name, EVAL_LAYOUT, n_envs=N_ENVS)
