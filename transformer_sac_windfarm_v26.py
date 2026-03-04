@@ -4,6 +4,7 @@ Transformer-based SAC for Wind Farm Control - V26
 Changes in V26:
 - Add pretraining as an option
     Args: pretrain_checkpoint, pretrain_freeze_steps
+- Add option to use alternative starting actions
 
 Changes in V25:
 - Add profile_embed_mode: -> Can either be added (what we did before) h = h + profiles or concattenated h = torch.cat(h, profiles)
@@ -274,6 +275,9 @@ class Args:
     finetune_reset_actor_optimizer: int = 0     # If True, reset optimizers for fresh fine-tuning. If False, resume optimizer states too.
     finetune_reset_critic_optimizer: int = 0    # If True, reset optimizers for fresh fine-tuning. If False, resume optimizer states too.
     finetune_reset_alpha: int = 0               # If True, reset entropy coefficient. If False, keep from checkpoint.
+
+    # === Initial Exploration Mode ===
+    initial_exploration: str = "random"  # "random" = sample from action space, "policy" = use actor network (useful when resuming from checkpoint)
 
     # === Pretrained Encoder Loading ===
     pretrain_checkpoint: Optional[str] = None   # Path to pretrained encoder .pt from pretrain_power.py
@@ -1704,6 +1708,15 @@ def main():
     # Parse arguments
     args = tyro.cli(Args)
     
+    # Validate initial_exploration
+    assert args.initial_exploration in ("random", "policy"), \
+        f"--initial_exploration must be 'random' or 'policy', got '{args.initial_exploration}'"
+    if args.initial_exploration == "policy" and args.resume_checkpoint is None:
+        print("WARNING: --initial_exploration=policy without --resume_checkpoint. "
+              "The actor is untrained, so 'policy' exploration will just be random Gaussian noise.")
+    if args.initial_exploration == "policy":
+        print(f"Initial exploration: using actor network for first {args.learning_starts} steps")
+    
     # Parse layouts
     layout_names = [l.strip() for l in args.layouts.split(",")]
     is_multi_layout = len(layout_names) > 1
@@ -2446,8 +2459,13 @@ def main():
 
         # Select action
         if global_step < args.learning_starts:
-            # Random exploration
-            actions = envs.action_space.sample()
+            if args.initial_exploration == "policy":
+                # Use the actor network (useful when resuming from checkpoint)
+                with torch.no_grad():
+                    actions = agent.act(envs, obs)
+            else:
+                # Random exploration (default for training from scratch)
+                actions = envs.action_space.sample()
         else:
             with torch.no_grad():
                 actions = agent.act(envs, obs)

@@ -204,14 +204,17 @@ def evaluate_checkpoint_episodes(env, agent, num_batches, num_envs, num_steps, d
 def parse_run_name(run_name):
     """
     Parse run names like:
-        'multifarm_E1_s1'                       -> ('E1', 1)
-        'multifarm_T1-T2-T3-T4-T5-T6_s2'       -> ('T1-T2-T3-T4-T5-T6', 2)
-    Returns (layout_str, seed) or (None, None).
+        'finetune_E1_ls100_s1'   -> ('finetune_ls100', 'E1', 1)
+        'finetune_E3_ls5000_s2'  -> ('finetune_ls5000', 'E3', 2)
+    Returns (config_name, layout_str, seed) or (None, None, None).
     """
-    match = re.match(r"multifarm_(.+)_s(\d+)", run_name)
+    match = re.match(r"finetune_(E\d+)_(ls\d+)_s(\d+)", run_name)
     if not match:
-        return None, None
-    return match.group(1), int(match.group(2))
+        return None, None, None
+    layout_str = match.group(1)
+    config_name = f"finetune_{match.group(2)}"
+    seed = int(match.group(3))
+    return config_name, layout_str, seed
 
 
 def find_safe_output_path(base_path):
@@ -399,7 +402,7 @@ def evaluate_run_on_layout(run_name, eval_layout, n_envs):
     with np.errstate(divide="ignore", invalid="ignore"):
         power_gain_pct_ts = (power_array / baseline_power_array - 1.0) * 100.0
 
-    layout_str, train_seed = parse_run_name(run_name)
+    config_name, layout_str, train_seed = parse_run_name(run_name)
 
     ds = xr.Dataset(
         {
@@ -476,11 +479,11 @@ if __name__ == "__main__":
 
     # Evaluate all runs in BASE_DIR
     all_runs = sorted(os.listdir(BASE_DIR))
-    all_runs = [r for r in all_runs if r.startswith("multifarm")]
+    all_runs = [r for r in all_runs if r.startswith("finetune")]
     random.shuffle(all_runs)
 
     for run_name in all_runs:
-        layout_str, seed = parse_run_name(run_name)
+        config_name, layout_str, seed = parse_run_name(run_name)
 
         if layout_str is None:
             print(f"[SKIP] Cannot parse run name: {run_name}")
@@ -490,13 +493,5 @@ if __name__ == "__main__":
         print(f"Run: {run_name}  (train_layout={layout_str}, seed={seed})")
         print(f"{'='*60}")
 
-        if layout_str == MULTI_LAYOUT_NAME:
-            # Multi-layout run: evaluate on ALL 11 layouts
-            eval_layouts_shuffled = ALL_EVAL_LAYOUTS.copy()
-            random.shuffle(eval_layouts_shuffled)
-            for eval_layout in eval_layouts_shuffled:
-                print(f"\nEvaluating on layout: {eval_layout}")
-                evaluate_run_on_layout(run_name, eval_layout, n_envs=N_ENVS)
-        else:
-            # Single-layout run: evaluate on its own layout only
-            evaluate_run_on_layout(run_name, eval_layout=layout_str, n_envs=N_ENVS)
+        # Single-layout run: evaluate on its own layout only
+        evaluate_run_on_layout(run_name, eval_layout=layout_str, n_envs=N_ENVS)
