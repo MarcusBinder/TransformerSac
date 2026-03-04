@@ -63,7 +63,6 @@ POSITIONAL ENCODING OPTIONS (--pos_encoding_type):
 - "RelativePositionalBiasWithWind": Relative bias incorporating wind direction
 
 MAIN TASKS:
-[ ] Also load in the action heads, if pretrained encoder checkpoint contains them (for full fine-tuning, not just encoder pretraining) TODO at least if we did BC
 [ ] Consider separate profile encoder instances for target networks if profiles become wind-direction-dependent (e.g. FourierProfileEncoderWithContext). Currently shared = soft-update is a no-op for encoder params.
 [ ] Implement FourierProfileEncoderWithContext that takes wind direction as input
 [ ] Add RelativePositionalBiasWithWind that takes wind direction as input
@@ -2057,6 +2056,13 @@ def main():
         # Store for phase 2 (weight loading after network construction)
         _pretrain_encoder_sd = _pt_ckpt["encoder_state_dict"]
         print(f"  Encoder state dict: {len(_pretrain_encoder_sd)} parameter tensors")
+
+        # BC checkpoints also contain the full actor (including action heads)
+        _pretrain_actor_sd = _pt_ckpt.get("actor_state_dict", None)
+        if _pretrain_actor_sd is not None:
+            print(f"  Actor state dict:   {len(_pretrain_actor_sd)} parameter tensors (BC checkpoint detected)")
+        else:
+            print(f"  No actor_state_dict found (self-supervised pretrain checkpoint)")
         print(f"{'='*60}\n")
 
         del _pt_ckpt  # free memory, keep only what we need
@@ -2328,9 +2334,51 @@ def main():
             return len(matched_keys)
 
 
-        n_actor = load_pretrained_into(actor, "Actor", _pretrain_encoder_sd)
+        # =================================================================
+        # Actor loading: full state dict (BC) or encoder-only (pretrain)
+        # =================================================================
+        if _pretrain_actor_sd is not None:
+            # BC checkpoint → load full actor including fc_mean/fc_logstd
+            # BUT preserve action_scale and action_bias_val from the env
+            # (they should match, but this is defensive)
+            env_action_scale = actor.action_scale.clone()
+            env_action_bias = actor.action_bias_val.clone()
+
+            # Flexible load: match what we can, skip shape mismatches
+            net_sd = actor.state_dict()
+            matched_keys = []
+            skipped_keys = []
+            for key, value in _pretrain_actor_sd.items():
+                if key in net_sd:
+                    if net_sd[key].shape == value.shape:
+                        net_sd[key] = value
+                        matched_keys.append(key)
+                    else:
+                        skipped_keys.append(
+                            f"{key} (shape: {list(value.shape)} vs {list(net_sd[key].shape)})"
+                        )
+                else:
+                    skipped_keys.append(f"{key} (not in Actor)")
+            actor.load_state_dict(net_sd)
+
+            # Restore env-derived action scaling (in case BC used different defaults)
+            actor.action_scale.copy_(env_action_scale)
+            actor.action_bias_val.copy_(env_action_bias)
+
+            print(f"\n  Actor (BC full load): loaded {len(matched_keys)}/{len(_pretrain_actor_sd)} params")
+            if matched_keys:
+                print(f"    Matched: {matched_keys[:8]}{'...' if len(matched_keys) > 8 else ''}")
+            if skipped_keys:
+                print(f"    Skipped: {skipped_keys}")
+            n_actor = len(matched_keys)
+        else:
+            # Self-supervised pretrain → encoder-only loading
+            n_actor = load_pretrained_into(actor, "Actor", _pretrain_encoder_sd)
+
+        # Critics always get encoder-only loading (obs_action_encoder input dim differs)
         n_qf1 = load_pretrained_into(qf1, "Critic qf1", _pretrain_encoder_sd)
         n_qf2 = load_pretrained_into(qf2, "Critic qf2", _pretrain_encoder_sd)
+        # n_qfX is the number of variables loaded in.
         
         # Re-sync target networks
         qf1_target.load_state_dict(qf1.state_dict())
@@ -2353,6 +2401,8 @@ def main():
             print(f"\n  Froze {len(frozen)} encoder params for {args.pretrain_freeze_steps} steps")
 
         del _pretrain_encoder_sd  # clean up
+        if _pretrain_actor_sd is not None:
+            del _pretrain_actor_sd
         print(f"{'='*60}\n")
     
     
