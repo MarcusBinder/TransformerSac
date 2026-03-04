@@ -1587,6 +1587,7 @@ def main():
         max_turbines=None,  # auto
         features=input_features,
         global_features=args.global_features,
+        action_type=None,  # pretrain doesn't need actions
         scaling_limits=scaling_limits,
         use_wd_deviation=args.use_wd_deviation,
         wd_scale_range=args.wd_scale_range,

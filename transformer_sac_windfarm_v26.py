@@ -282,6 +282,9 @@ class Args:
     pretrain_checkpoint: Optional[str] = None   # Path to pretrained encoder .pt from pretrain_power.py
     pretrain_freeze_steps: int = 0             # Freeze encoder for this many env steps (0 = no freeze)
 
+    # === Action Settings ===
+    action_type: str = "wind"   # "wind" (target setpoint) or "yaw" (delta). Overridden by BC checkpoint if provided.
+
 
 import gc
 
@@ -1846,9 +1849,43 @@ def main():
         profile_registry = None
 
 
+    # =========================================================================
+    # PRE-SCAN CHECKPOINT FOR ENV-AFFECTING ARGS (before env creation)
+    # =========================================================================
+    # If a pretrain/BC checkpoint is provided, we need action_type and
+    # history_length BEFORE creating the environment, since they affect
+    # config["ActionMethod"] and observation shape.
+    if args.pretrain_checkpoint is not None and os.path.exists(args.pretrain_checkpoint):
+        _prescan = torch.load(args.pretrain_checkpoint, map_location="cpu", weights_only=False)
+        _prescan_args = _prescan.get("args", {})
+
+        # --- action_type ---
+        if "action_type" in _prescan_args:
+            ckpt_action_type = _prescan_args["action_type"]
+            if ckpt_action_type != args.action_type:
+                print(f"  [pre-scan] Overriding action_type: {args.action_type} → {ckpt_action_type} (from checkpoint)")
+                args.action_type = ckpt_action_type
+            else:
+                print(f"  [pre-scan] action_type already matches checkpoint: {args.action_type}")
+
+        # --- history_length ---
+        if "history_length" in _prescan_args:
+            ckpt_history = _prescan_args["history_length"]
+            if ckpt_history != args.history_length:
+                print(f"  [pre-scan] Overriding history_length: {args.history_length} → {ckpt_history} (from checkpoint)")
+                args.history_length = ckpt_history
+            else:
+                print(f"  [pre-scan] history_length already matches checkpoint: {args.history_length}")
+
+        del _prescan  # free memory; full load happens later
+
     # Environment configuration
     print(f"using the config: {args.config}")
     config = make_env_config(args.config)
+
+    # Override ActionMethod from args (default "wind", or overridden by checkpoint above)
+    config["ActionMethod"] = args.action_type
+    print(f"ActionMethod set to: {config['ActionMethod']}")
     
     mes_prefixes = {
         "ws_mes": "ws",

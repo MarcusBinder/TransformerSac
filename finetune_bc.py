@@ -166,6 +166,9 @@ class Args:
     """JSON string of encoder-specific kwargs."""
 
     # === Action Settings ===
+    action_type: str = "wind"
+    """Which action representation to clone: 'wind' (target setpoint) or 'yaw' (delta yaw).
+    Must match the ActionMethod used in RL training (step 3)."""
     action_dim_per_turbine: int = 1
     """Action dimension per turbine (1 for yaw)."""
     action_scale: float = 1.0
@@ -244,6 +247,7 @@ class WindFarmBCDataset(Dataset):
         features: List[str] = ("ws", "wd", "yaw", "power"),
         history_length: int = 15,
         max_turbines: Optional[int] = None,
+        action_type: str = "wind",
         # Scaling
         scaling_ranges: Optional[dict] = None,
         # Preprocessing
@@ -255,6 +259,7 @@ class WindFarmBCDataset(Dataset):
         super().__init__()
         self.features = list(features)
         self.history_length = history_length
+        self.action_type = action_type
         self.use_wd_deviation = use_wd_deviation
         self.wd_scale_range = wd_scale_range
         self.use_wind_relative_pos = use_wind_relative_pos
@@ -351,7 +356,7 @@ class WindFarmBCDataset(Dataset):
                 feature_data = {}
                 for feat in self.features:
                     feature_data[feat] = ep[feat][:]  # (n_steps, n_turb)
-                actions = ep["actions"][:]  # (n_steps, n_turb)
+                actions = ep[f"actions_{self.action_type}"][:]  # (n_steps, n_turb)
 
                 # Handle wind direction deviation
                 if self.use_wd_deviation and "wd" in feature_data:
@@ -973,7 +978,7 @@ def main():
         mode = f"hist{args.history_length}"
         pretrain_tag = "pretrained" if args.pretrain_checkpoint else "scratch"
         run_name = (
-            f"{args.exp_name}_{args.policy}_{mode}"
+            f"{args.exp_name}_{args.policy}_{args.action_type}_{mode}"
             f"_e{args.embed_dim}_L{args.num_layers}_{pretrain_tag}"
         )
         tags = [t.strip() for t in args.wandb_tags.split(",")] if args.wandb_tags else None
@@ -1019,6 +1024,7 @@ def main():
         features=features,
         history_length=args.history_length,
         max_turbines=None,
+        action_type=args.action_type,
         scaling_ranges=scaling_ranges,
         use_wd_deviation=args.use_wd_deviation,
         wd_scale_range=args.wd_scale_range,
@@ -1059,6 +1065,7 @@ def main():
     print(f"  obs_dim (features × history): {obs_dim}")
     print(f"  max_turbines: {max_turbines}")
     print(f"  features: {features} ({len(features)} × {args.history_length} = {obs_dim})")
+    print(f"  action_type: {args.action_type}")
     print(f"  profiles: {'yes, ' + str(n_profile_dirs) + ' dirs' if has_profiles else 'no'}")
     print(f"  embed_dim: {args.embed_dim}")
     print(f"  num_heads: {args.num_heads}")
@@ -1170,6 +1177,7 @@ def main():
             "n_head_params": n_head_params,
             "n_layout_files": len(files),
             "pretrained": args.pretrain_checkpoint is not None,
+            "action_type": args.action_type,
         }, allow_val_change=True)
         wandb.watch(actor, log="gradients", log_freq=100)
 

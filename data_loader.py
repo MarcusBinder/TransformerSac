@@ -200,6 +200,8 @@ class WindFarmPretrainDataset(Dataset):
         features: List[str] = ["ws", "wd", "yaw", "power"],
         # --- Global features ---
         global_features: List[str] = [],
+        # --- Actions ---
+        action_type: Optional[str] = "wind",
         # --- Normalization ---
         scaling_limits: Optional[Dict[str, Tuple[float, float]]] = None,
         # --- Wind direction deviation ---
@@ -233,6 +235,7 @@ class WindFarmPretrainDataset(Dataset):
         self.history_length = history_length
         self.features = features
         self.global_features = list(global_features)
+        self.action_type = action_type
         self.use_wd_deviation = use_wd_deviation
         self.wd_scale_range = wd_scale_range
         self.use_wind_relative_pos = use_wind_relative_pos
@@ -312,9 +315,12 @@ class WindFarmPretrainDataset(Dataset):
                     ep_series = {}
                     for feat in self._history_features:
                         ep_series[feat] = ep[feat][:].astype(np.float32)
-                    # Always load power and actions for targets
+                    # Always load power for targets
                     ep_series["power"] = ep["power"][:].astype(np.float32)
-                    ep_series["actions"] = ep["actions"][:].astype(np.float32)
+                    # Conditionally load actions (BC needs them, pretrain may not)
+                    if self.action_type is not None:
+                        action_key = f"actions_{self.action_type}"
+                        ep_series["actions"] = ep[action_key][:].astype(np.float32)
                     episode_data[ep_key] = ep_series
 
                     # Valid timesteps: need history_length steps of context before
@@ -345,7 +351,10 @@ class WindFarmPretrainDataset(Dataset):
         N = len(self.index)
         self._obs = torch.zeros(N, self.max_turbines, self.obs_dim, dtype=torch.float32)
         self._target_power = torch.zeros(N, self.max_turbines, dtype=torch.float32)
-        self._actions = torch.zeros(N, self.max_turbines, dtype=torch.float32)
+        if self.action_type is not None:
+            self._actions = torch.zeros(N, self.max_turbines, dtype=torch.float32)
+        else:
+            self._actions = None
         self._positions = torch.zeros(N, self.max_turbines, 2, dtype=torch.float32)
         self._attention_mask = torch.ones(N, self.max_turbines, dtype=torch.bool)
         self._n_turbines = torch.zeros(N, dtype=torch.long)
@@ -414,8 +423,9 @@ class WindFarmPretrainDataset(Dataset):
             target_norm = self._normalize_feature("power", target_raw, mean_wd)
             self._target_power[global_idxs, :n_turb] = torch.from_numpy(target_norm)
 
-            actions = ep_data["actions"][timesteps - 1]  # (n_samples, n_turb)
-            self._actions[global_idxs, :n_turb] = torch.from_numpy(actions)
+            if self.action_type is not None:
+                actions = ep_data["actions"][timesteps - 1]  # (n_samples, n_turb)
+                self._actions[global_idxs, :n_turb] = torch.from_numpy(actions)
 
             # --- Mask & scalar metadata (bulk assign) ---
             self._attention_mask[global_idxs, :n_turb] = False
@@ -485,13 +495,14 @@ class WindFarmPretrainDataset(Dataset):
             "positions": self._positions[idx],
             "attention_mask": self._attention_mask[idx],
             "target_power": self._target_power[idx],
-            "actions": self._actions[idx],
             "n_turbines": self._n_turbines[idx],
             "layout_idx": self._layout_idx[idx],
             "mean_ws": self._mean_ws[idx],
             "mean_wd": self._mean_wd[idx],
             "mean_ti": self._mean_ti[idx],
         }
+        if self._actions is not None:
+            sample["actions"] = self._actions[idx]
         if self._has_profiles:
             sample["receptivity"] = self._receptivity[idx]
             sample["influence"] = self._influence[idx]
@@ -526,6 +537,8 @@ class WindFarmSnapshotDataset(Dataset):
         skip_steps: int = 1,
         # --- Global features ---
         global_features: List[str] = [],
+        # --- Actions ---
+        action_type: Optional[str] = None,  # accepted for API compat, not used in snapshot mode
         # --- Normalization ---
         scaling_limits: Optional[Dict[str, Tuple[float, float]]] = None,
         # --- Wind direction deviation ---
@@ -710,6 +723,8 @@ def create_pretrain_dataloader(
     skip_steps: int = 1,
     # --- Global features ---
     global_features: List[str] = [],
+    # --- Actions ---
+    action_type: Optional[str] = "wind",
     # --- Preprocessing flags ---
     scaling_limits: Optional[Dict[str, Tuple[float, float]]] = None,
     use_wd_deviation: bool = False,
@@ -737,6 +752,7 @@ def create_pretrain_dataloader(
     """
     common_kwargs = dict(
         global_features=global_features,
+        action_type=action_type,
         scaling_limits=scaling_limits,
         use_wd_deviation=use_wd_deviation,
         wd_scale_range=wd_scale_range,
