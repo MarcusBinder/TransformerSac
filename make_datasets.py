@@ -13,11 +13,13 @@ HDF5 Structure:
     └── episodes/
         └── ep_XXXX/
             ├── attrs: n_steps, mean_ws, mean_wd, mean_ti, seed
-            ├── ws      # (n_steps, n_turbines)
-            ├── wd      # (n_steps, n_turbines)
-            ├── yaw     # (n_steps, n_turbines)
-            ├── power   # (n_steps, n_turbines)
-            └── actions # (n_steps, n_turbines)
+            ├── ws           # (n_steps, n_turbines)
+            ├── wd           # (n_steps, n_turbines)
+            ├── yaw          # (n_steps, n_turbines)
+            ├── power        # (n_steps, n_turbines)
+            ├── rewards      # (n_steps,)
+            ├── actions_wind # (n_steps, n_turbines)  — target setpoint in [-1, 1]
+            └── actions_yaw  # (n_steps, n_turbines)  — delta yaw / max_delta, clipped [-1, 1]
 
 Usage:
     python make_dataset.py \\
@@ -160,7 +162,9 @@ def append_episode(
     wd: np.ndarray,       # (n_steps, n_turbines)
     yaw: np.ndarray,      # (n_steps, n_turbines)
     power: np.ndarray,    # (n_steps, n_turbines)
-    actions: np.ndarray,  # (n_steps, n_turbines)
+    actions_wind,   # (n_steps, n_turbines)
+    actions_yaw,    # (n_steps, n_turbines)
+    rewards,        # (n_steps,)
     mean_ws: float,
     mean_wd: float,
     mean_ti: float,
@@ -183,7 +187,9 @@ def append_episode(
         ep.create_dataset("wd", data=wd.astype(np.float32))
         ep.create_dataset("yaw", data=yaw.astype(np.float32))
         ep.create_dataset("power", data=power.astype(np.float32))
-        ep.create_dataset("actions", data=actions.astype(np.float32))
+        ep.create_dataset("rewards",      data=rewards.astype(np.float32))
+        ep.create_dataset("actions_wind", data=actions_wind.astype(np.float32))
+        ep.create_dataset("actions_yaw",  data=actions_yaw.astype(np.float32))
 
 
 # =============================================================================
@@ -234,31 +240,16 @@ def make_single_env(
 # AGENTS
 # =============================================================================
 
-def greedy_controller(fs, max_yaw_delta):
-    """Returns action in [-1, 1] representing desired yaw correction as fraction of max delta."""
-    yaw_baseline = fs.windTurbines.yaw
-    wind_dir_baseline = fs.get_wind_direction(
-        xyz=fs.windTurbines.rotor_positions_xyz, include_wakes=True
-    )
-    yaw_offset = (fs.wind_direction - wind_dir_baseline) + yaw_baseline
+def greedy_controller(fs, yaw_max: float):
+    """Wind-based: target yaw that aligns each turbine with its local (wake-inclusive) wind."""
+    wind_dir_local = fs.get_wind_direction(xyz=fs.windTurbines.rotor_positions_xyz, include_wakes=True)
+    # Target offset = what yaw the turbine needs to be at to face local wind
+    target_yaw = wind_dir_local - fs.wind_direction   # negative of the misalignment
+    return np.clip(target_yaw / yaw_max, -1.0, 1.0)
 
-    # Correct toward zero: clip to max step, normalize to [-1, 1]
-    action = np.clip(-yaw_offset / max_yaw_delta, -1, 1)
-    return action
-
-def pywake_agent(fs, optimal_yaws, max_yaw_delta):
-    """Returns action in [-1, 1] representing desired yaw correction as fraction of max delta.
-
-    Inputs:
-    - fs: FarmState object from WindGym, providing current turbine states and wind conditions
-    - optimal_yaws: array of optimal yaw angles (degrees) computed by PyWake for each turbine
-    - max_yaw_delta: maximum yaw change allowed per step (degrees)
-    """
-    yaw_baseline = fs.windTurbines.yaw
-    yaw_offset = optimal_yaws - yaw_baseline
-    # Correct toward optimal: clip to max step, normalize to [-1, 1]
-    action = np.clip(yaw_offset / max_yaw_delta, -1, 1)
-    return action
+def pywake_agent(optimal_yaws, yaw_max):
+    """Wind-based: target setpoint as fraction of yaw limit."""
+    return np.clip(optimal_yaws / yaw_max, -1.0, 1.0)
 
 # =============================================================================
 # EPISODE COLLECTION
@@ -286,7 +277,8 @@ def collect_episode(env, policy="random", max_steps=600) -> dict:
     mean_ti = float(base_env.ti)
 
     # Collect step data
-    ws_list, wd_list, yaw_list, power_list, action_list = [], [], [], [], []
+    ws_list, wd_list, yaw_list, power_list = [], [], [], []
+    actions_wind_list, actions_yaw_list, reward_list = [], [], []
 
     done = False
     current_step = 0
@@ -294,35 +286,46 @@ def collect_episode(env, policy="random", max_steps=600) -> dict:
     if policy == "pywake":
         py_agent = PyWakeAgent(
             x_pos=base_env.x_pos, y_pos=base_env.y_pos,
-            turbine=base_env.turbine, yaw_max=30, yaw_min=-30,
+            turbine=base_env.turbine, yaw_max=30, yaw_min=-30, # Use 30 because its better for the internal optimizer
             look_up=False, env=base_env,
         )
         py_agent.update_wind(wind_speed=base_env.ws, wind_direction=base_env.wd, TI=base_env.ti)
         py_agent.optimize()
 
     while not done:
-        # Select action
-        if policy == "random":
-            action = env.action_space.sample()
-        elif policy == "greedy":
-            action = greedy_controller(base_env.fs, max_yaw_delta=base_env.yaw_step_env)
-        elif policy == "pywake":
-            action = pywake_agent(base_env.fs, py_agent.optimized_yaws, max_yaw_delta=base_env.yaw_step_env)
-        else:
-            raise ValueError(f"Unknown policy: {policy}")
-
-        # Record pre-step measurements
         measurements = base_env.farm_measurements.get_measurements(scaled=False)
-        mes = measurements.reshape(n_turb, 4)  # (n_turb, 4) = [ws, wd, yaw, power]
+        mes = measurements.reshape(n_turb, 4)   # [ws, wd, yaw, power]
         ws_list.append(mes[:, 0].copy())
         wd_list.append(mes[:, 1].copy())
         yaw_list.append(mes[:, 2].copy())
         power_list.append(mes[:, 3].copy())
-        action_list.append(action.flatten()[:n_turb].copy())
+        yaw_before = mes[:, 2].copy()
+
+        # Select action
+        # Wind-based action (target setpoint)
+        if policy == "random":
+            action = env.action_space.sample()
+        elif policy == "greedy":
+            action = greedy_controller(base_env.fs, yaw_max=base_env.yaw_max)
+        elif policy == "pywake":
+            action = pywake_agent(py_agent.optimized_yaws, yaw_max=base_env.yaw_max)
+        else:
+            raise ValueError(f"Unknown policy: {policy}")
+
+        actions_wind_list.append(action.flatten()[:n_turb].copy())
 
         # Step
         obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
+        reward_list.append(float(reward))
+
+        # Post-step yaw → derive equivalent yaw-based action
+        mes_after = base_env.farm_measurements.get_measurements(scaled=False).reshape(n_turb, 4)
+        yaw_after = mes_after[:, 2].copy()
+        yaw_action = np.clip(
+            (yaw_after - yaw_before) / base_env.yaw_step_env, -1.0, 1.0
+        )
+        actions_yaw_list.append(yaw_action)
 
         current_step += 1
         if current_step >= max_steps:
@@ -330,11 +333,13 @@ def collect_episode(env, policy="random", max_steps=600) -> dict:
             done = True
 
     return {
-        "ws": np.stack(ws_list, axis=0),        # (n_steps, n_turb)
-        "wd": np.stack(wd_list, axis=0),
-        "yaw": np.stack(yaw_list, axis=0),
-        "power": np.stack(power_list, axis=0),
-        "actions": np.stack(action_list, axis=0),
+        "ws":           np.stack(ws_list,           axis=0),
+        "wd":           np.stack(wd_list,           axis=0),
+        "yaw":          np.stack(yaw_list,          axis=0),
+        "power":        np.stack(power_list,        axis=0),
+        "rewards":      np.array(reward_list,       dtype=np.float32),
+        "actions_wind": np.stack(actions_wind_list, axis=0),
+        "actions_yaw":  np.stack(actions_yaw_list,  axis=0),
         "mean_ws": mean_ws,
         "mean_wd": mean_wd,
         "mean_ti": mean_ti,
@@ -372,6 +377,9 @@ def _collect_single_episode(args: tuple) -> dict:
         TI_type=TI_type,
     )
 
+    if env.ActionMethod.lower() == "yaw":
+        print("The action method defined in the config was yaw. We change this to wind to ensure the correct action space is used for data collection.")
+        env.ActionMethod = "Wind"
     episode_data = collect_episode(env, policy=policy, max_steps=max_steps)
     env.close()
 
@@ -502,7 +510,9 @@ def collect_layout_data(
                 wd=ep_data["wd"],
                 yaw=ep_data["yaw"],
                 power=ep_data["power"],
-                actions=ep_data["actions"],
+                actions_wind=ep_data["actions_wind"],
+                actions_yaw=ep_data["actions_yaw"],
+                rewards=ep_data["rewards"],
                 mean_ws=ep_data["mean_ws"],
                 mean_wd=ep_data["mean_wd"],
                 mean_ti=ep_data["mean_ti"],
@@ -536,7 +546,9 @@ def collect_layout_data(
                     wd=ep_data["wd"],
                     yaw=ep_data["yaw"],
                     power=ep_data["power"],
-                    actions=ep_data["actions"],
+                    actions_wind=ep_data["actions_wind"],
+                    actions_yaw=ep_data["actions_yaw"],
+                    rewards=ep_data["rewards"],
                     mean_ws=ep_data["mean_ws"],
                     mean_wd=ep_data["mean_wd"],
                     mean_ti=ep_data["mean_ti"],
