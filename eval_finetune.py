@@ -485,10 +485,10 @@ if __name__ == "__main__":
     for run_name in all_runs:
         config_name, layout_str, seed = parse_run_name(run_name)
 
-        if layout_str is None:
-            print(f"[SKIP] Cannot parse run name: {run_name}")
-            continue
-
+        # if layout_str is None:
+        #     print(f"[SKIP] Cannot parse run name: {run_name}")
+        #     continue
+        layout_str="E5"
         print(f"\n{'='*60}")
         print(f"Run: {run_name}  (train_layout={layout_str}, seed={seed})")
         print(f"{'='*60}")
