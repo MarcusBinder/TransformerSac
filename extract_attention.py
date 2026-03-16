@@ -39,7 +39,7 @@ from helper_funcs import (
     EnhancedPerTurbineWrapper,
 )
 from MultiLayoutEnv import MultiLayoutEnv, LayoutConfig
-from transformer_sac_windfarm_v26 import TransformerActor, Args
+from transformer_sac_windfarm import TransformerActor, Args
 
 import gymnasium as gym
 from WindGym import WindFarmEnv
