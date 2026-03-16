@@ -32,13 +32,13 @@ except ImportError:
 
 from transformer_sac_windfarm import TransformerActor
 from helpers.helper_funcs import (
-    get_layout_positions,
-    make_env_config,
     transform_to_wind_relative,
     EnhancedPerTurbineWrapper,
     find_checkpoints,
     load_actor_from_checkpoint,
 )
+from helpers.layouts import get_layout_positions
+from helpers.env_configs import make_env_config
 from helpers.multi_layout_env import MultiLayoutEnv, LayoutConfig
 from WindGym import WindFarmEnv
 from WindGym.wrappers import PerTurbineObservationWrapper
