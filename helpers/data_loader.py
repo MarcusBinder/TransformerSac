@@ -584,6 +584,7 @@ class WindFarmSnapshotDataset(Dataset):
             with h5py.File(path, "r") as f:
                 layout_info = {
                     "path": str(path),
+                    "layout_name": str(f.attrs["layout_name"]),
                     "n_turbines": int(f.attrs["n_turbines"]),
                     "rotor_diameter": float(f.attrs["rotor_diameter"]),
                     "positions": f["positions/xy"][:].astype(np.float32),

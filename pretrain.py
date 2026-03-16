@@ -47,7 +47,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset, random_split
 from glob import glob
 from pathlib import Path
 
@@ -196,6 +196,10 @@ class Args:
     """AdamW weight decay."""
     val_split: float = 0.1
     """Fraction of data held out for validation."""
+    val_split_by_layout: bool = False
+    """Split validation by layout instead of random. All samples from selected layouts go to val."""
+    val_layout_indices: Optional[List[int]] = None
+    """Explicit layout indices for validation (e.g. [0, 2]). Overrides fraction-based selection."""
     # Data is loaded into RAM — no num_workers needed.
 
     # === Output / Checkpointing ===
@@ -233,6 +237,69 @@ def get_encoder_state_dict(actor: TransformerActor) -> dict:
         k: v for k, v in actor.state_dict().items()
         if not any(k.startswith(head) for head in ACTOR_HEAD_KEYS)
     }
+
+
+def split_by_layout(
+    dataset,
+    val_fraction: float,
+    val_layout_indices: Optional[List[int]],
+    seed: int,
+) -> Tuple[Subset, Subset, List[int], List[int]]:
+    """Split dataset into train/val Subsets by layout index.
+
+    All samples from held-out layouts go to val; the rest go to train.
+
+    Returns:
+        (train_subset, val_subset, train_layout_idxs, val_layout_idxs)
+    """
+    import random as _random
+
+    # Discover unique layout indices
+    if isinstance(dataset, WindFarmPretrainDataset):
+        all_layout_idxs = dataset._layout_idx.unique().tolist()
+    elif isinstance(dataset, WindFarmSnapshotDataset):
+        all_layout_idxs = sorted(set(entry[0] for entry in dataset.index))
+    else:
+        raise TypeError(f"Unsupported dataset type: {type(dataset)}")
+
+    n_layouts = len(all_layout_idxs)
+
+    # Determine which layouts go to validation
+    if val_layout_indices is not None:
+        val_layouts = set(val_layout_indices)
+    else:
+        rng = _random.Random(seed)
+        shuffled = list(all_layout_idxs)
+        rng.shuffle(shuffled)
+        n_val_layouts = max(1, round(n_layouts * val_fraction))
+        val_layouts = set(shuffled[:n_val_layouts])
+
+    train_layouts = sorted(set(all_layout_idxs) - val_layouts)
+    val_layouts_sorted = sorted(val_layouts)
+
+    # Partition sample indices
+    if isinstance(dataset, WindFarmPretrainDataset):
+        val_mask = torch.isin(
+            dataset._layout_idx,
+            torch.tensor(val_layouts_sorted, dtype=dataset._layout_idx.dtype),
+        )
+        val_indices = torch.where(val_mask)[0].tolist()
+        train_indices = torch.where(~val_mask)[0].tolist()
+    else:  # WindFarmSnapshotDataset
+        train_indices = []
+        val_indices = []
+        for i, (li, _, _) in enumerate(dataset.index):
+            if li in val_layouts:
+                val_indices.append(i)
+            else:
+                train_indices.append(i)
+
+    return (
+        Subset(dataset, train_indices),
+        Subset(dataset, val_indices),
+        train_layouts,
+        val_layouts_sorted,
+    )
 
 
 def _encode_with_actor(
@@ -1601,13 +1668,32 @@ def main():
         dataset = WindFarmPretrainDataset(history_length=args.history_length, **common_kwargs)
 
     # Train/val split
-    n_val = int(len(dataset) * args.val_split)
-    n_train = len(dataset) - n_val
-    train_set, val_set = random_split(
-        dataset, [n_train, n_val],
-        generator=torch.Generator().manual_seed(args.seed),
-    )
-    print(f"Train: {n_train} samples, Val: {n_val} samples")
+    n_layouts = len(dataset.layouts)
+    train_layout_idxs = None
+    val_layout_idxs = None
+
+    if args.val_split_by_layout and n_layouts > 1:
+        train_set, val_set, train_layout_idxs, val_layout_idxs = split_by_layout(
+            dataset, args.val_split, args.val_layout_indices, args.seed,
+        )
+        n_train, n_val = len(train_set), len(val_set)
+        # Log layout assignments with names
+        def _layout_names(idxs):
+            return [dataset.layouts[i].get("layout_name", f"layout_{i}") for i in idxs]
+        print(f"Layout-based split:")
+        print(f"  Train layouts ({len(train_layout_idxs)}): {_layout_names(train_layout_idxs)}  ({n_train} samples)")
+        print(f"  Val layouts   ({len(val_layout_idxs)}):   {_layout_names(val_layout_idxs)}  ({n_val} samples)")
+    else:
+        if args.val_split_by_layout and n_layouts <= 1:
+            print("Warning: --val-split-by-layout requested but only 1 layout found. "
+                  "Falling back to random split.")
+        n_val = int(len(dataset) * args.val_split)
+        n_train = len(dataset) - n_val
+        train_set, val_set = random_split(
+            dataset, [n_train, n_val],
+            generator=torch.Generator().manual_seed(args.seed),
+        )
+        print(f"Train: {n_train} samples, Val: {n_val} samples")
 
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True,
@@ -1719,6 +1805,9 @@ def main():
             "n_params": n_params,
             "n_layout_files": len(files),
             "input_features": input_features,
+            "val_split_by_layout": args.val_split_by_layout,
+            "val_layout_indices": val_layout_idxs,
+            "train_layout_indices": train_layout_idxs,
         }, allow_val_change=True)
         wandb.watch(model, log="all", log_freq=500)
 
@@ -1842,6 +1931,9 @@ def main():
                 "max_turbines": max_turbines,
                 "n_profile_dirs": n_profile_dirs,
                 "input_features": input_features,
+                "val_split_by_layout": args.val_split_by_layout,
+                "val_layout_indices": val_layout_idxs,
+                "train_layout_indices": train_layout_idxs,
             }
             if args.pretrain_mode == "power":
                 checkpoint["val_mse"] = val_mse
@@ -1879,6 +1971,9 @@ def main():
         "max_turbines": max_turbines,
         "n_profile_dirs": n_profile_dirs,
         "input_features": input_features,
+        "val_split_by_layout": args.val_split_by_layout,
+        "val_layout_indices": val_layout_idxs,
+        "train_layout_indices": train_layout_idxs,
     }
     if args.pretrain_mode == "power":
         final_checkpoint["val_mae"] = val_mae
