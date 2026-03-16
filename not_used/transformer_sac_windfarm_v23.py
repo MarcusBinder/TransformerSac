@@ -137,7 +137,7 @@ from receptivity_profiles import compute_layout_profiles
 # Evaluation import
 from eval_utils import PolicyEvaluator, run_evaluation
 
-from positional_encodings_helper import (
+from positional_encodings import (
     AbsolutePositionalEncoding,
     RelativePositionalBias,
     Sinusoidal2DPositionalEncoding,
@@ -154,7 +154,7 @@ from positional_encodings_helper import (
     GATPositionalEncoder,
 )
 
-from profile_encodings_helper import (
+from profile_encodings import (
     CNNProfileEncoder,
     DilatedProfileEncoder,
     AttentionProfileEncoder,
