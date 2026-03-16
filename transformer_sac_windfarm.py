@@ -45,15 +45,15 @@ from torch.utils.tensorboard import SummaryWriter
 # WindGym imports (adjust path as needed for your setup)
 from WindGym import WindFarmEnv
 from WindGym.wrappers import RecordEpisodeVals, PerTurbineObservationWrapper
-from agent import WindFarmAgent
+from helpers.agent import WindFarmAgent
 
 # Logging utilities for multi-layout training
-from multi_layout_debug import (
+from helpers.multi_layout_debug import (
     MultiLayoutDebugLogger,
     create_debug_logger,
 )
 
-from helper_funcs import (
+from helpers.helper_funcs import (
     get_layout_positions,
     get_env_wind_directions,
     get_env_raw_positions,
@@ -73,10 +73,10 @@ from helper_funcs import (
 )
 
 # Receptivity profile computation
-from receptivity_profiles import compute_layout_profiles
+from helpers.receptivity_profiles import compute_layout_profiles
 
 # Evaluation import
-from eval_utils import PolicyEvaluator, run_evaluation
+from helpers.eval_utils import PolicyEvaluator, run_evaluation
 
 from positional_encodings import (
     AbsolutePositionalEncoding,
@@ -1714,7 +1714,7 @@ def main():
     # Import WindGym components
     from WindGym import WindFarmEnv
     from WindGym.wrappers import RecordEpisodeVals, PerTurbineObservationWrapper
-    from MultiLayoutEnv import MultiLayoutEnv, LayoutConfig
+    from helpers.multi_layout_env import MultiLayoutEnv, LayoutConfig
     
     # Wind turbine
     if args.turbtype == "DTU10MW":
@@ -1736,7 +1736,7 @@ def main():
 
         if args.profile_encoding_type is not None:
             if args.profile_source.lower() == "geometric":
-                from geometric_profiles import compute_layout_profiles_vectorized
+                from helpers.geometric_profiles import compute_layout_profiles_vectorized
                 
                 # Get rotor diameter as a float (geometric version doesn't need the full WT object)
                 D = wind_turbine.diameter()  # or however DTU10MW exposes this

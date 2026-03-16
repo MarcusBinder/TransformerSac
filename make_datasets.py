@@ -48,7 +48,7 @@ import tyro
 # WindGym imports
 from WindGym import WindFarmEnv
 
-from helper_funcs import (
+from helpers.helper_funcs import (
     get_layout_positions,
     make_env_config,
 )
@@ -399,7 +399,7 @@ def compute_profiles(
 ):
     """Compute receptivity and influence profiles for a layout."""
     if profile_source.lower() == "geometric":
-        from geometric_profiles import compute_layout_profiles_vectorized
+        from helpers.geometric_profiles import compute_layout_profiles_vectorized
         D = wind_turbine.diameter()
         recep, infl = compute_layout_profiles_vectorized(
             x_pos, y_pos,
@@ -410,7 +410,7 @@ def compute_profiles(
             scale_factor=15.0,
         )
     elif profile_source.lower() == "pywake":
-        from receptivity_profiles import compute_layout_profiles
+        from helpers.receptivity_profiles import compute_layout_profiles
         recep, infl = compute_layout_profiles(
             x_pos, y_pos, wind_turbine,
             n_directions=n_directions,

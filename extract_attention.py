@@ -20,7 +20,6 @@ Produces:  attention_data/E3_wd273_step150000.npz
 """
 
 import os
-import sys
 import json
 import argparse
 from dataclasses import dataclass
@@ -30,15 +29,14 @@ import numpy as np
 import torch
 
 # ── Project imports ──────────────────────────────────────────────────────────
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from helper_funcs import (
+from helpers.helper_funcs import (
     get_layout_positions,
     make_env_config,
     transform_to_wind_relative,
     rotate_profiles_tensor,
     EnhancedPerTurbineWrapper,
 )
-from MultiLayoutEnv import MultiLayoutEnv, LayoutConfig
+from helpers.multi_layout_env import MultiLayoutEnv, LayoutConfig
 from transformer_sac_windfarm import TransformerActor, Args
 
 import gymnasium as gym
@@ -84,7 +82,7 @@ def compute_profiles(ckpt_args, x_pos, y_pos, rotor_diameter, wind_turbine):
     source = ckpt_args.get("profile_source", "PyWake").lower()
 
     if source == "geometric":
-        from geometric_profiles import compute_layout_profiles_vectorized
+        from helpers.geometric_profiles import compute_layout_profiles_vectorized
         return compute_layout_profiles_vectorized(
             x_pos, y_pos,
             rotor_diameter=rotor_diameter,
@@ -94,7 +92,7 @@ def compute_profiles(ckpt_args, x_pos, y_pos, rotor_diameter, wind_turbine):
             scale_factor=15.0,
         )
     else:
-        from receptivity_profiles import compute_layout_profiles
+        from helpers.receptivity_profiles import compute_layout_profiles
         return compute_layout_profiles(
             x_pos, y_pos, wind_turbine, n_directions=n_dirs,
         )
