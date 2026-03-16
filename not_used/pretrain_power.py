@@ -1,3 +1,4 @@
+# This functionality has been absorbed by the other pretraining
 """
 Power Prediction Pretraining for Wind Farm Transformer
 
