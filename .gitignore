@@ -10,3 +10,6 @@ logs/
 /runs
 /figs
 /figs
+/pretrain_data
+/pretrain_data_greedy
+/pretrain_data_pywake
