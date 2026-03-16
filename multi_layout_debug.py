@@ -374,7 +374,7 @@ class MultiLayoutDebugLogger:
         head_idx: Optional[int] = None,
         title: str = "",
         sample_idx: int = 0,
-    ):
+    ): #TODO THIS USES THE WRONG X AXIS FOR UPWIND/DOWNWIND: 
         """
         Create a figure showing attention patterns overlaid on farm layout.
         
@@ -575,7 +575,7 @@ class MultiLayoutDebugLogger:
         layer_idx: int = -1,
         sample_idx: int = 0,
         title: str = "",
-    ):
+    ): #TODO THIS USES THE WRONG X AXIS FOR UPWIND/DOWNWIND: 
         """
         Create a figure showing attention patterns for each head separately.
         
