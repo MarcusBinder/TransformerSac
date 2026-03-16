@@ -6,7 +6,7 @@ import torch.nn as nn
 from typing import Optional
 
 
-class RelativePositionalBias(nn.Module): # This is okay
+class RelativePositionalBias(nn.Module):
     """
     Relative positional bias for attention.
 
@@ -108,7 +108,7 @@ class RelativePositionalBias(nn.Module): # This is okay
 
         return bias
 
-class RelativePolarBias(nn.Module): # This is okay
+class RelativePolarBias(nn.Module):
     """
     Relative positional bias using polar coordinates.
 
@@ -197,7 +197,7 @@ class RelativePolarBias(nn.Module): # This is okay
 
         return bias
 
-class ALiBiPositionalBias(nn.Module): # Did not show good perforamnce in inital testing.
+class ALiBiPositionalBias(nn.Module):
     """
     Attention with Linear Biases (ALiBi) for 2D spatial positions.
 

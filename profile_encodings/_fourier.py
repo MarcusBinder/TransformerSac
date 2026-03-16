@@ -38,8 +38,8 @@ class FourierProfileEncoder(nn.Module):
         self,
         embed_dim: int = 128,
         n_harmonics: int = 8,
-        use_phase: bool = False,        # Always false gave best results.
-        learnable_weights: bool = True, # Inital test showed that learnable weights can help, but not by much. Worth further tuning.
+        use_phase: bool = False,
+        learnable_weights: bool = True,
         **kwargs,
     ):
         super().__init__()

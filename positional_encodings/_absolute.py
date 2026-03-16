@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 
-class AbsolutePositionalEncoding(nn.Module): # I dont like this one
+class AbsolutePositionalEncoding(nn.Module):
     """
     Original absolute positional encoding for turbine (x, y) coordinates.
 
@@ -42,7 +42,7 @@ class AbsolutePositionalEncoding(nn.Module): # I dont like this one
         return self.encoder(positions)
 
 
-class Sinusoidal2DPositionalEncoding(nn.Module): # I dont like this one
+class Sinusoidal2DPositionalEncoding(nn.Module):
     """
     Sinusoidal positional encoding extended to 2D coordinates.
 
@@ -98,7 +98,7 @@ class Sinusoidal2DPositionalEncoding(nn.Module): # I dont like this one
 
         return self.proj(raw_embeddings)
 
-class PolarPositionalEncoding(nn.Module): # I dont like this one
+class PolarPositionalEncoding(nn.Module):
     """
     Positional encoding using polar coordinates (r, θ).
 

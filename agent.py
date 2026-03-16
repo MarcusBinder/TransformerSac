@@ -97,7 +97,6 @@ class BatchPreparer:
         
         # Query environment state
         wind_dirs = np.array(envs.env.get_attr('wd'), dtype=np.float32)
-        # print("INSIDE THE ACTOR WIND DIRS:", wind_dirs)
         raw_positions = np.array(envs.env.get_attr('turbine_positions'), dtype=np.float32)
         masks = np.array(envs.env.get_attr('attention_mask'), dtype=bool)
         
