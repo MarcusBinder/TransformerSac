@@ -102,6 +102,7 @@ from profile_encodings import (
     FourierProfileEncoder,
     MultiResolutionProfileEncoder,
     FourierProfileEncoderWithContext,
+    TancikProfileEncoder,
 )
 
 # =============================================================================
@@ -493,6 +494,7 @@ VALID_PROFILE_ENCODING_TYPES = [
     # === Fourier Based ===
     "FourierProfileEncoder",                # Encode circular profiles via Fourier decomposition.
     "FourierProfileEncoderWithContext",     # Needs wind direction as input. Not yet implemented
+    "TancikProfileEncoder",                 # Random Fourier Features (Tancik et al., NeurIPS 2020)
 ]
 
 def create_profile_encoding(
@@ -534,6 +536,7 @@ def create_profile_encoding(
     # Default configs per encoder type, overridden by encoder_kwargs
     ENCODER_DEFAULTS = {
         "FourierProfileEncoder": dict(n_harmonics=8, use_phase=False, learnable_weights=True),
+        "TancikProfileEncoder": dict(n_features=128, sigma=1.0),
         "MultiResolutionProfileEncoder": dict(scales=[3, 7, 15, 31], channels_per_scale=16),
         "AttentionProfileEncoder": dict(n_attention_heads=4),
     }
@@ -551,6 +554,7 @@ def create_profile_encoding(
         "AttentionProfileEncoder": AttentionProfileEncoder,
         "MultiResolutionProfileEncoder": MultiResolutionProfileEncoder,
         "FourierProfileEncoder": FourierProfileEncoder,
+        "TancikProfileEncoder": TancikProfileEncoder,
     }
     
     cls = ENCODER_CLASSES.get(profile_type)
