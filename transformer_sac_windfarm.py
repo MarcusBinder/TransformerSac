@@ -1,86 +1,24 @@
 """
-Transformer-based SAC for Wind Farm Control - V26
+Transformer-based SAC for Wind Farm Control.
 
-Changes in V26:
-- Add pretraining as an option
-    Args: pretrain_checkpoint, pretrain_freeze_steps
-- Add option to use alternative starting actions
+Trains a Soft Actor-Critic agent with a transformer backbone to learn
+yaw control policies that generalize across wind farm layouts.
 
-Changes in V25:
-- Add profile_embed_mode: -> Can either be added (what we did before) h = h + profiles or concattenated h = torch.cat(h, profiles)
-- Simplified the self.profile_fusion, to just a nn.Linear(2 * embed_dim, embed_dim)
-- Added profile encoder: MultiResolutionProfileEncoder
-- Added profile_encoder_kwargs: JSON string to flexibly specify kwargs for profile encoder (e.g. number of scales and channels in MultiResolutionProfileEncoder)
+Design principles:
+    1. Per-turbine tokenization: Each turbine is a token with local observations
+    2. Wind-relative positional encoding: Positions rotated so wind comes from 270°
+    3. Wind direction as deviation from mean (rotation invariant)
+    4. Shared actor/critic heads across turbines (permutation equivariant)
+    5. Adaptive target entropy based on actual turbine count
+    6. Modular positional encoding with absolute and relative options
 
-Changes in V24:
-- Moved to comand line config 
+Positional encoding options (--pos_encoding_type):
+    absolute_mlp, sinusoidal_2d, polar_mlp, relative_mlp, relative_mlp_shared,
+    relative_polar, alibi, alibi_directional, absolute_plus_relative,
+    RelativePositionalBiasAdvanced, RelativePositionalBiasFactorized,
+    RelativePositionalBiasWithWind
 
-Changes in V23:
-- Added geometric profiles as alternative to PyWake profiles
-- Renamed the following:
-    PyWakeProfileEncoder -> CNNProfileEncoder
-    PyWakeProfileEncoderDilated ->  DilatedProfileEncoder
-    PyWakeProfileEncoderWithAttention -> AttentionProfileEncoder
-
-Changes in V22:
-- Added the following positional encoders:
-    GATPositionalEncoder: A Graph Attention Network encoder for turbine positions, allowing for more flexible spatial context encoding based on local neighborhoods.
-    SpatialContextEmbedding: Embeds spatial context such as local turbine density or distance to nearest turbine, providing additional information about the environment.
-    NeighborhoodAggregationEmbedding: Embeds local neighborhood information by aggregating features of nearby turbines, capturing local interactions more explicitly.
-    WakeKernelBias: A positional bias based on physics-inspired wake interaction kernels, encoding expected influence patterns based on relative positions.
-- Added pos_embedding_mode: Arguemnt to control how positional encodings are integrated (added vs concatenated), allowing for more flexible architectural choices.
-    
-
-
-Key design principles:
-1. Per-turbine tokenization: Each turbine is a token with local observations
-2. Wind-relative positional encoding: Positions rotated so wind comes from 270° (optional)
-3. Wind direction as DEVIATION from mean (not absolute) - rotation invariant (optional)
-4. Shared actor/critic heads across turbines (permutation equivariant)
-5. Adaptive target entropy based on actual turbine count (not max)
-6. Optional farm-level token for global context (removed)
-7. NEW: Modular positional encoding with absolute and relative options
-
-Author: Marcus (DTU Wind Energy)
-Based on discussions about transformer architectures for wind farm control.
-
-================================================================================
-TODO LIST - ACTIVE DEVELOPMENT
-================================================================================
-
-POSITIONAL ENCODING OPTIONS (--pos_encoding_type):
-- "absolute_mlp": (DEFAULT) MLP on absolute (x,y) → add to token embedding
-- "sinusoidal_2d": Multi-frequency sin/cos encoding of 2D coordinates
-- "polar_mlp": MLP on polar (r, θ) coordinates
-- "relative_mlp": MLP on pairwise relative positions → attention bias (per-head)
-- "relative_mlp_shared": Same as relative_mlp but heads share bias
-- "relative_polar": MLP on pairwise polar (Δr, Δθ) → attention bias
-- "alibi": Linear distance penalty (no learned params)
-- "alibi_directional": ALiBi with upwind/downwind asymmetry (learned slopes)
-- "absolute_plus_relative": Both absolute embedding AND relative bias
-- "RelativePositionalBiasAdvanced": Relative bias with distance and angle features
-- "RelativePositionalBiasFactorized": Factorized relative bias for efficiency
-- "RelativePositionalBiasWithWind": Relative bias incorporating wind direction
-
-MAIN TASKS:
-[ ] Consider separate profile encoder instances for target networks if profiles become wind-direction-dependent (e.g. FourierProfileEncoderWithContext). Currently shared = soft-update is a no-op for encoder params.
-[ ] Implement FourierProfileEncoderWithContext that takes wind direction as input
-[ ] Add RelativePositionalBiasWithWind that takes wind direction as input
-[ ] Make weights shared between actor and critic for: pos_encoder, rel_pos_bias, input_proj, transformer
-
-
-
-TEMPORAL EXTENSIONS (OPTION B)
-[ ] Design spatio-temporal attention mechanism
-[ ] Implement SpatioTemporalTransformer class
-[ ] Add temporal attention masking (causal)
-[ ] Consider GTrXL for very long-range dependencies
-
-KNOWN ISSUES / NOTES:
-- History length of 15 may need tuning based on wake propagation time
-- Gradient clipping at 1.0 is not yet tested
-
-================================================================================
+Author: Marcus Binder Nilsen (DTU Wind Energy)
 """
 
 import os
@@ -107,8 +45,6 @@ from torch.utils.tensorboard import SummaryWriter
 # WindGym imports (adjust path as needed for your setup)
 from WindGym import WindFarmEnv
 from WindGym.wrappers import RecordEpisodeVals, PerTurbineObservationWrapper
-# from MultiLayoutEnv import MultiLayoutEnv, LayoutConfig, create_layout_configs
-
 from agent import WindFarmAgent
 
 # Logging utilities for multi-layout training
@@ -128,7 +64,6 @@ from helper_funcs import (
     transform_to_wind_relative,
     compute_wind_direction_deviation,
     EnhancedPerTurbineWrapper,
-    # get_env_profiles,
     get_env_receptivity_profiles,
     get_env_influence_profiles,
     rotate_profiles_tensor,
@@ -143,7 +78,7 @@ from receptivity_profiles import compute_layout_profiles
 # Evaluation import
 from eval_utils import PolicyEvaluator, run_evaluation
 
-from positional_encodings_helper import (
+from positional_encodings import (
     AbsolutePositionalEncoding,
     RelativePositionalBias,
     Sinusoidal2DPositionalEncoding,
@@ -160,13 +95,13 @@ from positional_encodings_helper import (
     GATPositionalEncoder,
 )
 
-from profile_encodings_helper import (
+from profile_encodings import (
     CNNProfileEncoder,
     DilatedProfileEncoder,
     AttentionProfileEncoder,
     FourierProfileEncoder,
     MultiResolutionProfileEncoder,
-    FourierProfileEncoderWithContext, # Needs wind direction as input. Not yet implemented
+    FourierProfileEncoderWithContext,
 )
 
 # =============================================================================

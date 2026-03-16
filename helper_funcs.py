@@ -34,16 +34,6 @@ def soft_update(source, target, tau):
 # =============================================================================
 
 
-# def load_actor_from_checkpoint(checkpoint_path: str, device: torch.device):
-#     """Load actor network from checkpoint."""
-#     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-#     args = checkpoint["args"]
-
-#     # Return checkpoint and args
-#     return checkpoint, args
-
-
-
 def load_actor_from_checkpoint(checkpoint_path: str, device: torch.device):
     """Load actor network from checkpoint (handles old and new formats)."""
     data = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -398,9 +388,6 @@ def get_layout_positions(layout_type: str, wind_turbine) -> Tuple[np.ndarray, np
     Returns:
         x_pos, y_pos: Arrays of turbine positions
     """
-    # Import here to avoid circular imports when not using WindGym
-    # from WindGym.utils.generate_layouts import generate_square_grid, generate_cirular_farm
-    
     layouts = {
         "test_layout": lambda: generate_square_grid(turbine=wind_turbine, nx=2, ny=1, xDist=5, yDist=5),
         "3turb": lambda: generate_square_grid(turbine=wind_turbine, nx=3, ny=1, xDist=5, yDist=5),
@@ -511,8 +498,7 @@ def get_env_receptivity_profiles(envs) -> np.ndarray:
         Shape (num_envs, max_turbines, n_directions)
     """
     if envs.env.get_attr('receptivity_profiles')[0] is None:
-        print("The receptivity profiles are None")
-        print("I dont know if this will cause issues later, so be careful")
+        print("Warning: receptivity profiles are None")
     return np.array(envs.env.get_attr('receptivity_profiles'), dtype=np.float32)
 
 def get_env_layout_indices(envs) -> List[int]:
@@ -529,8 +515,7 @@ def get_env_influence_profiles(envs) -> np.ndarray:
         Shape (num_envs, max_turbines, n_directions)
     """
     if envs.env.get_attr('influence_profiles')[0] is None:
-        print("The influence profiles are None")
-        print("I dont know if this will cause issues later, so be careful")
+        print("Warning: influence profiles are None")
     return np.array(envs.env.get_attr('influence_profiles'), dtype=np.float32)
 
 

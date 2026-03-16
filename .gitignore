@@ -1,16 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
 
-/__pycache__
+# Data files
 *.nc
+
+# Training artifacts
 /wandb
 *events*
 */events.*
 runs/
-*.sh
 logs/
-/runs
-/figs
-/figs
+
+# Pretrained weights
+pretrained_pt/
+
+# Pretraining data
 /pretrain_data
 /pretrain_data_greedy
 /pretrain_data_pywake
+
+# Generated figures
+/figs
+
+# Misc
 /trash
+*.sh
+.DS_Store
+.vscode/
+.ipynb_checkpoints/
+.claude/

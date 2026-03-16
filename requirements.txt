@@ -1,0 +1,11 @@
+torch>=2.0
+numpy
+gymnasium
+tyro
+wandb
+pandas
+matplotlib
+scipy
+h5py
+xarray
+py_wake

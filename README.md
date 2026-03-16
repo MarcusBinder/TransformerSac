@@ -1,60 +1,66 @@
-# Transformer-Based Wind Farm Control
+# Transformer-Based SAC for Wind Farm Yaw Control
 
-This project develops transformer-based reinforcement learning approaches for wind farm yaw control that can generalize across different farm configurations.
+A transformer-based Soft Actor-Critic (SAC) agent that learns generalizable yaw control policies for wind farms. Trained on diverse farm layouts, it can deploy zero-shot to unseen configurations.
 
-## Overview
+## Key Features
 
-Wind turbines in a farm create wakes that reduce power output for downstream turbines. By coordinating yaw angles across turbines, we can steer wakes and increase total farm power production. Traditional control methods require retraining for each new farm layout, limiting their practical deployment.
+- **Zero-shot generalization** — Train on small farms (3-6 turbines), deploy on larger ones (20-25 turbines) without retraining
+- **Layout transfer** — Learn from grid layouts, transfer to irregular and circular arrangements
+- **Interpretable attention** — Attention weights reveal which turbines influence each control decision
+- **Wind-relative encoding** — Positions are transformed to a canonical wind frame, making the policy invariant to absolute wind direction
+- **Modular architecture** — Pluggable positional encodings (MLP, sinusoidal, polar, ALiBi, relative bias) and profile encoders (Fourier, CNN, dilated, attention-based)
 
-This work uses transformer architectures to learn control policies that:
 
-- **Generalize across farm sizes**: Train on small farms, deploy on larger ones
-- **Transfer between layouts**: Learn from square grids, apply to circular arrangements
-- **Provide interpretability**: Attention weights reveal which turbines the policy considers when making decisions
+## Quick Start
+
+**Training:**
+```bash
+python transformer_sac_windfarm.py \
+    --train_layouts T1 T2 T3 T4 T5 T6 \
+    --eval_layouts E1 E2 E3 \
+    --total_timesteps 500000 \
+    --pos_encoding_type absolute_mlp \
+    --use_profiles \
+    --seed 1
+```
+
+**Evaluation:**
+```bash
+python evaluate.py \
+    --checkpoint runs/<run_name>/checkpoints/step_500000.pt \
+    --eval_layouts E1 E2 E3 E4 E5
+```
+
+## Project Structure
+
+| Path | Description |
+|------|-------------|
+| `transformer_sac_windfarm.py` | Main training script (SAC + transformer architecture) |
+| `agent.py` | `WindFarmAgent` — wraps the actor for inference |
+| `evaluate.py` | Evaluation pipeline |
+| `eval_utils.py` | Evaluation helper functions |
+| `helper_funcs.py` | Checkpoint I/O, coordinate transforms, env utilities |
+| `MultiLayoutEnv.py` | Multi-layout environment for training across farm configurations |
+| `positional_encodings/` | Positional encoding modules (absolute, bias, GAT, neighborhood) |
+| `profile_encodings/` | Wake profile encoders (Fourier, CNN, dilated, attention) |
+| `receptivity_profiles.py` | Compute turbine receptivity/influence profiles via PyWake |
+| `geometric_profiles.py` | Geometry-based profile approximations |
+| `pretrain.py` | Behavioral cloning pretraining |
+| `extract_attention.py` | Extract attention weights for analysis |
+| `Notebooks/` | Plotting and analysis notebooks (WES paper figures) |
+| `archive/` | Historical development code (old iterations, experiments) |
 
 ## Approach
 
-The core idea is to treat each turbine as a token in a transformer sequence:
+Each turbine is treated as a **token** in a transformer sequence:
 
-- **Per-turbine tokenization**: Each turbine's local observations (wind speed, direction, current yaw) become a token
-- **Wind-relative positional encoding**: Turbine positions are transformed relative to wind direction and normalized by rotor diameter
-- **Permutation equivariance**: The policy outputs actions for all turbines simultaneously, with shared weights ensuring the same turbine in different positions receives consistent treatment
+1. **Per-turbine tokenization** — Local observations (wind speed, direction, yaw) become token features
+2. **Wind-relative positional encoding** — Turbine positions are rotated so wind always comes from a canonical direction, then encoded via MLP (or other schemes)
+3. **Wake profile conditioning** — Optional Fourier-encoded receptivity/influence profiles provide layout-aware context
+4. **Permutation-equivariant output** — Shared actor/critic heads produce actions for all turbines simultaneously
 
-The transformer architecture naturally handles variable-length sequences, enabling a single trained policy to control farms with different numbers of turbines.
+The transformer naturally handles variable-length sequences, enabling a single policy to control farms of different sizes.
 
-## Goal
+## License
 
-Develop a zero-shot generalizable wind farm controller that can be trained on a diverse set of farm configurations and deployed to new, unseen layouts without retraining—reducing the engineering effort required for real-world wind farm optimization.
-
-
-## Current status:
-`transformer_sac_windfarm_v4` was able to train a agent, and it lookes like it was working. This was however only for a single wind condition and a single farm. 
-
-`transformer_sac_windfarm_v5` should be able to train an agent on varrying wind farms, but it is not yet tested.  
-
-### Future work/tasks
-
-
-
-Priority | Issue | Type | Effort | Explanation | 
------------------------------------------------
-?? | Critic architecture: actions through attention | Design choice | Medium | 
-    Currently, each turbine token is (obs, action) concatenated, and the transformer attends over all tokens. This means turbine A's representation is influenced by turbine B's action through attention. While wake physics could justify this (B's yaw affects A's inflow), it's unconventional—standard Q-networks condition on actions after state encoding, not through attention. An alternative is: encode states with the transformer, pool, then concatenate the flat action vector before the Q-head. Worth testing which works better.
-
-?? | Mean pooling vs CLS token for critic | Design choice | Low | 
-    The critic aggregates turbine representations by taking the mean across all tokens. An alternative is to prepend a learnable [CLS] token to the sequence; after the transformer, only the CLS token's output is used for the Q-value. CLS tokens can learn to aggregate information more flexibly than fixed mean pooling. Low priority since mean pooling is a reasonable default.
-
-
-
-Priority  | Direction                  | Novelty    | Effort | Key Benefit
--------------------------------------------------------
-1         | GTrXL                      | Low        | Medium | Training stability, established RL-transformer solution
-2         | Hybrid GNN-Transformer     | High       | High   | Physics-informed structure, strong generalization
-
-
-Recommended Implementation Order
-Phase       | Task                                       | Rationale | 
-Medium-term | Test critic architecture alternatives (A2) | Could improve learning
-Medium-term | GTrXL (B2)                                 | Stabilize training for harder problems
-Research    | Wind-relative RoPE (B3)                    | Novel contribution potential
-Research    | Hybrid GNN-Transformer (B4)                | Strongest paper contribution
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.

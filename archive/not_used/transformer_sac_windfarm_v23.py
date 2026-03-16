@@ -1,5 +1,12 @@
 """
-Transformer-based SAC for Wind Farm Control - V22
+Transformer-based SAC for Wind Farm Control - V23
+
+Changes in V23:
+- Added geometric profiles as alternative to PyWake profiles
+- Renamed the following:
+    PyWakeProfileEncoder -> CNNProfileEncoder
+    PyWakeProfileEncoderDilated ->  DilatedProfileEncoder
+    PyWakeProfileEncoderWithAttention -> AttentionProfileEncoder
 
 Changes in V22:
 - Added the following positional encoders:
@@ -17,13 +24,6 @@ Changes in V21:
   Profile registry is pre-padded to max_turbines at init; permutations are sanitized
   at add-time so that batch gather + np.take_along_axis replaces the Python loop.
 - Added soft_update using torch lerp. 
-
-
-Changes in V20:
-- Added share_profile_encoder -> If True, actor and critic share the same profile encoders (receptivity and influence). If False, they have separate encoders. This allows us to test whether sharing profile encoders between actor and critic improves performance and generalization, or if they benefit from learning separate representations.
-- Removed full receptivity profiles from replay buffers. Instead just store layout and permutations. Is MUCH better for memory now.
-- Fixed clipping bug
-- Vectorized profile rolling
 
 
 Key design principles:
@@ -137,7 +137,7 @@ from receptivity_profiles import compute_layout_profiles
 # Evaluation import
 from eval_utils import PolicyEvaluator, run_evaluation
 
-from positional_encodings_helper import (
+from positional_encodings import (
     AbsolutePositionalEncoding,
     RelativePositionalBias,
     Sinusoidal2DPositionalEncoding,
@@ -154,10 +154,10 @@ from positional_encodings_helper import (
     GATPositionalEncoder,
 )
 
-from profile_encodings_helper import (
-    PyWakeProfileEncoder,
-    PyWakeProfileEncoderDilated,
-    PyWakeProfileEncoderWithAttention,
+from profile_encodings import (
+    CNNProfileEncoder,
+    DilatedProfileEncoder,
+    AttentionProfileEncoder,
     FourierProfileEncoder,
     FourierProfileEncoderWithContext, # Needs wind direction as input. Not yet implemented
 )
@@ -186,7 +186,7 @@ class Args:
     max_episode_steps: Optional[int] = None # Max steps per episode (None = use env default)
 
     # === Receptivity Profile Settings ===
-    # use_pywake_profile: bool = False        # Enable profile encoding
+    profile_source: str = "PyWake"  # "pywake" or "geometric"
     profile_encoding_type: Optional[str] = None  # Now Optional, use None for no pos encoding
     profile_encoder_hidden: int = 128       # Hidden dim in profile encoder MLP
     rotate_profiles: bool = True            # Rotate profiles to wind-relative frame
@@ -531,9 +531,9 @@ PositionalEncoding = AbsolutePositionalEncoding
 VALID_PROFILE_ENCODING_TYPES = [
     None,                  # No positional encoding
     # === CNN Based ===
-    "PyWakeProfileEncoder",                 # CNN encoder for PyWake profiles
-    "PyWakeProfileEncoderDilated",          # Dilated convolutions for large receptive field without pooling
-    "PyWakeProfileEncoderWithAttention",    # Lightweight attention over angular positions
+    "CNNProfileEncoder",                # CNN encoder for PyWake profiles
+    "DilatedProfileEncoder",            # Dilated convolutions for large receptive field without pooling
+    "AttentionProfileEncoder",          # Lightweight attention over angular positions
     
     # === Fourier Based ===
     "FourierProfileEncoder",                # Encode circular profiles via Fourier decomposition.
@@ -575,34 +575,34 @@ def create_profile_encoding(
     # Profile Encodings
     # =========================================================================
     
-    elif profile_type == "PyWakeProfileEncoder":
+    elif profile_type == "CNNProfileEncoder":
         
-        recep_encoder = PyWakeProfileEncoder(
+        recep_encoder = CNNProfileEncoder(
                 embed_dim=embed_dim,
                 hidden_channels=hidden_channels,
             )
-        influence_encoder = PyWakeProfileEncoder(
-                embed_dim=embed_dim,
-                hidden_channels=hidden_channels,
-            )
-        
-    elif profile_type == "PyWakeProfileEncoderDilated":
-        recep_encoder = PyWakeProfileEncoderDilated(
-                embed_dim=embed_dim,
-                hidden_channels=hidden_channels,
-            )
-        influence_encoder = PyWakeProfileEncoderDilated(
+        influence_encoder = CNNProfileEncoder(
                 embed_dim=embed_dim,
                 hidden_channels=hidden_channels,
             )
         
-    elif profile_type == "PyWakeProfileEncoderWithAttention":
-        recep_encoder = PyWakeProfileEncoderWithAttention(
+    elif profile_type == "DilatedProfileEncoder":
+        recep_encoder = DilatedProfileEncoder(
+                embed_dim=embed_dim,
+                hidden_channels=hidden_channels,
+            )
+        influence_encoder = DilatedProfileEncoder(
+                embed_dim=embed_dim,
+                hidden_channels=hidden_channels,
+            )
+        
+    elif profile_type == "AttentionProfileEncoder":
+        recep_encoder = AttentionProfileEncoder(
                 embed_dim=embed_dim,
                 hidden_channels=hidden_channels,
                 n_attention_heads=4,
             )
-        influence_encoder = PyWakeProfileEncoderWithAttention(
+        influence_encoder = AttentionProfileEncoder(
                 embed_dim=embed_dim,
                 hidden_channels=hidden_channels,
                 n_attention_heads=4,
@@ -1743,22 +1743,46 @@ def main():
         x_pos, y_pos = get_layout_positions(name, wind_turbine)
         layout = LayoutConfig(name=name, x_pos=x_pos, y_pos=y_pos)
         
+
         if args.profile_encoding_type is not None:
-            print(f"Computing receptivity profiles for layout: {name}")
-            receptivity_profiles, influence_profiles = compute_layout_profiles(
-                x_pos, y_pos, wind_turbine,
-                n_directions=args.n_profile_directions,
+            if args.profile_source.lower() == "geometric":
+                from geometric_profiles import compute_layout_profiles_vectorized
+                
+                # Get rotor diameter as a float (geometric version doesn't need the full WT object)
+                D = wind_turbine.diameter()  # or however DTU10MW exposes this
+                
+                print(f"Computing GEOMETRIC profiles for layout: {name}")
+                receptivity_profiles, influence_profiles = compute_layout_profiles_vectorized(
+                    x_pos, y_pos,
+                    rotor_diameter=D,
+                    k_wake=0.04,
+                    n_directions=args.n_profile_directions,
+                    sigma_smooth=10.0,
+                    scale_factor=15.0,
+                )
+            elif args.profile_source.lower() == "pywake":
+                print(f"Computing PyWake profiles for layout: {name}")
+                receptivity_profiles, influence_profiles = compute_layout_profiles(
+                    x_pos, y_pos, wind_turbine,
+                    n_directions=args.n_profile_directions,
+                )
+            else:
+                raise ValueError(
+                    f"Unknown profile_source: {args.profile_source}. "
+                    f"Use 'pywake' or 'geometric'."
                 )
             
-            layout.receptivity_profiles = receptivity_profiles  # (n_turbines, n_directions)
-            layout.influence_profiles = influence_profiles  # (n_turbines, n_directions
-    
+            layout.receptivity_profiles = receptivity_profiles  # (n_turbines, n_directions
+            layout.influence_profiles = influence_profiles      # (n_turbines, n_directions
+            
         layouts.append(layout)
 
     if args.profile_encoding_type is not None:
         use_profiles = True
     else:
         use_profiles = False
+
+
 
     # Build profile registry from layouts
     if use_profiles:
@@ -1868,6 +1892,7 @@ def main():
         deterministic=False,
         use_profiles=use_profiles,  # NEW: Pass profile setting
         n_profile_directions=args.n_profile_directions,  # NEW: Pass profile resolution
+        profile_source=args.profile_source,
     )
 
 
@@ -1884,7 +1909,7 @@ def main():
     # Initialize debug logger with configurable frequencies
     debug_logger = create_debug_logger(
         layout_names=layout_names,
-        log_every=250,  # Base frequency - others are multiples of this
+        log_every=250000,  # Base frequency - others are multiples of this
     )
     # Frequencies will be:
     #   - summary metrics: every 100 steps

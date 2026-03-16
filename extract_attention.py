@@ -30,7 +30,7 @@ import numpy as np
 import torch
 
 # ── Project imports ──────────────────────────────────────────────────────────
-sys.path.insert(0, "/work/users/manils/LargeFarm")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from helper_funcs import (
     get_layout_positions,
     make_env_config,

@@ -1,10 +1,5 @@
 """
-Transformer-based SAC for Wind Farm Control - V26
-
-Changes in V26:
-- Add pretraining as an option
-    Args: pretrain_checkpoint, pretrain_freeze_steps
-- Add option to use alternative starting actions
+Transformer-based SAC for Wind Farm Control - V25
 
 Changes in V25:
 - Add profile_embed_mode: -> Can either be added (what we did before) h = h + profiles or concattenated h = torch.cat(h, profiles)
@@ -143,7 +138,7 @@ from receptivity_profiles import compute_layout_profiles
 # Evaluation import
 from eval_utils import PolicyEvaluator, run_evaluation
 
-from positional_encodings_helper import (
+from positional_encodings import (
     AbsolutePositionalEncoding,
     RelativePositionalBias,
     Sinusoidal2DPositionalEncoding,
@@ -160,7 +155,7 @@ from positional_encodings_helper import (
     GATPositionalEncoder,
 )
 
-from profile_encodings_helper import (
+from profile_encodings import (
     CNNProfileEncoder,
     DilatedProfileEncoder,
     AttentionProfileEncoder,
@@ -274,16 +269,6 @@ class Args:
     finetune_reset_actor_optimizer: int = 0     # If True, reset optimizers for fresh fine-tuning. If False, resume optimizer states too.
     finetune_reset_critic_optimizer: int = 0    # If True, reset optimizers for fresh fine-tuning. If False, resume optimizer states too.
     finetune_reset_alpha: int = 0               # If True, reset entropy coefficient. If False, keep from checkpoint.
-
-    # === Initial Exploration Mode ===
-    initial_exploration: str = "random"  # "random" = sample from action space, "policy" = use actor network (useful when resuming from checkpoint)
-
-    # === Pretrained Encoder Loading ===
-    pretrain_checkpoint: Optional[str] = None   # Path to pretrained encoder .pt from pretrain_power.py
-    pretrain_freeze_steps: int = 0             # Freeze encoder for this many env steps (0 = no freeze)
-
-    # === Action Settings ===
-    action_type: str = "wind"   # "wind" (target setpoint) or "yaw" (delta). Overridden by BC checkpoint if provided.
 
 
 import gc
@@ -1710,15 +1695,6 @@ def main():
     # Parse arguments
     args = tyro.cli(Args)
     
-    # Validate initial_exploration
-    assert args.initial_exploration in ("random", "policy"), \
-        f"--initial_exploration must be 'random' or 'policy', got '{args.initial_exploration}'"
-    if args.initial_exploration == "policy" and args.resume_checkpoint is None:
-        print("WARNING: --initial_exploration=policy without --resume_checkpoint. "
-              "The actor is untrained, so 'policy' exploration will just be random Gaussian noise.")
-    if args.initial_exploration == "policy":
-        print(f"Initial exploration: using actor network for first {args.learning_starts} steps")
-    
     # Parse layouts
     layout_names = [l.strip() for l in args.layouts.split(",")]
     is_multi_layout = len(layout_names) > 1
@@ -1762,16 +1738,6 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     print(f"Using device: {device}")
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Force math SDPA backend (avoids ROCm Flash/MemEfficient kernel bugs)
-    # ONLY RELEVANT FOR LUMI. TODO make it such this only works on lumi
-    if device.type == "cuda":
-        torch.backends.cuda.enable_flash_sdp(False)
-        torch.backends.cuda.enable_mem_efficient_sdp(False)
-        torch.backends.cuda.enable_math_sdp(True)
-        print("Forced math SDPA backend")
-
     # =========================================================================
     # ENVIRONMENT SETUP
     # =========================================================================
@@ -1849,43 +1815,8 @@ def main():
         profile_registry = None
 
 
-    # =========================================================================
-    # PRE-SCAN CHECKPOINT FOR ENV-AFFECTING ARGS (before env creation)
-    # =========================================================================
-    # If a pretrain/BC checkpoint is provided, we need action_type and
-    # history_length BEFORE creating the environment, since they affect
-    # config["ActionMethod"] and observation shape.
-    if args.pretrain_checkpoint is not None and os.path.exists(args.pretrain_checkpoint):
-        _prescan = torch.load(args.pretrain_checkpoint, map_location="cpu", weights_only=False)
-        _prescan_args = _prescan.get("args", {})
-
-        # --- action_type ---
-        if "action_type" in _prescan_args:
-            ckpt_action_type = _prescan_args["action_type"]
-            if ckpt_action_type != args.action_type:
-                print(f"  [pre-scan] Overriding action_type: {args.action_type} → {ckpt_action_type} (from checkpoint)")
-                args.action_type = ckpt_action_type
-            else:
-                print(f"  [pre-scan] action_type already matches checkpoint: {args.action_type}")
-
-        # --- history_length ---
-        if "history_length" in _prescan_args:
-            ckpt_history = _prescan_args["history_length"]
-            if ckpt_history != args.history_length:
-                print(f"  [pre-scan] Overriding history_length: {args.history_length} → {ckpt_history} (from checkpoint)")
-                args.history_length = ckpt_history
-            else:
-                print(f"  [pre-scan] history_length already matches checkpoint: {args.history_length}")
-
-        del _prescan  # free memory; full load happens later
-
     # Environment configuration
-    print(f"using the config: {args.config}")
     config = make_env_config(args.config)
-
-    # Override ActionMethod from args (default "wind", or overridden by checkpoint above)
-    config["ActionMethod"] = args.action_type
-    print(f"ActionMethod set to: {config['ActionMethod']}")
     
     mes_prefixes = {
         "ws_mes": "ws",
@@ -2041,70 +1972,6 @@ def main():
     # =========================================================================
     # NETWORK SETUP
     # =========================================================================
-    
-    # =========================================================================
-    # OVERRIDE ARCHITECTURE ARGS FROM PRETRAIN CHECKPOINT (if provided)
-    # =========================================================================
-
-    if args.pretrain_checkpoint is not None:
-        print(f"\n{'='*60}")
-        print(f"PRETRAIN CHECKPOINT: loading architecture config")
-        print(f"{'='*60}")
-        print(f"Checkpoint: {args.pretrain_checkpoint}")
-
-        if not os.path.exists(args.pretrain_checkpoint):
-            raise FileNotFoundError(f"Pretrain checkpoint not found: {args.pretrain_checkpoint}")
-
-        _pt_ckpt = torch.load(args.pretrain_checkpoint, map_location="cpu", weights_only=False)
-
-        if "args" not in _pt_ckpt:
-            raise ValueError("Pretrain checkpoint missing 'args' key — cannot load architecture config")
-
-        pt_args = _pt_ckpt["args"]
-
-        # Keys that MUST match between pretrain and RL for weight loading to work
-        ARCH_KEYS = [
-            "embed_dim", "num_heads", "num_layers", "mlp_ratio",
-            "pos_embed_dim", "dropout",
-            "pos_encoding_type", "rel_pos_hidden_dim", "rel_pos_per_head",
-            "pos_embedding_mode",
-            "profile_encoding_type", "profile_encoder_hidden",
-            "profile_fusion_type", "profile_embed_mode",
-            "profile_encoder_kwargs",
-            "n_profile_directions",
-        ]
-
-        overrides = []
-        for key in ARCH_KEYS:
-            if key in pt_args:
-                old_val = getattr(args, key, None)
-                new_val = pt_args[key]
-                if old_val != new_val:
-                    overrides.append((key, old_val, new_val))
-                    setattr(args, key, new_val)
-
-        if overrides:
-            print(f"\n  Overrode {len(overrides)} args from pretrain config:")
-            for key, old, new in overrides:
-                print(f"    {key}: {old} → {new}")
-        else:
-            print(f"\n  All architecture args already match pretrain config ✓")
-
-        # Store for phase 2 (weight loading after network construction)
-        _pretrain_encoder_sd = _pt_ckpt["encoder_state_dict"]
-        print(f"  Encoder state dict: {len(_pretrain_encoder_sd)} parameter tensors")
-
-        # BC checkpoints also contain the full actor (including action heads)
-        _pretrain_actor_sd = _pt_ckpt.get("actor_state_dict", None)
-        if _pretrain_actor_sd is not None:
-            print(f"  Actor state dict:   {len(_pretrain_actor_sd)} parameter tensors (BC checkpoint detected)")
-        else:
-            print(f"  No actor_state_dict found (self-supervised pretrain checkpoint)")
-        print(f"{'='*60}\n")
-
-        del _pt_ckpt  # free memory, keep only what we need
-    
-    
     
     print("\nCreating networks...")
     print(f"Positional encoding type: {args.pos_encoding_type}")
@@ -2336,115 +2203,6 @@ def main():
         print(f"{'='*60}\n")
     
     # =========================================================================
-    # LOAD PRETRAINED ENCODER (from pretrain_power.py)
-    # =========================================================================
-
-    if args.pretrain_checkpoint is not None and args.resume_checkpoint is None:
-        print(f"\n{'='*60}")
-        print(f"LOADING PRETRAINED ENCODER")
-        print(f"{'='*60}")
-
-        def load_pretrained_into(network, network_name, encoder_sd):
-            """Load matching encoder weights into an actor or critic."""
-            net_sd = network.state_dict()
-            matched_keys = []
-            skipped_keys = []
-
-            for key, value in encoder_sd.items():
-                if key in net_sd:
-                    if net_sd[key].shape == value.shape:
-                        net_sd[key] = value
-                        matched_keys.append(key)
-                    else:
-                        skipped_keys.append(
-                            f"{key} (shape: {list(value.shape)} vs {list(net_sd[key].shape)})"
-                        )
-                else:
-                    skipped_keys.append(f"{key} (not in {network_name})")
-
-            network.load_state_dict(net_sd)
-            print(f"\n  {network_name}: loaded {len(matched_keys)}/{len(encoder_sd)} params")
-            if matched_keys:
-                print(f"    Matched: {matched_keys[:5]}{'...' if len(matched_keys) > 5 else ''}")
-            if skipped_keys:
-                print(f"    Skipped: {skipped_keys}")
-            return len(matched_keys)
-
-
-        # =================================================================
-        # Actor loading: full state dict (BC) or encoder-only (pretrain)
-        # =================================================================
-        if _pretrain_actor_sd is not None:
-            # BC checkpoint → load full actor including fc_mean/fc_logstd
-            # BUT preserve action_scale and action_bias_val from the env
-            # (they should match, but this is defensive)
-            env_action_scale = actor.action_scale.clone()
-            env_action_bias = actor.action_bias_val.clone()
-
-            # Flexible load: match what we can, skip shape mismatches
-            net_sd = actor.state_dict()
-            matched_keys = []
-            skipped_keys = []
-            for key, value in _pretrain_actor_sd.items():
-                if key in net_sd:
-                    if net_sd[key].shape == value.shape:
-                        net_sd[key] = value
-                        matched_keys.append(key)
-                    else:
-                        skipped_keys.append(
-                            f"{key} (shape: {list(value.shape)} vs {list(net_sd[key].shape)})"
-                        )
-                else:
-                    skipped_keys.append(f"{key} (not in Actor)")
-            actor.load_state_dict(net_sd)
-
-            # Restore env-derived action scaling (in case BC used different defaults)
-            actor.action_scale.copy_(env_action_scale)
-            actor.action_bias_val.copy_(env_action_bias)
-
-            print(f"\n  Actor (BC full load): loaded {len(matched_keys)}/{len(_pretrain_actor_sd)} params")
-            if matched_keys:
-                print(f"    Matched: {matched_keys[:8]}{'...' if len(matched_keys) > 8 else ''}")
-            if skipped_keys:
-                print(f"    Skipped: {skipped_keys}")
-            n_actor = len(matched_keys)
-        else:
-            # Self-supervised pretrain → encoder-only loading
-            n_actor = load_pretrained_into(actor, "Actor", _pretrain_encoder_sd)
-
-        # Critics always get encoder-only loading (obs_action_encoder input dim differs)
-        n_qf1 = load_pretrained_into(qf1, "Critic qf1", _pretrain_encoder_sd)
-        n_qf2 = load_pretrained_into(qf2, "Critic qf2", _pretrain_encoder_sd)
-        # n_qfX is the number of variables loaded in.
-        
-        # Re-sync target networks
-        qf1_target.load_state_dict(qf1.state_dict())
-        qf2_target.load_state_dict(qf2.state_dict())
-        print(f"\n  Target networks synced ✓")
-
-        if n_actor == 0:
-            print(f"\n  ⚠ WARNING: No weights matched! Something is wrong.")
-
-        # Optional: freeze encoder initially
-        if args.pretrain_freeze_steps > 0:
-            frozen = []
-            for name, param in actor.named_parameters():
-                if "fc_mean" not in name and "fc_logstd" not in name:
-                    param.requires_grad = False
-                    frozen.append(name)
-            actor_optimizer = optim.Adam(
-                [p for p in actor.parameters() if p.requires_grad], lr=args.policy_lr
-            )
-            print(f"\n  Froze {len(frozen)} encoder params for {args.pretrain_freeze_steps} steps")
-
-        del _pretrain_encoder_sd  # clean up
-        if _pretrain_actor_sd is not None:
-            del _pretrain_actor_sd
-        print(f"{'='*60}\n")
-    
-    
-    
-    # =========================================================================
     # REPLAY BUFFER
     # =========================================================================
 
@@ -2520,16 +2278,6 @@ def main():
     for update in range(num_updates + 2):
         global_step += args.num_envs
         
-        # Unfreeze pretrained encoder after warmup
-        if (args.pretrain_checkpoint is not None 
-            and args.pretrain_freeze_steps > 0 
-            and global_step >= args.pretrain_freeze_steps
-            and global_step - args.num_envs < args.pretrain_freeze_steps):
-            for name, param in actor.named_parameters():
-                param.requires_grad = True
-            actor_optimizer = optim.Adam(actor.parameters(), lr=args.policy_lr)
-            print(f"\n[Step {global_step}] Unfroze pretrained encoder parameters")
-        
         # Get environment info (needed for replay buffer)
         wind_dirs = get_env_wind_directions(envs)
         raw_positions = get_env_raw_positions(envs)
@@ -2546,13 +2294,8 @@ def main():
 
         # Select action
         if global_step < args.learning_starts:
-            if args.initial_exploration == "policy":
-                # Use the actor network (useful when resuming from checkpoint)
-                with torch.no_grad():
-                    actions = agent.act(envs, obs)
-            else:
-                # Random exploration (default for training from scratch)
-                actions = envs.action_space.sample()
+            # Random exploration
+            actions = envs.action_space.sample()
         else:
             with torch.no_grad():
                 actions = agent.act(envs, obs)
@@ -2644,6 +2387,7 @@ def main():
                 # Get profiles from batch (will be None if not using profiles)
                 batch_receptivity = data.get("receptivity", None)
                 batch_influence = data.get("influence", None)
+
 
                 # -----------------------------------------------------------------
                 # Update Critics

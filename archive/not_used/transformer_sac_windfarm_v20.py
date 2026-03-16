@@ -1,29 +1,32 @@
 """
-Transformer-based SAC for Wind Farm Control - V23
+Transformer-based SAC for Wind Farm Control - V20
 
-Changes in V23:
-- Added geometric profiles as alternative to PyWake profiles
-- Renamed the following:
-    PyWakeProfileEncoder -> CNNProfileEncoder
-    PyWakeProfileEncoderDilated ->  DilatedProfileEncoder
-    PyWakeProfileEncoderWithAttention -> AttentionProfileEncoder
+Changes in V20:
+- Added share_profile_encoder -> If True, actor and critic share the same profile encoders (receptivity and influence). If False, they have separate encoders. This allows us to test whether sharing profile encoders between actor and critic improves performance and generalization, or if they benefit from learning separate representations.
+- Removed full receptivity profiles from replay buffers. Instead just store layout and permutations. Is MUCH better for memory now.
+- Fixed clipping bug
+- Vectorized profile rolling
 
-Changes in V22:
-- Added the following positional encoders:
-    GATPositionalEncoder: A Graph Attention Network encoder for turbine positions, allowing for more flexible spatial context encoding based on local neighborhoods.
-    SpatialContextEmbedding: Embeds spatial context such as local turbine density or distance to nearest turbine, providing additional information about the environment.
-    NeighborhoodAggregationEmbedding: Embeds local neighborhood information by aggregating features of nearby turbines, capturing local interactions more explicitly.
-    WakeKernelBias: A positional bias based on physics-inspired wake interaction kernels, encoding expected influence patterns based on relative positions.
-- Added pos_embedding_mode: Arguemnt to control how positional encodings are integrated (added vs concatenated), allowing for more flexible architectural choices.
-    
-Changes in V21:
-- Reuse log_pi, for the alpha_loss calculation 
-- Updated rotate_profiles_tensor
-- Vectorized replay buffer: pre-allocated numpy arrays instead of list of tuples.
-  Turns the per-sample unpack/permute/pad loop into vectorized array indexing.
-  Profile registry is pre-padded to max_turbines at init; permutations are sanitized
-  at add-time so that batch gather + np.take_along_axis replaces the Python loop.
-- Added soft_update using torch lerp. 
+Changes in V19:
+- Renamed encodings_helper to positional_encodings_helper
+- Made profile_encodings_helper
+- Add profile_fusion_type, joint or add
+- Added RelativePositionalBiasAdvanced, RelativePositionalBiasFactorized, and RelativePositionalBiasWithWind
+
+Changes in V18:
+- Removed sample_env
+- Remove unnecessary reset at initialization of MultiLayoutEnv
+- Add max_episode_steps argument to MultiLayoutEnv from args
+
+Changes in V17:
+- Added the agent.py interface. Simplifies it a bit, and makes it easier to maintain
+
+Changes in V16:
+- Added pywake-based receptivity and influence profile option
+- Removed the projection layer when no positional encoding is used. Just use Identity.
+
+A clean implementation of transformer-based Soft Actor-Critic for wind farm
+yaw control with the goal of generalizing across different farm layouts.
 
 
 Key design principles:
@@ -60,8 +63,11 @@ MAIN TASKS:
 [ ] Consider separate profile encoder instances for target networks if profiles become wind-direction-dependent (e.g. FourierProfileEncoderWithContext). Currently shared = soft-update is a no-op for encoder params.
 [ ] Implement FourierProfileEncoderWithContext that takes wind direction as input
 [ ] Add RelativePositionalBiasWithWind that takes wind direction as input
+[x] Add Joint fusion of receptivity and influence profiles. So h = h + f(recep, influence), where f is nn with concat of both profiles as input.
 [ ] Make weights shared between actor and critic for: pos_encoder, rel_pos_bias, input_proj, transformer
-
+[x] Add receptivity profile as option for positional encoding
+[x] Add infuence profile as option for positional encoding
+[x] Fix the evaluation code to match new env setup. Maybe make smarter somehow (?)
 
 
 TEMPORAL EXTENSIONS (OPTION B)
@@ -81,7 +87,7 @@ import os
 import random
 import time
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, List, Dict, Any, Union
+from typing import Optional, Tuple, List, Dict, Any
 from collections import deque
 
 # Set memory allocation config BEFORE importing torch
@@ -128,7 +134,6 @@ from helper_funcs import (
     rotate_profiles_tensor,
     get_env_layout_indices,
     get_env_permutations,
-    soft_update,
 )
 
 # Receptivity profile computation
@@ -137,7 +142,7 @@ from receptivity_profiles import compute_layout_profiles
 # Evaluation import
 from eval_utils import PolicyEvaluator, run_evaluation
 
-from positional_encodings_helper import (
+from positional_encodings import (
     AbsolutePositionalEncoding,
     RelativePositionalBias,
     Sinusoidal2DPositionalEncoding,
@@ -148,16 +153,12 @@ from positional_encodings_helper import (
     RelativePositionalBiasAdvanced,
     RelativePositionalBiasFactorized,
     RelativePositionalBiasWithWind,
-    SpatialContextEmbedding,
-    NeighborhoodAggregationEmbedding,
-    WakeKernelBias,
-    GATPositionalEncoder,
 )
 
-from profile_encodings_helper import (
-    CNNProfileEncoder,
-    DilatedProfileEncoder,
-    AttentionProfileEncoder,
+from profile_encodings import (
+    PyWakeProfileEncoder,
+    PyWakeProfileEncoderDilated,
+    PyWakeProfileEncoderWithAttention,
     FourierProfileEncoder,
     FourierProfileEncoderWithContext, # Needs wind direction as input. Not yet implemented
 )
@@ -186,7 +187,7 @@ class Args:
     max_episode_steps: Optional[int] = None # Max steps per episode (None = use env default)
 
     # === Receptivity Profile Settings ===
-    profile_source: str = "PyWake"  # "pywake" or "geometric"
+    # use_pywake_profile: bool = False        # Enable profile encoding
     profile_encoding_type: Optional[str] = None  # Now Optional, use None for no pos encoding
     profile_encoder_hidden: int = 128       # Hidden dim in profile encoder MLP
     rotate_profiles: bool = True            # Rotate profiles to wind-relative frame
@@ -229,7 +230,6 @@ class Args:
     dropout: float = 0.0          # Dropout rate (0 for RL typically)
     pos_embed_dim: int = 32       # Dimension for positional encoding
     
-
     # === Positional Encoding Settings ===
     # Options: "absolute_mlp", "relative_mlp", "relative_mlp_shared", 
     #          "sinusoidal_2d",
@@ -238,7 +238,6 @@ class Args:
     rel_pos_hidden_dim: int = 64
     # For relative encoding: whether to use separate bias per head
     rel_pos_per_head: bool = True
-    pos_embedding_mode: str = "concat"  # "add" or "concat" positional embedding to token (only for absolute types)
     
     # === SAC Hyperparameters ===
     utd_ratio: float = 1.0           # Update-to-data ratio
@@ -296,10 +295,7 @@ VALID_POS_ENCODING_TYPES = [
     "absolute_mlp",         # Original: MLP on (x,y) → add to token
     "sinusoidal_2d",        # NeRF-style multi-frequency encoding
     "polar_mlp",            # MLP on (r, θ) polar coordinates
-    "spatial_context",      # Embedding of spatial context (e.g. local density)
-    "neighborhood_agg",     # Embedding based on local neighborhood (e.g. via GNN)
-    "gat_encoder",          # Graph Attention Network encoder for positions
-
+    
     # === Attention Bias (added to attention logits) ===
     "relative_mlp",         # MLP on pairwise rel pos → attention bias (per-head)
     "relative_mlp_shared",  # MLP on pairwise rel pos → attention bias (shared)
@@ -310,7 +306,6 @@ VALID_POS_ENCODING_TYPES = [
     "RelativePositionalBiasAdvanced",  # Advanced relative bias with distance and angle features
     "RelativePositionalBiasFactorized", # Factorized relative bias for efficiency
     "RelativePositionalBiasWithWind",   # Relative bias incorporating wind direction
-    "wake_kernel",                      # Wake kernel bias based on physics-inspired functions of relative position
     # === Combined ===
     "absolute_plus_relative",  # Both absolute embedding AND relative bias
 ]
@@ -323,8 +318,7 @@ def create_positional_encoding(
     num_heads: int,
     rel_pos_hidden_dim: int = 64,
     rel_pos_per_head: bool = True,
-    embedding_mode: str = "concat",  # "add" or "concat" for absolute types
-) -> Tuple[Optional[nn.Module], Optional[nn.Module], Union[str, bool]]:
+) -> Tuple[Optional[nn.Module], Optional[nn.Module], bool, bool]:
     """
     Factory function to create positional encoding modules.
     
@@ -337,14 +331,11 @@ def create_positional_encoding(
         rel_pos_per_head: Whether relative bias is per-head
     
     Returns:
-        (pos_encoder, rel_pos_bias, embedding_mode)
+        (pos_encoder, rel_pos_bias, uses_additive_embedding)
         - pos_encoder: Module for absolute position embedding (or None)
         - rel_pos_bias: Module for relative position bias (or None)
-        - embedding_mode: "none", "add" or "concat"
-            - "none": No position embedding added to tokens (bias)
-            - "add": Position embedding directly added to tokens (like LLMs)
-            - "concat": Position embedding concatenated to tokens and projected
-            """
+        - uses_additive_embedding: Whether pos embedding is added to tokens
+    """
     if encoding_type not in VALID_POS_ENCODING_TYPES:
         raise ValueError(
             f"Unknown pos_encoding_type: {encoding_type}. "
@@ -363,55 +354,30 @@ def create_positional_encoding(
     # =========================================================================
     
     elif encoding_type == "absolute_mlp":
-        out_dim = embed_dim if embedding_mode == "add" else pos_embed_dim
         # Original approach: MLP embedding added to tokens
-        pos_encoder = AbsolutePositionalEncoding(pos_dim=2, embed_dim=out_dim)
+        pos_encoder = AbsolutePositionalEncoding(pos_dim=2, embed_dim=pos_embed_dim)
         rel_pos_bias = None
-        embedding_mode = embedding_mode
+        uses_additive_embedding = True
         
     elif encoding_type == "sinusoidal_2d":
         # Sinusoidal 2D encoding (frequency bands are fixed, projection is learned)
-        out_dim = embed_dim if embedding_mode == "add" else pos_embed_dim
         pos_encoder = Sinusoidal2DPositionalEncoding(
-            embed_dim=out_dim,
+            embed_dim=pos_embed_dim,
             num_frequencies=8,  # 8 frequency bands
             max_freq_log2=6,    # Max frequency 2^6 = 64
         )
         rel_pos_bias = None
-        embedding_mode = embedding_mode
+        uses_additive_embedding = True
         
     elif encoding_type == "polar_mlp":
         # Polar coordinate encoding
-        out_dim = embed_dim if embedding_mode == "add" else pos_embed_dim
-        pos_encoder = PolarPositionalEncoding(embed_dim=out_dim)
+        pos_encoder = PolarPositionalEncoding(embed_dim=pos_embed_dim)
         rel_pos_bias = None
-        embedding_mode = embedding_mode
-
-    elif encoding_type == "spatial_context":
-        out_dim = embed_dim if embedding_mode == "add" else pos_embed_dim
-        pos_encoder = SpatialContextEmbedding(embed_dim=out_dim)
-        rel_pos_bias = None
-        embedding_mode = embedding_mode
-
-    elif encoding_type == "neighborhood_agg":
-        out_dim = embed_dim if embedding_mode == "add" else pos_embed_dim
-        pos_encoder = NeighborhoodAggregationEmbedding(embed_dim=out_dim)
-        rel_pos_bias = None
-        embedding_mode = embedding_mode
+        uses_additive_embedding = True
     
-    elif encoding_type == "gat_encoder":
-        # Graph Attention Network encoder for positions
-        out_dim = embed_dim if embedding_mode == "add" else pos_embed_dim
-        pos_encoder = GATPositionalEncoder(embed_dim=out_dim, 
-                                           n_heads=num_heads,
-                                           n_layers=2,
-                                           edge_dim=8,
-                                           use_wind_context=False,
-                                           distance_cutoff=15.0,
-                                           )
-        rel_pos_bias = None
-        embedding_mode = embedding_mode
-
+    # =========================================================================
+    # Attention Bias Encodings (added to attention logits)
+    # =========================================================================
     
     elif encoding_type == "relative_mlp":
         # Relative position bias added to attention (per-head)
@@ -422,7 +388,7 @@ def create_positional_encoding(
             per_head=True,
             pos_dim=2
         )
-        embedding_mode = False
+        uses_additive_embedding = False
         
     elif encoding_type == "relative_mlp_shared":
         # Relative position bias (shared across heads)
@@ -433,7 +399,7 @@ def create_positional_encoding(
             per_head=False,
             pos_dim=2
         )
-        embedding_mode = False
+        uses_additive_embedding = False
         
     elif encoding_type == "relative_polar":
         # Relative position bias using polar coordinates
@@ -443,7 +409,7 @@ def create_positional_encoding(
             hidden_dim=rel_pos_hidden_dim,
             per_head=True,
         )
-        embedding_mode = False
+        uses_additive_embedding = False
     
     elif encoding_type == "relative_polar_shared":
         # Relative polar bias (shared across heads)
@@ -453,19 +419,19 @@ def create_positional_encoding(
             hidden_dim=rel_pos_hidden_dim,
             per_head=False,
         )
-        embedding_mode = False
+        uses_additive_embedding = False
         
     elif encoding_type == "alibi":
         # ALiBi: Simple linear distance penalty (no learned params)
         pos_encoder = None
         rel_pos_bias = ALiBiPositionalBias(num_heads=num_heads)
-        embedding_mode = False
+        uses_additive_embedding = False
         
     elif encoding_type == "alibi_directional":
         # Directional ALiBi with upwind/downwind asymmetry
         pos_encoder = None
         rel_pos_bias = DirectionalALiBiPositionalBias(num_heads=num_heads)
-        embedding_mode = False
+        uses_additive_embedding = False
     
     elif encoding_type == "RelativePositionalBiasAdvanced":
         # Advanced relative bias with distance and angle features
@@ -476,7 +442,7 @@ def create_positional_encoding(
             characteristic_distance=5.0,
             use_physics_asymmetry=True,
         )
-        embedding_mode = False
+        uses_additive_embedding = False
         
     elif encoding_type == "RelativePositionalBiasFactorized":
         # Factorized relative bias for efficiency
@@ -485,7 +451,7 @@ def create_positional_encoding(
             num_heads=num_heads,
             hidden_dim=rel_pos_hidden_dim,
         )
-        embedding_mode = False
+        uses_additive_embedding = False
         
     elif encoding_type == "RelativePositionalBiasWithWind":
         # Relative bias incorporating wind direction
@@ -493,34 +459,25 @@ def create_positional_encoding(
         raise NotImplementedError(
             "RelativePositionalBiasWithWind requires wind direction as input. See TODO."
         )
-    
-    elif encoding_type == "wake_kernel":
-        # Wake kernel bias based on physics-inspired functions of relative position
-        pos_encoder = None
-        rel_pos_bias = WakeKernelBias(num_heads=num_heads)
-        embedding_mode = False
-
     # =========================================================================
     # Combined Encodings
     # =========================================================================
     
     elif encoding_type == "absolute_plus_relative":
         # Both absolute embedding AND relative bias
-        out_dim = embed_dim if embedding_mode == "add" else pos_embed_dim
-        pos_encoder = AbsolutePositionalEncoding(pos_dim=2, embed_dim=out_dim)
+        pos_encoder = AbsolutePositionalEncoding(pos_dim=2, embed_dim=pos_embed_dim)
         rel_pos_bias = RelativePositionalBias(
             num_heads=num_heads,
             hidden_dim=rel_pos_hidden_dim,
             per_head=rel_pos_per_head,
             pos_dim=2
         )
-        embedding_mode = embedding_mode
+        uses_additive_embedding = True
     
     else:
         raise ValueError(f"Encoding type '{encoding_type}' not implemented yet.")
     
-
-    return pos_encoder, rel_pos_bias, embedding_mode
+    return pos_encoder, rel_pos_bias, uses_additive_embedding
 
 
 # Backward compatibility alias
@@ -531,9 +488,9 @@ PositionalEncoding = AbsolutePositionalEncoding
 VALID_PROFILE_ENCODING_TYPES = [
     None,                  # No positional encoding
     # === CNN Based ===
-    "CNNProfileEncoder",                # CNN encoder for PyWake profiles
-    "DilatedProfileEncoder",            # Dilated convolutions for large receptive field without pooling
-    "AttentionProfileEncoder",          # Lightweight attention over angular positions
+    "PyWakeProfileEncoder",                 # CNN encoder for PyWake profiles
+    "PyWakeProfileEncoderDilated",          # Dilated convolutions for large receptive field without pooling
+    "PyWakeProfileEncoderWithAttention",    # Lightweight attention over angular positions
     
     # === Fourier Based ===
     "FourierProfileEncoder",                # Encode circular profiles via Fourier decomposition.
@@ -575,34 +532,34 @@ def create_profile_encoding(
     # Profile Encodings
     # =========================================================================
     
-    elif profile_type == "CNNProfileEncoder":
+    elif profile_type == "PyWakeProfileEncoder":
         
-        recep_encoder = CNNProfileEncoder(
+        recep_encoder = PyWakeProfileEncoder(
                 embed_dim=embed_dim,
                 hidden_channels=hidden_channels,
             )
-        influence_encoder = CNNProfileEncoder(
-                embed_dim=embed_dim,
-                hidden_channels=hidden_channels,
-            )
-        
-    elif profile_type == "DilatedProfileEncoder":
-        recep_encoder = DilatedProfileEncoder(
-                embed_dim=embed_dim,
-                hidden_channels=hidden_channels,
-            )
-        influence_encoder = DilatedProfileEncoder(
+        influence_encoder = PyWakeProfileEncoder(
                 embed_dim=embed_dim,
                 hidden_channels=hidden_channels,
             )
         
-    elif profile_type == "AttentionProfileEncoder":
-        recep_encoder = AttentionProfileEncoder(
+    elif profile_type == "PyWakeProfileEncoderDilated":
+        recep_encoder = PyWakeProfileEncoderDilated(
+                embed_dim=embed_dim,
+                hidden_channels=hidden_channels,
+            )
+        influence_encoder = PyWakeProfileEncoderDilated(
+                embed_dim=embed_dim,
+                hidden_channels=hidden_channels,
+            )
+        
+    elif profile_type == "PyWakeProfileEncoderWithAttention":
+        recep_encoder = PyWakeProfileEncoderWithAttention(
                 embed_dim=embed_dim,
                 hidden_channels=hidden_channels,
                 n_attention_heads=4,
             )
-        influence_encoder = AttentionProfileEncoder(
+        influence_encoder = PyWakeProfileEncoderWithAttention(
                 embed_dim=embed_dim,
                 hidden_channels=hidden_channels,
                 n_attention_heads=4,
@@ -832,7 +789,6 @@ class TransformerActor(nn.Module):
         pos_encoding_type: str = "absolute_mlp",
         rel_pos_hidden_dim: int = 64,
         rel_pos_per_head: bool = True,
-        pos_embedding_mode: str = "concat",  # "add" or "concat" for absolute types
         # Receptivity profile settings
         profile_encoding: Optional[str] = None,
         profile_encoder_hidden: int = 128,
@@ -874,7 +830,7 @@ class TransformerActor(nn.Module):
             f"Invalid profile_fusion_type: {profile_fusion_type}"
 
         # Create positional encoding modules based on type
-        self.pos_encoder, self.rel_pos_bias, self.embedding_mode = \
+        self.pos_encoder, self.rel_pos_bias, self.uses_additive_embedding = \
             create_positional_encoding(
                 encoding_type=pos_encoding_type,
                 embed_dim=embed_dim,
@@ -882,7 +838,6 @@ class TransformerActor(nn.Module):
                 num_heads=num_heads,
                 rel_pos_hidden_dim=rel_pos_hidden_dim,
                 rel_pos_per_head=rel_pos_per_head,
-                embedding_mode=pos_embedding_mode,
             )
         
 
@@ -917,7 +872,7 @@ class TransformerActor(nn.Module):
         )
         
         # Input projection: only needed when concatenating position embedding
-        if self.embedding_mode == "concat":
+        if self.uses_additive_embedding:
             self.input_proj = nn.Linear(embed_dim + pos_embed_dim, embed_dim)
         else:
             self.input_proj = nn.Identity()
@@ -967,15 +922,10 @@ class TransformerActor(nn.Module):
         h = self.obs_encoder(obs)  # (batch, n_turb, embed_dim)
         
         # Apply positional encoding based on type
-        if self.embedding_mode == "concat" and self.pos_encoder is not None:
+        if self.uses_additive_embedding and self.pos_encoder is not None:
             # Absolute encoding: concatenate position embedding
             pos_embed = self.pos_encoder(positions)  # (batch, n_turb, pos_embed_dim)
             h = torch.cat([h, pos_embed], dim=-1)  # (batch, n_turb, embed_dim + pos_embed_dim)
-        elif self.embedding_mode == "add" and self.pos_encoder is not None:
-            # Absolute encoding: add position embedding
-            pos_embed = self.pos_encoder(positions)
-            h = h + pos_embed  # (batch, n_turb, embed_dim)
-    
         
         # Project to embed_dim
         h = self.input_proj(h)  # (batch, n_turb, embed_dim)
@@ -1108,7 +1058,6 @@ class TransformerCritic(nn.Module):
         pos_encoding_type: str = "absolute_mlp",
         rel_pos_hidden_dim: int = 64,
         rel_pos_per_head: bool = True,
-        pos_embedding_mode: str = "concat",  # "add" or "concat" for absolute types
         # PyWake profile settings
         profile_encoding: Optional[str] = None,
         profile_encoder_hidden: int = 128,
@@ -1124,9 +1073,9 @@ class TransformerCritic(nn.Module):
         self.pos_encoding_type = pos_encoding_type
         self.profile_encoding = profile_encoding
         self.profile_fusion_type = profile_fusion_type
-
+        
         # Create positional encoding modules based on type
-        self.pos_encoder, self.rel_pos_bias, self.embedding_mode = \
+        self.pos_encoder, self.rel_pos_bias, self.uses_additive_embedding = \
             create_positional_encoding(
                 encoding_type=pos_encoding_type,
                 embed_dim=embed_dim,
@@ -1134,7 +1083,6 @@ class TransformerCritic(nn.Module):
                 num_heads=num_heads,
                 rel_pos_hidden_dim=rel_pos_hidden_dim,
                 rel_pos_per_head=rel_pos_per_head,
-                embedding_mode=pos_embedding_mode,
             )
 
         # PyWake profile encoder (optional)
@@ -1159,7 +1107,7 @@ class TransformerCritic(nn.Module):
         )
                 
         # Input projection: only needed when concatenating position embedding
-        if self.embedding_mode == "concat":
+        if self.uses_additive_embedding:
             self.input_proj = nn.Linear(embed_dim + pos_embed_dim, embed_dim)
         else:
             self.input_proj = nn.Identity()
@@ -1216,12 +1164,9 @@ class TransformerCritic(nn.Module):
         h = self.obs_action_encoder(x)
         
         # Apply positional encoding based on type
-        if self.embedding_mode == "concat" and self.pos_encoder is not None:
+        if self.uses_additive_embedding and self.pos_encoder is not None:
             pos_embed = self.pos_encoder(positions)
             h = torch.cat([h, pos_embed], dim=-1)
-        elif self.embedding_mode == "add" and self.pos_encoder is not None:
-            pos_embed = self.pos_encoder(positions)
-            h = h + pos_embed
         
         # Project to embed_dim
         h = self.input_proj(h)
@@ -1268,107 +1213,72 @@ class TransformerCritic(nn.Module):
 
 class TransformerReplayBuffer:
     """
-    Replay buffer with pre-allocated numpy arrays for O(1) insertion and
-    vectorized batch sampling (no per-sample Python loops).
-
+    Replay buffer that stores raw positions and wind direction.
+    
     Wind-relative transformation is applied at sample time to ensure
     correct positional encoding regardless of when the transition was collected.
+    
+    Profiles are looked up at sample time and permuted according to the
+    stored permutation, rather than storing full profiles per-transition.
 
-    Profiles are looked up at sample time via vectorized gather + permute
-    on a pre-padded profile registry, rather than storing full profiles
-    per-transition.
-
-    Storage (pre-allocated numpy arrays):
-    - _obs:            (capacity, max_turbines, obs_dim)         float32
-    - _next_obs:       (capacity, max_turbines, obs_dim)         float32
-    - _actions:        (capacity, max_turbines, action_dim)      float32
-    - _rewards:        (capacity,)                               float32
-    - _dones:          (capacity,)                               float32
-    - _raw_positions:  (capacity, max_turbines, 2)               float32
-    - _attention_mask: (capacity, max_turbines)                  bool
-    - _wind_directions:(capacity,)                               float32
-    - _layout_indices: (capacity,)                               int32   (profiles only)
-    - _permutations:   (capacity, max_turbines)                  int64   (profiles only)
+    This is important because:
+    1. Wind direction may change within an episode
+    2. Different episodes have different wind directions
+    3. The model always sees positions in a canonical wind-relative frame (NOT ANYMORE)
+    
+    Storage format per transition:
+    - obs: (max_turbines, obs_dim)
+    - next_obs: (max_turbines, obs_dim)
+    - action: (max_turbines, action_dim)
+    - reward: scalar
+    - done: bool
+    - raw_positions: (max_turbines, 2) - NOT transformed
+    - attention_mask: (max_turbines,) - True = padding
+    - wind_direction: scalar - for transformation at sample time
+    - layout_index: integer index for profile lookup (if using profiles)
+    - permutation: (max_turbines,) integer array indicating turbine order (for shuffled layouts)
     """
-
+    
     def __init__(
         self,
         capacity: int,
         device: torch.device,
         rotor_diameter: float,
-        max_turbines: int,
-        obs_dim: int,
-        action_dim: int,
         use_wind_relative: bool = True,
         use_profiles: bool = False,
         rotate_profiles: bool = False,
+        # layout_profiles: Optional[Dict[str, Tuple[np.ndarray, np.ndarray]]] = None,
         profile_registry: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
+        max_turbines: Optional[int] = None,
     ):
         """
         Args:
             capacity: Maximum number of transitions
             device: Torch device for sampled tensors
             rotor_diameter: For position normalization
-            max_turbines: Maximum number of turbines across all layouts
-            obs_dim: Observation dimension per turbine
-            action_dim: Action dimension per turbine
             use_wind_relative: Whether to transform positions to wind-relative frame
             use_profiles: Whether to store and return receptivity profiles
             rotate_profiles: Whether to rotate profiles to wind-relative frame at sample time
-            profile_registry: List of (recep, influence) tuples per layout, each (n_turb, n_dirs)
         """
         self.capacity = capacity
         self.device = device
         self.rotor_diameter = rotor_diameter
-        self.max_turbines = max_turbines
         self.use_wind_relative = use_wind_relative
+        self.buffer = []
+        self.position = 0
         self.use_profiles = use_profiles
         self.rotate_profiles = rotate_profiles
-        self.position = 0
-        self.size = 0  # Current number of stored transitions
+        # Profile lookup table: profile_registry[layout_idx] = (recep, influence)
+        # where each is shape (n_turbines_in_layout, n_directions), raw/unshuffled/unpadded
+        self.profile_registry = profile_registry
+        self.max_turbines = max_turbines
 
-        # --- Pre-allocate storage arrays ---
-        self._obs = np.zeros((capacity, max_turbines, obs_dim), dtype=np.float32)
-        self._next_obs = np.zeros((capacity, max_turbines, obs_dim), dtype=np.float32)
-        self._actions = np.zeros((capacity, max_turbines, action_dim), dtype=np.float32)
-        self._rewards = np.zeros(capacity, dtype=np.float32)
-        self._dones = np.zeros(capacity, dtype=np.float32)
-        self._raw_positions = np.zeros((capacity, max_turbines, 2), dtype=np.float32)
-        self._attention_mask = np.zeros((capacity, max_turbines), dtype=bool)
-        self._wind_directions = np.zeros(capacity, dtype=np.float32)
-
-        # --- Profile-specific storage ---
         if self.use_profiles:
             assert profile_registry is not None, "Must provide profile_registry when use_profiles=True"
+            assert max_turbines is not None, "Must provide max_turbines when use_profiles=True"
+            
 
-            self._layout_indices = np.zeros(capacity, dtype=np.int32)
-            self._permutations = np.zeros((capacity, max_turbines), dtype=np.int64)
-
-            # Pre-pad registry profiles to max_turbines for vectorized gather.
-            # _padded_recep[layout_idx] = (max_turbines, n_dirs), zero-padded
-            # _padded_infl[layout_idx]  = (max_turbines, n_dirs), zero-padded
-            n_dirs = profile_registry[0][0].shape[1]
-            n_layouts = len(profile_registry)
-            self._padded_recep = np.zeros((n_layouts, max_turbines, n_dirs), dtype=np.float32)
-            self._padded_infl = np.zeros((n_layouts, max_turbines, n_dirs), dtype=np.float32)
-            for li, (recep, infl) in enumerate(profile_registry):
-                nt = recep.shape[0]
-                self._padded_recep[li, :nt] = recep
-                self._padded_infl[li, :nt] = infl
-            self._n_dirs = n_dirs
-        else:
-            self._layout_indices = None
-            self._permutations = None
-
-        alloc_mb = (
-            self._obs.nbytes + self._next_obs.nbytes + self._actions.nbytes
-            + self._rewards.nbytes + self._dones.nbytes
-            + self._raw_positions.nbytes + self._attention_mask.nbytes
-            + self._wind_directions.nbytes
-        ) / 1e6
-        print(f"[ReplayBuffer] Pre-allocated {alloc_mb:.1f} MB for {capacity} transitions "
-              f"(max_turb={max_turbines}, obs_dim={obs_dim}, act_dim={action_dim})")
-
+    
     def add(
         self,
         obs: np.ndarray,
@@ -1383,7 +1293,7 @@ class TransformerReplayBuffer:
         permutation: Optional[np.ndarray] = None,
     ) -> None:
         """
-        Store a transition by writing directly into pre-allocated arrays.
+        Store a transition.
         
         Args:
             obs: (max_turbines, obs_dim)
@@ -1392,43 +1302,28 @@ class TransformerReplayBuffer:
             reward: scalar
             done: bool
             raw_positions: (max_turbines, 2)
-            attention_mask: (max_turbines,) - True = padding
+            attention_mask: (max_turbines,)
             wind_direction: scalar
             layout_index: Index of current layout (for profile lookup)
             permutation: Turbine permutation array (for shuffled profiles)
         """
-        i = self.position
+        data = (
+            obs, next_obs, action, reward, done,
+            raw_positions, attention_mask, wind_direction,
+            layout_index, permutation,  
+        )
 
-        self._obs[i] = obs
-        self._next_obs[i] = next_obs
-        self._actions[i] = action
-        self._rewards[i] = reward
-        self._dones[i] = float(done)
-        self._raw_positions[i] = raw_positions
-        self._attention_mask[i] = attention_mask
-        self._wind_directions[i] = wind_direction
 
-        if self.use_profiles:
-            assert layout_index is not None, "layout_index required when use_profiles=True"
-            self._layout_indices[i] = layout_index
-
-            if permutation is not None:
-                # Sanitize permutation: padding positions get identity mapping
-                # so that indexing into the zero-padded registry stays zero.
-                safe_perm = permutation.copy()
-                n_real = int((~attention_mask).sum())
-                if n_real < self.max_turbines:
-                    safe_perm[n_real:] = np.arange(n_real, self.max_turbines)
-                self._permutations[i] = safe_perm
-            else:
-                self._permutations[i] = np.arange(self.max_turbines)
-
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(data)
+        else:
+            self.buffer[self.position] = data
+        
         self.position = (self.position + 1) % self.capacity
-        self.size = min(self.size + 1, self.capacity)
-
+    
     def sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
         """
-        Sample a batch using vectorized array indexing (no Python loop).
+        Sample batch and apply wind-relative transformation.
         
         Returns:
             Dict with keys:
@@ -1442,15 +1337,55 @@ class TransformerReplayBuffer:
             - receptivity: (batch, max_turb, n_directions) - only if use_profiles=True
             - influence: (batch, max_turb, n_directions) - only if use_profiles=True
         """
-        indices = np.random.choice(self.size, batch_size, replace=False)
+        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
+        batch = [self.buffer[i] for i in indices]
+        
+        # Unpack batch
+        obs_list, next_obs_list, action_list = [], [], []
+        raw_positions_list, mask_list, wind_dirs = [], [], []
+        rewards, dones = [], []
+        receptivity_list, influence_list = [], []
 
-        # --- Vectorized array indexing (the whole point) ---
-        raw_positions = self._raw_positions[indices]            # (B, T, 2)
-        wind_directions = self._wind_directions[indices]        # (B,)
+        for item in batch:
+            (obs, next_obs, action, reward, done,
+             raw_pos, mask, wind_dir, layout_idx, perm) = item
+            
+            obs_list.append(obs)
+            next_obs_list.append(next_obs)
+            action_list.append(action)
+            raw_positions_list.append(raw_pos)
+            mask_list.append(mask)
+            wind_dirs.append(wind_dir)
+            rewards.append(reward)
+            dones.append(done)
 
+            if self.use_profiles and layout_idx is not None:
+                raw_recep, raw_infl = self.profile_registry[layout_idx]
+                n_turb = raw_recep.shape[0]
+                n_dirs = raw_recep.shape[1]
+                
+                # Apply permutation to match shuffled turbine order
+                recep = raw_recep[perm[:n_turb]]
+                infl = raw_infl[perm[:n_turb]]
+                
+                # Pad to max_turbines
+                padded_recep = np.zeros((self.max_turbines, n_dirs), dtype=np.float32)
+                padded_recep[:n_turb] = recep
+                padded_infl = np.zeros((self.max_turbines, n_dirs), dtype=np.float32)
+                padded_infl[:n_turb] = infl
+                
+                receptivity_list.append(padded_recep)
+                influence_list.append(padded_infl)
+
+
+
+        # Stack to arrays
+        raw_positions = np.stack(raw_positions_list)  # (batch, max_turb, 2)
+        wind_directions = np.array(wind_dirs)  # (batch,)
+        
         # Normalize positions by rotor diameter
         positions_norm = raw_positions / self.rotor_diameter
-
+        
         # Convert to tensors
         positions_tensor = torch.tensor(positions_norm, device=self.device, dtype=torch.float32)
 
@@ -1462,46 +1397,37 @@ class TransformerReplayBuffer:
             positions_final = positions_tensor
 
         result = {
-            "observations": torch.tensor(self._obs[indices], device=self.device, dtype=torch.float32),
-            "next_observations": torch.tensor(self._next_obs[indices], device=self.device, dtype=torch.float32),
-            "actions": torch.tensor(self._actions[indices], device=self.device, dtype=torch.float32),
+            "observations": torch.tensor(np.stack(obs_list), device=self.device, dtype=torch.float32),
+            "next_observations": torch.tensor(np.stack(next_obs_list), device=self.device, dtype=torch.float32),
+            "actions": torch.tensor(np.stack(action_list), device=self.device, dtype=torch.float32),
             "positions": positions_final,
-            "attention_mask": torch.tensor(self._attention_mask[indices], device=self.device, dtype=torch.bool),
-            "rewards": torch.tensor(self._rewards[indices], device=self.device, dtype=torch.float32).unsqueeze(-1),
-            "dones": torch.tensor(self._dones[indices], device=self.device, dtype=torch.float32).unsqueeze(-1),
+            "attention_mask": torch.tensor(np.stack(mask_list), device=self.device, dtype=torch.bool),
+            "rewards": torch.tensor(rewards, device=self.device, dtype=torch.float32).unsqueeze(-1),
+            "dones": torch.tensor(dones, device=self.device, dtype=torch.float32).unsqueeze(-1),
         }
 
-        # --- Vectorized profile lookup + permutation ---
+        # Add profiles if enabled
         if self.use_profiles:
-            layout_idx_batch = self._layout_indices[indices]    # (B,)
-            perm_batch = self._permutations[indices]            # (B, T)
-
-            # Gather from pre-padded registry: (B, T, n_dirs)
-            recep_batch = self._padded_recep[layout_idx_batch]  # (B, T, D)
-            infl_batch = self._padded_infl[layout_idx_batch]    # (B, T, D)
-
-            # Apply permutation via advanced indexing (vectorized, no loop)
-            # perm_batch[:, :, None] broadcasts over the n_dirs axis
-            recep_batch = np.take_along_axis(recep_batch, perm_batch[:, :, None], axis=1)
-            infl_batch = np.take_along_axis(infl_batch, perm_batch[:, :, None], axis=1)
-
+            receptivity_array = np.stack(receptivity_list)  # (batch, max_turb, n_dirs)
+            influence_array = np.stack(influence_list)  # (batch, max_turb, n_directions)
+            
             # Optionally rotate profiles to wind-relative frame
             if self.rotate_profiles:
-                recep_batch = self._rotate_profiles_batch(recep_batch, wind_directions)
-                infl_batch = self._rotate_profiles_batch(infl_batch, wind_directions)
-
-            result["receptivity"] = torch.tensor(recep_batch, device=self.device, dtype=torch.float32)
-            result["influence"] = torch.tensor(infl_batch, device=self.device, dtype=torch.float32)
-
+                receptivity_array = self._rotate_profiles_batch(receptivity_array, wind_directions)
+                influence_array = self._rotate_profiles_batch(influence_array, wind_directions)
+            
+            result["receptivity"] = torch.tensor(receptivity_array, device=self.device, dtype=torch.float32)
+            result["influence"] = torch.tensor(influence_array, device=self.device, dtype=torch.float32)
+        
         return result
-
+    
     def _rotate_profiles_batch(
         self,
         profiles: np.ndarray,
         wind_directions: np.ndarray
     ) -> np.ndarray:
         """
-        Rotate profiles so current wind direction is at index 0 (vectorized).
+        Rotate profiles so current wind direction is at index 0.
         
         Args:
             profiles: (batch, max_turb, n_directions)
@@ -1510,17 +1436,27 @@ class TransformerReplayBuffer:
         Returns:
             Rotated profiles with same shape
         """
+        # batch_size = profiles.shape[0]
+        # n_directions = profiles.shape[2]
+        # degrees_per_index = 360.0 / n_directions
+        # rotated = np.empty_like(profiles)
+        # for i in range(batch_size):
+        #     shift = int(round(wind_directions[i] / degrees_per_index))
+        #     rotated[i] = np.roll(profiles[i], -shift, axis=-1)
+        
+        # Now vectorized for efficiency
+        # batch_size = profiles.shape[0]
         n_directions = profiles.shape[2]
         degrees_per_index = 360.0 / n_directions
-
+        
         shifts = np.round(wind_directions / degrees_per_index).astype(int)
         # Build shifted index array: (batch, 1, n_directions)
         indices = (np.arange(n_directions)[None, None, :] + shifts[:, None, None]) % n_directions
         return np.take_along_axis(profiles, indices, axis=-1)
 
-    def __len__(self) -> int:
-        return self.size
 
+    def __len__(self) -> int:
+        return len(self.buffer)
 
 
 # =============================================================================
@@ -1743,46 +1679,22 @@ def main():
         x_pos, y_pos = get_layout_positions(name, wind_turbine)
         layout = LayoutConfig(name=name, x_pos=x_pos, y_pos=y_pos)
         
-
         if args.profile_encoding_type is not None:
-            if args.profile_source.lower() == "geometric":
-                from geometric_profiles import compute_layout_profiles_vectorized
-                
-                # Get rotor diameter as a float (geometric version doesn't need the full WT object)
-                D = wind_turbine.diameter()  # or however DTU10MW exposes this
-                
-                print(f"Computing GEOMETRIC profiles for layout: {name}")
-                receptivity_profiles, influence_profiles = compute_layout_profiles_vectorized(
-                    x_pos, y_pos,
-                    rotor_diameter=D,
-                    k_wake=0.04,
-                    n_directions=args.n_profile_directions,
-                    sigma_smooth=10.0,
-                    scale_factor=15.0,
-                )
-            elif args.profile_source.lower() == "pywake":
-                print(f"Computing PyWake profiles for layout: {name}")
-                receptivity_profiles, influence_profiles = compute_layout_profiles(
-                    x_pos, y_pos, wind_turbine,
-                    n_directions=args.n_profile_directions,
-                )
-            else:
-                raise ValueError(
-                    f"Unknown profile_source: {args.profile_source}. "
-                    f"Use 'pywake' or 'geometric'."
+            print(f"Computing receptivity profiles for layout: {name}")
+            receptivity_profiles, influence_profiles = compute_layout_profiles(
+                x_pos, y_pos, wind_turbine,
+                n_directions=args.n_profile_directions,
                 )
             
-            layout.receptivity_profiles = receptivity_profiles  # (n_turbines, n_directions
-            layout.influence_profiles = influence_profiles      # (n_turbines, n_directions
-            
+            layout.receptivity_profiles = receptivity_profiles  # (n_turbines, n_directions)
+            layout.influence_profiles = influence_profiles  # (n_turbines, n_directions
+    
         layouts.append(layout)
 
     if args.profile_encoding_type is not None:
         use_profiles = True
     else:
         use_profiles = False
-
-
 
     # Build profile registry from layouts
     if use_profiles:
@@ -1892,7 +1804,6 @@ def main():
         deterministic=False,
         use_profiles=use_profiles,  # NEW: Pass profile setting
         n_profile_directions=args.n_profile_directions,  # NEW: Pass profile resolution
-        profile_source=args.profile_source,
     )
 
 
@@ -1909,7 +1820,7 @@ def main():
     # Initialize debug logger with configurable frequencies
     debug_logger = create_debug_logger(
         layout_names=layout_names,
-        log_every=250000,  # Base frequency - others are multiples of this
+        log_every=250,  # Base frequency - others are multiples of this
     )
     # Frequencies will be:
     #   - summary metrics: every 100 steps
@@ -2000,7 +1911,6 @@ def main():
         "pos_encoding_type": args.pos_encoding_type,
         "rel_pos_hidden_dim": args.rel_pos_hidden_dim,
         "rel_pos_per_head": args.rel_pos_per_head,
-        "pos_embedding_mode": args.pos_embedding_mode,
         # PyWake profiles
         "profile_encoding": args.profile_encoding_type,
         "profile_encoder_hidden": args.profile_encoder_hidden,
@@ -2181,18 +2091,16 @@ def main():
     # =========================================================================
     # REPLAY BUFFER
     # =========================================================================
-
+    
     rb = TransformerReplayBuffer(
         capacity=args.buffer_size,
         device=device,
         rotor_diameter=rotor_diameter,
-        max_turbines=n_turbines_max,
-        obs_dim=obs_dim_per_turbine,
-        action_dim=action_dim_per_turbine,
         use_wind_relative=args.use_wind_relative_pos,
         use_profiles=use_profiles,
         rotate_profiles=args.rotate_profiles,
         profile_registry=profile_registry,
+        max_turbines=n_turbines_max,
     )
 
 
@@ -2423,7 +2331,7 @@ def main():
                 qf_loss = qf1_loss + qf2_loss
                 
                 # Update critics
-                q_optimizer.zero_grad(set_to_none=True)
+                q_optimizer.zero_grad()
                 qf_loss.backward()
                 if args.grad_clip:
                     torch.nn.utils.clip_grad_norm_(
@@ -2465,7 +2373,7 @@ def main():
                     actor_loss = (alpha * log_pi - min_qf_pi).mean()
                     
                     # Update actor
-                    actor_optimizer.zero_grad(set_to_none=True)
+                    actor_optimizer.zero_grad()
                     actor_loss.backward()
                     if args.grad_clip:
                         torch.nn.utils.clip_grad_norm_(
@@ -2483,7 +2391,13 @@ def main():
                     # Update Alpha (entropy coefficient)
                     # -------------------------------------------------------------
                     if args.autotune:
-                        log_pi_detached = log_pi.detach()
+                        with torch.no_grad():
+                            _, log_pi, _, _ = actor.get_action(
+                                data["observations"], data["positions"], 
+                                batch_mask, 
+                                recep_profile=batch_receptivity,
+                                influence_profile=batch_influence
+                            )
                         
                         # Adaptive target entropy per sample
                         target_entropy_batch = compute_adaptive_target_entropy(
@@ -2492,9 +2406,9 @@ def main():
                         )
                         
                         # Alpha loss
-                        alpha_loss = (-log_alpha.exp() * (log_pi_detached + target_entropy_batch)).mean()
+                        alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy_batch)).mean()
                         
-                        alpha_optimizer.zero_grad(set_to_none=True)
+                        alpha_optimizer.zero_grad()
                         alpha_loss.backward()
                         alpha_optimizer.step()
                         alpha = log_alpha.exp().item()
@@ -2507,9 +2421,14 @@ def main():
                 # NOTE: When share_profile_encoder=True, the shared encoder params appear in both
                  # qf1 and qf1_target, making the soft-update a no-op (x ← τx + (1-τ)x = x) for those params.
                 if total_gradient_steps % args.target_network_frequency == 0:
-
-                    soft_update(qf1, qf1_target, args.tau)
-                    soft_update(qf2, qf2_target, args.tau)
+                    for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
+                        target_param.data.copy_(
+                            args.tau * param.data + (1 - args.tau) * target_param.data
+                        )
+                    for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
+                        target_param.data.copy_(
+                            args.tau * param.data + (1 - args.tau) * target_param.data
+                        )
                 
                 # Attention physics analysis (frequency controlled by logger)
                 if debug_logger.should_log_attention(total_gradient_steps):
