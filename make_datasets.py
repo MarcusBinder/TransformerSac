@@ -377,7 +377,7 @@ def _collect_single_episode(args: tuple) -> dict:
 
     if env.ActionMethod.lower() == "yaw":
         print("The action method defined in the config was yaw. We change this to wind to ensure the correct action space is used for data collection.")
-        env.ActionMethod = "Wind"
+        env.ActionMethod = "wind"
     episode_data = collect_episode(env, policy=policy, max_steps=max_steps)
     env.close()
 
