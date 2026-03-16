@@ -8,3 +8,5 @@ runs/
 *.sh
 logs/
 /runs
+/figs
+/figs
