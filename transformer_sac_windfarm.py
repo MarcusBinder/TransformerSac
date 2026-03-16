@@ -160,7 +160,7 @@ from positional_encodings_helper import (
     GATPositionalEncoder,
 )
 
-from profile_encodings_helper import (
+from profile_encodings import (
     CNNProfileEncoder,
     DilatedProfileEncoder,
     AttentionProfileEncoder,
