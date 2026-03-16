@@ -54,13 +54,11 @@ from helpers.multi_layout_debug import (
 )
 
 from helpers.helper_funcs import (
-    get_layout_positions,
     get_env_wind_directions,
     get_env_raw_positions,
     get_env_attention_masks,
     save_checkpoint,
     load_checkpoint,
-    make_env_config,
     transform_to_wind_relative,
     compute_wind_direction_deviation,
     EnhancedPerTurbineWrapper,
@@ -71,6 +69,8 @@ from helpers.helper_funcs import (
     get_env_permutations,
     soft_update,
 )
+from helpers.layouts import get_layout_positions
+from helpers.env_configs import make_env_config
 
 # Receptivity profile computation
 from helpers.receptivity_profiles import compute_layout_profiles

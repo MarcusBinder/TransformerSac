@@ -38,10 +38,8 @@ from dataclasses import dataclass
 from collections import defaultdict
 from .agent import WindFarmAgent
 from .multi_layout_env import MultiLayoutEnv, LayoutConfig
-from .helper_funcs import (
-    get_layout_positions,
-    transform_to_wind_relative,
-)
+from .helper_funcs import transform_to_wind_relative
+from .layouts import get_layout_positions
 
 from WindGym.wrappers import RecordEpisodeVals
 

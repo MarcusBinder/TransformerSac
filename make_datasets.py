@@ -48,10 +48,8 @@ import tyro
 # WindGym imports
 from WindGym import WindFarmEnv
 
-from helpers.helper_funcs import (
-    get_layout_positions,
-    make_env_config,
-)
+from helpers.layouts import get_layout_positions
+from helpers.env_configs import make_env_config
 
 from WindGym.Agents import GreedyAgent, PyWakeAgent
 
