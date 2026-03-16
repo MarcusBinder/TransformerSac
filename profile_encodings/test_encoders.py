@@ -18,6 +18,7 @@ from profile_encodings import (
     DilatedProfileEncoder,
     AttentionProfileEncoder,
     FourierProfileEncoder,
+    TancikProfileEncoder,
 )
 
 
@@ -37,6 +38,7 @@ def main():
         "ProfileEncoderWithAttention": AttentionProfileEncoder(embed_dim),
         "Dilated": DilatedProfileEncoder(embed_dim),
         "FourierProfileEncoder": FourierProfileEncoder(embed_dim),
+        "TancikProfileEncoder": TancikProfileEncoder(embed_dim),
     }
 
     print(f"Input shape: {profiles.shape}\n")

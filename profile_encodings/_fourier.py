@@ -243,3 +243,130 @@ class FourierProfileEncoderWithContext(nn.Module):
         embeddings = self.proj(combined)
 
         return embeddings.reshape(batch_size, n_turbines, -1)
+
+
+class TancikProfileEncoder(nn.Module):
+    """
+    Encode profiles via Tancik-style Random Fourier Features (RFF).
+
+    Instead of extracting deterministic FFT harmonics (like FourierProfileEncoder),
+    this projects the full profile vector through random sinusoidal features:
+
+        γ(x) = [cos(2π B x), sin(2π B x)]
+
+    where B ~ N(0, σ²) is a frozen random matrix.
+
+    Key differences from FourierProfileEncoder:
+    - FFT decomposes the profile into angular harmonics (structured, interpretable)
+    - RFF projects the full profile into a random feature space (unstructured,
+      but can capture arbitrary correlations across profile bins)
+
+    The σ hyperparameter controls the frequency bandwidth:
+    - Small σ (e.g. 0.1): Smooth features, captures broad profile shape
+    - Medium σ (e.g. 1.0): Balanced
+    - Large σ (e.g. 10.0): High-frequency features, sensitive to fine detail
+
+    For wind farm profiles where values are wake deficits in [0, ~1] range,
+    σ in [0.5, 5.0] is a reasonable starting range.
+
+    Reference: Tancik et al., "Fourier Features Let Networks Learn High Frequency
+    Functions in Low Dimensional Domains", NeurIPS 2020.
+
+    Args:
+        embed_dim: Output embedding dimension
+        n_features: Number of random Fourier features (half the projection dim,
+                    since we concatenate cos and sin). More features = better kernel
+                    approximation but more compute. 64-256 is typical.
+        sigma: Std of the Gaussian used to sample B. Controls frequency bandwidth.
+        learnable_sigma: If True, make sigma a learnable parameter (experimental).
+        input_dim: Expected profile dimension (n_directions). If None, B is lazily
+                   initialized on first forward pass.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 128,
+        n_features: int = 128,
+        sigma: float = 1.0,
+        learnable_sigma: bool = False,
+        input_dim: int | None = None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.n_features = n_features
+        self.learnable_sigma = learnable_sigma
+
+        # Feature dim: n_features cos + n_features sin
+        self.feature_dim = 2 * n_features
+
+        if learnable_sigma:
+            # Learn log(sigma) for numerical stability
+            self.log_sigma = nn.Parameter(torch.tensor(math.log(sigma)))
+        else:
+            self.register_buffer('log_sigma', torch.tensor(math.log(sigma)))
+
+        # Initialize B if input_dim is known, otherwise defer
+        if input_dim is not None:
+            self._init_B(input_dim)
+        else:
+            self.register_buffer('B', None)  # Will be lazily initialized
+
+        # Project Fourier features to embedding (same structure as FourierProfileEncoder)
+        self.proj = nn.Sequential(
+            nn.Linear(self.feature_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+
+    def _init_B(self, input_dim: int):
+        """Sample and freeze the random frequency matrix B."""
+        # B: (n_features, input_dim), sampled from N(0, 1)
+        # The actual frequencies are sigma * B, applied as cos(2π σ B x)
+        # We store the unit-variance version and scale by sigma at forward time,
+        # so that learnable_sigma works correctly.
+        B = torch.randn(self.n_features, input_dim)
+        self.register_buffer('B', B)
+
+    def forward(self, profiles: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            profiles: (batch, n_turbines, n_directions)
+
+        Returns:
+            embeddings: (batch, n_turbines, embed_dim)
+        """
+        batch_size, n_turbines, n_dirs = profiles.shape
+
+        # Lazy init of B on first forward pass
+        if self.B is None:
+            self._init_B(n_dirs)
+            self.B = self.B.to(profiles.device)
+
+        # Reshape: (batch * n_turbines, n_directions)
+        x = profiles.reshape(batch_size * n_turbines, n_dirs)
+
+        # Compute projection: x @ (σB)^T -> (batch * n_turbines, n_features)
+        sigma = torch.exp(self.log_sigma)
+        projection = x @ (sigma * self.B).T  # (B*T, n_features)
+
+        # Apply sinusoidal mapping: γ(x) = [cos(2π·proj), sin(2π·proj)]
+        features = torch.cat([
+            torch.cos(2 * math.pi * projection),
+            torch.sin(2 * math.pi * projection),
+        ], dim=-1)  # (B*T, 2 * n_features)
+
+        # Scale by 1/sqrt(n_features) for stable variance
+        # (standard RFF normalization from Rahimi & Recht 2007)
+        features = features / math.sqrt(self.n_features)
+
+        # Project to embedding dimension
+        embeddings = self.proj(features)
+
+        return embeddings.reshape(batch_size, n_turbines, -1)
+
+    @property
+    def sigma(self) -> float:
+        """Current sigma value."""
+        return torch.exp(self.log_sigma).item()

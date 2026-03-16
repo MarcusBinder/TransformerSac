@@ -3,7 +3,8 @@
 Two encoder families:
 - CNN-based: CNNProfileEncoder, DilatedProfileEncoder, AttentionProfileEncoder,
              MultiResolutionProfileEncoder
-- Fourier-based: FourierProfileEncoder, FourierProfileEncoderWithContext
+- Fourier-based: FourierProfileEncoder, FourierProfileEncoderWithContext,
+                 TancikProfileEncoder (Random Fourier Features)
 
 Shared building block: ResidualConvBlock
 """
@@ -18,6 +19,7 @@ from profile_encodings._cnn import (
 from profile_encodings._fourier import (
     FourierProfileEncoder,
     FourierProfileEncoderWithContext,
+    TancikProfileEncoder,
 )
 
 __all__ = [
@@ -28,4 +30,5 @@ __all__ = [
     "MultiResolutionProfileEncoder",
     "FourierProfileEncoder",
     "FourierProfileEncoderWithContext",
+    "TancikProfileEncoder",
 ]
