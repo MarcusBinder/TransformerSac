@@ -36,9 +36,9 @@ import gymnasium as gym
 from typing import Dict, List, Any, Optional, Callable, Tuple
 from dataclasses import dataclass
 from collections import defaultdict
-from agent import WindFarmAgent
-from MultiLayoutEnv import MultiLayoutEnv, LayoutConfig
-from helper_funcs import (
+from .agent import WindFarmAgent
+from .multi_layout_env import MultiLayoutEnv, LayoutConfig
+from .helper_funcs import (
     get_layout_positions,
     transform_to_wind_relative,
 )
@@ -170,7 +170,7 @@ class PolicyEvaluator:
             # Compute profiles if enabled
             if self.use_profiles:
                 if self.profile_source.lower() == "geometric":
-                    from geometric_profiles import compute_layout_profiles_vectorized
+                    from .geometric_profiles import compute_layout_profiles_vectorized
                     D = self.wind_turbine.diameter()
                     print(f"[Evaluator] Computing GEOMETRIC profiles for layout: {name}")
                     receptivity_profiles, influence_profiles = compute_layout_profiles_vectorized(
@@ -182,7 +182,7 @@ class PolicyEvaluator:
                         scale_factor=15.0,
                     )
                 else:
-                    from receptivity_profiles import compute_layout_profiles
+                    from .receptivity_profiles import compute_layout_profiles
                     print(f"[Evaluator] Computing PyWake profiles for layout: {name}")
                     receptivity_profiles, influence_profiles = compute_layout_profiles(
                         x_pos, y_pos, self.wind_turbine,

@@ -27,7 +27,7 @@ import gymnasium as gym
 from typing import Optional, Tuple, List
 from dataclasses import dataclass
 
-from helper_funcs import transform_to_wind_relative, rotate_profiles_tensor
+from .helper_funcs import transform_to_wind_relative, rotate_profiles_tensor
 
 
 # =============================================================================

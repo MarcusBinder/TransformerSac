@@ -31,7 +31,7 @@ except ImportError:
     HAS_PATHOS = False
 
 from transformer_sac_windfarm import TransformerActor
-from helper_funcs import (
+from helpers.helper_funcs import (
     get_layout_positions,
     make_env_config,
     transform_to_wind_relative,
@@ -39,7 +39,7 @@ from helper_funcs import (
     find_checkpoints,
     load_actor_from_checkpoint,
 )
-from MultiLayoutEnv import MultiLayoutEnv, LayoutConfig
+from helpers.multi_layout_env import MultiLayoutEnv, LayoutConfig
 from WindGym import WindFarmEnv
 from WindGym.wrappers import PerTurbineObservationWrapper
 
