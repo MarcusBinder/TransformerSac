@@ -1431,11 +1431,14 @@ def train_one_epoch_power(model, loader, optimizer, device, epoch,
 
 
 @torch.no_grad()
-def evaluate_power(model, loader, device):
+def evaluate_power(model, loader, device, layout_names=None):
     model.eval()
     total_loss = 0.0
     total_mae = 0.0
     n_batches = 0
+
+    # Per-layout accumulators: {layout_idx: {"mse_sum": ..., "mae_sum": ..., "count": ...}}
+    per_layout_acc = {}
 
     for batch in loader:
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
@@ -1453,11 +1456,41 @@ def evaluate_power(model, loader, device):
         mae = mae / real_mask.sum()
         total_mae += mae.item()
 
+        # Per-layout metrics
+        if layout_names is not None and "layout_idx" in batch:
+            diff_sq = (predicted_power - batch["target_power"]) ** 2  # (B, N)
+            diff_abs = (predicted_power - batch["target_power"]).abs()  # (B, N)
+            real_f = real_mask.float()  # (B, N)
+            n_real_per_sample = real_f.sum(dim=1)  # (B,)
+            per_sample_mse = (diff_sq * real_f).sum(dim=1) / n_real_per_sample.clamp(min=1)
+            per_sample_mae = (diff_abs * real_f).sum(dim=1) / n_real_per_sample.clamp(min=1)
+
+            layout_idxs = batch["layout_idx"]  # (B,)
+            for li in layout_idxs.unique().tolist():
+                mask_li = layout_idxs == li
+                if li not in per_layout_acc:
+                    per_layout_acc[li] = {"mse_sum": 0.0, "mae_sum": 0.0, "count": 0}
+                per_layout_acc[li]["mse_sum"] += per_sample_mse[mask_li].sum().item()
+                per_layout_acc[li]["mae_sum"] += per_sample_mae[mask_li].sum().item()
+                per_layout_acc[li]["count"] += mask_li.sum().item()
+
         n_batches += 1
 
     avg_mse = total_loss / max(n_batches, 1)
     avg_mae = total_mae / max(n_batches, 1)
-    return avg_mse, avg_mae
+
+    # Build per-layout metrics dict
+    per_layout_metrics = {}
+    if layout_names is not None:
+        for li, acc in per_layout_acc.items():
+            name = layout_names.get(li, f"layout_{li}")
+            count = max(acc["count"], 1)
+            per_layout_metrics[name] = {
+                "mse": acc["mse_sum"] / count,
+                "mae": acc["mae_sum"] / count,
+            }
+
+    return avg_mse, avg_mae, per_layout_metrics
 
 
 # --- Masked mode ---
@@ -1504,7 +1537,8 @@ def train_one_epoch_masked(model, loader, optimizer, device, epoch,
 
 
 @torch.no_grad()
-def evaluate_masked(model, loader, device, feature_names, feature_weights=None):
+def evaluate_masked(model, loader, device, feature_names, feature_weights=None,
+                    layout_names=None):
     """
     Evaluate masked reconstruction.
 
@@ -1512,12 +1546,16 @@ def evaluate_masked(model, loader, device, feature_names, feature_weights=None):
         avg_loss: scalar
         per_feature_mse: dict mapping feature_name → MSE
         avg_cosine_sim: mean cosine similarity at masked positions
+        per_layout_metrics: dict mapping layout_name → {"loss": x}
     """
     model.eval()
     total_loss = 0.0
     total_per_feature = None
     total_cosine_sim = 0.0
     n_batches = 0
+
+    # Per-layout accumulators: {layout_idx: {"loss_sum": ..., "count": ...}}
+    per_layout_acc = {}
 
     for batch in loader:
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
@@ -1548,6 +1586,26 @@ def evaluate_masked(model, loader, device, feature_names, feature_weights=None):
             cos_sim = F.cosine_similarity(pred_flat, orig_flat, dim=-1).mean()
             total_cosine_sim += cos_sim.item()
 
+        # Per-layout loss
+        if layout_names is not None and "layout_idx" in batch:
+            predict_mask = result["predict_mask"]  # (B, N)
+            sq_err = (result["predicted_obs"] - result["original_obs"]) ** 2  # (B, N, D)
+            # Per-sample mean reconstruction error over masked positions
+            mask_expanded = predict_mask.unsqueeze(-1).float()  # (B, N, 1)
+            n_masked_per_sample = predict_mask.float().sum(dim=1)  # (B,)
+            obs_dim = sq_err.shape[-1]
+            per_sample_loss = (sq_err * mask_expanded).sum(dim=(1, 2)) / (
+                n_masked_per_sample * obs_dim
+            ).clamp(min=1)  # (B,)
+
+            layout_idxs = batch["layout_idx"]  # (B,)
+            for li in layout_idxs.unique().tolist():
+                mask_li = layout_idxs == li
+                if li not in per_layout_acc:
+                    per_layout_acc[li] = {"loss_sum": 0.0, "count": 0}
+                per_layout_acc[li]["loss_sum"] += per_sample_loss[mask_li].sum().item()
+                per_layout_acc[li]["count"] += mask_li.sum().item()
+
         n_batches += 1
 
     avg_loss = total_loss / max(n_batches, 1)
@@ -1561,7 +1619,15 @@ def evaluate_masked(model, loader, device, feature_names, feature_weights=None):
             if i < avg_per_feature.shape[0]:
                 per_feature_dict[name] = avg_per_feature[i].item()
 
-    return avg_loss, per_feature_dict, avg_cosine_sim
+    # Build per-layout metrics dict
+    per_layout_metrics = {}
+    if layout_names is not None:
+        for li, acc in per_layout_acc.items():
+            name = layout_names.get(li, f"layout_{li}")
+            count = max(acc["count"], 1)
+            per_layout_metrics[name] = {"loss": acc["loss_sum"] / count}
+
+    return avg_loss, per_feature_dict, avg_cosine_sim, per_layout_metrics
 
 
 # =============================================================================
@@ -1683,6 +1749,7 @@ def main():
         print(f"Layout-based split:")
         print(f"  Train layouts ({len(train_layout_idxs)}): {_layout_names(train_layout_idxs)}  ({n_train} samples)")
         print(f"  Val layouts   ({len(val_layout_idxs)}):   {_layout_names(val_layout_idxs)}  ({n_val} samples)")
+
     else:
         if args.val_split_by_layout and n_layouts <= 1:
             print("Warning: --val-split-by-layout requested but only 1 layout found. "
@@ -1694,6 +1761,12 @@ def main():
             generator=torch.Generator().manual_seed(args.seed),
         )
         print(f"Train: {n_train} samples, Val: {n_val} samples")
+
+    # Build layout name mapping for wandb and checkpoints
+    layout_name_map = {
+        i: dataset.layouts[i].get("layout_name", f"layout_{i}")
+        for i in range(n_layouts)
+    }
 
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True,
@@ -1808,6 +1881,7 @@ def main():
             "val_split_by_layout": args.val_split_by_layout,
             "val_layout_indices": val_layout_idxs,
             "train_layout_indices": train_layout_idxs,
+            "layout_names": layout_name_map,
         }, allow_val_change=True)
         wandb.watch(model, log="all", log_freq=500)
 
@@ -1858,11 +1932,14 @@ def main():
 
         # ---- Validate ----
         if args.pretrain_mode == "power":
-            val_mse, val_mae = evaluate_power(model, val_loader, device)
+            val_mse, val_mae, per_layout = evaluate_power(
+                model, val_loader, device, layout_name_map,
+            )
             val_loss = val_mse
         else:
-            val_loss, per_feature_mse, cosine_sim = evaluate_masked(
+            val_loss, per_feature_mse, cosine_sim, per_layout = evaluate_masked(
                 model, val_loader, device, feature_names, feature_weights,
+                layout_name_map,
             )
 
         scheduler.step()
@@ -1899,10 +1976,15 @@ def main():
                 log_dict["val/mse"] = val_mse
                 log_dict["val/mae"] = val_mae
                 log_dict["val/mae_watts"] = val_mae * args.power_max
+                for name, metrics in per_layout.items():
+                    log_dict[f"val/mse_{name}"] = metrics["mse"]
+                    log_dict[f"val/mae_{name}"] = metrics["mae"]
             else:
                 log_dict["val/cosine_sim"] = cosine_sim
                 for k, v in per_feature_mse.items():
                     log_dict[f"val/mse_{k}"] = v
+                for name, metrics in per_layout.items():
+                    log_dict[f"val/loss_{name}"] = metrics["loss"]
 
             # --- Diagnostic plots (every N epochs + first + last) ---
             if do_plots and (epoch % args.plot_every == 0
@@ -1934,6 +2016,7 @@ def main():
                 "val_split_by_layout": args.val_split_by_layout,
                 "val_layout_indices": val_layout_idxs,
                 "train_layout_indices": train_layout_idxs,
+                "layout_names": layout_name_map,
             }
             if args.pretrain_mode == "power":
                 checkpoint["val_mse"] = val_mse
@@ -1957,6 +2040,7 @@ def main():
                 "optimizer_state_dict": optimizer.state_dict(),
                 "val_loss": val_loss,
                 "args": vars(args),
+                "layout_names": layout_name_map,
             }, f"{args.save_dir}/epoch_{epoch:04d}.pt")
 
     # ---- Final save ----
@@ -1974,6 +2058,7 @@ def main():
         "val_split_by_layout": args.val_split_by_layout,
         "val_layout_indices": val_layout_idxs,
         "train_layout_indices": train_layout_idxs,
+        "layout_names": layout_name_map,
     }
     if args.pretrain_mode == "power":
         final_checkpoint["val_mae"] = val_mae
