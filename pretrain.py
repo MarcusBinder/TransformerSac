@@ -884,7 +884,7 @@ def fig_attention_on_layout(results, sample_idx=0, top_k=3):
     return layer_figs
 
 
-def fig_pred_vs_actual(results):
+def fig_pred_vs_actual(results, input_features=None):
     """Scatter of predicted vs. actual power, colored by wind direction.
     Only applicable to power mode."""
     if "predicted_power" not in results:
@@ -902,10 +902,15 @@ def fig_pred_vs_actual(results):
     # Extract wind direction for coloring (best-effort, depends on obs layout)
     obs_dim = obs.shape[-1]
     try:
-        n_features = 3  # ws, wd, yaw
+        if input_features is not None:
+            n_features = len(input_features)
+            wd_feature_idx = input_features.index("wd") if "wd" in input_features else 1
+        else:
+            n_features = 3  # ws, wd, yaw fallback
+            wd_feature_idx = 1
         history_len = obs_dim // n_features
         if obs_dim == n_features * history_len:
-            wd_idx = 1 * history_len + (history_len - 1)
+            wd_idx = wd_feature_idx * history_len + (history_len - 1)
             wd_flat = obs[:, :, wd_idx][real]
         else:
             wd_flat = np.zeros_like(pred_flat)
@@ -1342,7 +1347,7 @@ def generate_diagnostic_plots(
     # 2. Predicted vs. actual scatter (power mode only)
     if args.pretrain_mode == "power":
         try:
-            fig = fig_pred_vs_actual(results)
+            fig = fig_pred_vs_actual(results, input_features=list(args.features))
             if fig is not None:
                 images["plots/pred_vs_actual"] = wandb.Image(fig)
                 plt.close(fig)
