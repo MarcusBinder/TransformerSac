@@ -95,7 +95,7 @@ def transform_to_wind_relative(
     in a canonical reference frame.
 
     Physics intuition:
-    - After transformation, "upwind" always means positive x direction
+    - After transformation, "downwind" always means positive x direction
     - Wake effects always propagate in positive x direction
     - Lateral offset is always in y direction
 
