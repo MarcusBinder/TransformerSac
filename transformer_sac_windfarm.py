@@ -2163,9 +2163,16 @@ def main():
     
     qf1_params = get_critic_params_excluding_shared(qf1, shared_recep_encoder, shared_influence_encoder)
     qf2_params = get_critic_params_excluding_shared(qf2, shared_recep_encoder, shared_influence_encoder)
-    
+
+    # Collect shared encoder params so they receive gradients from critic loss too
+    shared_encoder_params = []
+    if shared_recep_encoder is not None:
+        shared_encoder_params += list(shared_recep_encoder.parameters())
+    if shared_influence_encoder is not None:
+        shared_encoder_params += list(shared_influence_encoder.parameters())
+
     q_optimizer = optim.Adam(
-        qf1_params + qf2_params,
+        qf1_params + qf2_params + shared_encoder_params,
         lr=args.q_lr
     )
     
@@ -2173,11 +2180,10 @@ def main():
     if shared_recep_encoder is not None:
         actor_unique = sum(p.numel() for p in actor.parameters())
         critic_unique = sum(p.numel() for p in qf1_params)
-        shared_total = sum(p.numel() for p in shared_recep_encoder.parameters()) + \
-                       sum(p.numel() for p in shared_influence_encoder.parameters())
+        shared_total = sum(p.numel() for p in shared_encoder_params)
         print(f"Actor parameters (includes shared): {actor_unique:,}")
         print(f"Critic parameters (excluding shared): {critic_unique:,} (x2)")
-        print(f"Shared encoder parameters: {shared_total:,}")
+        print(f"Shared encoder parameters (in both optimizers): {shared_total:,}")
 
 
     # Entropy tuning
@@ -2646,7 +2652,7 @@ def main():
                 qf_loss.backward()
                 if args.grad_clip:
                     torch.nn.utils.clip_grad_norm_(
-                        qf1_params + qf2_params,
+                        qf1_params + qf2_params + shared_encoder_params,
                         max_norm=args.grad_clip_max_norm
                     )
                 q_optimizer.step()
