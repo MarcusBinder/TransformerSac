@@ -694,7 +694,7 @@ class WakeKernelBias(nn.Module):
         pos_j = positions.unsqueeze(1)
         rel = pos_j - pos_i
 
-        dx = rel[..., 0]  # positive = j upstream of i (wind-relative)
+        dx = rel[..., 0]  # positive = j downstream of i (wind-relative)
         dy = rel[..., 1]
         dist = torch.sqrt(dx ** 2 + dy ** 2 + 1e-8)
 
