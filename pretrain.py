@@ -198,8 +198,8 @@ class Args:
     """Fraction of data held out for validation."""
     val_split_by_layout: bool = False
     """Split validation by layout instead of random. All samples from selected layouts go to val."""
-    val_layout_indices: Optional[List[int]] = None
-    """Explicit layout indices for validation (e.g. [0, 2]). Overrides fraction-based selection."""
+    val_layout_names: Optional[List[str]] = None
+    """Explicit layout names for validation (e.g. ['HornsRev']). All files sharing the name go to val."""
     # Data is loaded into RAM — no num_workers needed.
 
     # === Output / Checkpointing ===
@@ -242,12 +242,13 @@ def get_encoder_state_dict(actor: TransformerActor) -> dict:
 def split_by_layout(
     dataset,
     val_fraction: float,
-    val_layout_indices: Optional[List[int]],
+    val_layout_names: Optional[List[str]],
     seed: int,
 ) -> Tuple[Subset, Subset, List[int], List[int]]:
-    """Split dataset into train/val Subsets by layout index.
+    """Split dataset into train/val Subsets by layout name.
 
-    All samples from held-out layouts go to val; the rest go to train.
+    All samples from held-out layout *names* go to val; the rest go to train.
+    Multiple file indices that share the same layout_name are grouped together.
 
     Returns:
         (train_subset, val_subset, train_layout_idxs, val_layout_idxs)
@@ -262,17 +263,31 @@ def split_by_layout(
     else:
         raise TypeError(f"Unsupported dataset type: {type(dataset)}")
 
-    n_layouts = len(all_layout_idxs)
+    # Build name → [layout_idx, ...] mapping
+    name_to_idxs = {}
+    for li in all_layout_idxs:
+        name = dataset.layouts[li].get("layout_name", f"layout_{li}")
+        name_to_idxs.setdefault(name, []).append(li)
 
-    # Determine which layouts go to validation
-    if val_layout_indices is not None:
-        val_layouts = set(val_layout_indices)
+    all_names = sorted(name_to_idxs.keys())
+
+    # Determine which layout *names* go to validation
+    if val_layout_names is not None:
+        for vn in val_layout_names:
+            if vn not in name_to_idxs:
+                raise ValueError(f"Layout name '{vn}' not found. Available: {all_names}")
+        val_name_set = set(val_layout_names)
     else:
         rng = _random.Random(seed)
-        shuffled = list(all_layout_idxs)
-        rng.shuffle(shuffled)
-        n_val_layouts = max(1, round(n_layouts * val_fraction))
-        val_layouts = set(shuffled[:n_val_layouts])
+        shuffled_names = list(all_names)
+        rng.shuffle(shuffled_names)
+        n_val_names = max(1, round(len(all_names) * val_fraction))
+        val_name_set = set(shuffled_names[:n_val_names])
+
+    # Expand names → integer indices
+    val_layouts = set()
+    for name in val_name_set:
+        val_layouts.update(name_to_idxs[name])
 
     train_layouts = sorted(set(all_layout_idxs) - val_layouts)
     val_layouts_sorted = sorted(val_layouts)
@@ -1479,15 +1494,22 @@ def evaluate_power(model, loader, device, layout_names=None):
     avg_mse = total_loss / max(n_batches, 1)
     avg_mae = total_mae / max(n_batches, 1)
 
-    # Build per-layout metrics dict
+    # Build per-layout metrics dict (aggregate indices sharing the same name)
     per_layout_metrics = {}
     if layout_names is not None:
+        name_acc = {}
         for li, acc in per_layout_acc.items():
             name = layout_names.get(li, f"layout_{li}")
-            count = max(acc["count"], 1)
+            if name not in name_acc:
+                name_acc[name] = {"mse_sum": 0.0, "mae_sum": 0.0, "count": 0}
+            name_acc[name]["mse_sum"] += acc["mse_sum"]
+            name_acc[name]["mae_sum"] += acc["mae_sum"]
+            name_acc[name]["count"] += acc["count"]
+        for name, agg in name_acc.items():
+            count = max(agg["count"], 1)
             per_layout_metrics[name] = {
-                "mse": acc["mse_sum"] / count,
-                "mae": acc["mae_sum"] / count,
+                "mse": agg["mse_sum"] / count,
+                "mae": agg["mae_sum"] / count,
             }
 
     return avg_mse, avg_mae, per_layout_metrics
@@ -1619,13 +1641,19 @@ def evaluate_masked(model, loader, device, feature_names, feature_weights=None,
             if i < avg_per_feature.shape[0]:
                 per_feature_dict[name] = avg_per_feature[i].item()
 
-    # Build per-layout metrics dict
+    # Build per-layout metrics dict (aggregate indices sharing the same name)
     per_layout_metrics = {}
     if layout_names is not None:
+        name_acc = {}
         for li, acc in per_layout_acc.items():
             name = layout_names.get(li, f"layout_{li}")
-            count = max(acc["count"], 1)
-            per_layout_metrics[name] = {"loss": acc["loss_sum"] / count}
+            if name not in name_acc:
+                name_acc[name] = {"loss_sum": 0.0, "count": 0}
+            name_acc[name]["loss_sum"] += acc["loss_sum"]
+            name_acc[name]["count"] += acc["count"]
+        for name, agg in name_acc.items():
+            count = max(agg["count"], 1)
+            per_layout_metrics[name] = {"loss": agg["loss_sum"] / count}
 
     return avg_loss, per_feature_dict, avg_cosine_sim, per_layout_metrics
 
@@ -1735,12 +1763,16 @@ def main():
 
     # Train/val split
     n_layouts = len(dataset.layouts)
+    unique_layout_names = sorted(set(
+        l.get("layout_name", f"layout_{i}") for i, l in enumerate(dataset.layouts)
+    ))
+    n_unique_layouts = len(unique_layout_names)
     train_layout_idxs = None
     val_layout_idxs = None
 
-    if args.val_split_by_layout and n_layouts > 1:
+    if args.val_split_by_layout and n_unique_layouts > 1:
         train_set, val_set, train_layout_idxs, val_layout_idxs = split_by_layout(
-            dataset, args.val_split, args.val_layout_indices, args.seed,
+            dataset, args.val_split, args.val_layout_names, args.seed,
         )
         n_train, n_val = len(train_set), len(val_set)
         # Log layout assignments with names
@@ -1751,8 +1783,8 @@ def main():
         print(f"  Val layouts   ({len(val_layout_idxs)}):   {_layout_names(val_layout_idxs)}  ({n_val} samples)")
 
     else:
-        if args.val_split_by_layout and n_layouts <= 1:
-            print("Warning: --val-split-by-layout requested but only 1 layout found. "
+        if args.val_split_by_layout and n_unique_layouts <= 1:
+            print("Warning: --val-split-by-layout requested but only 1 unique layout found. "
                   "Falling back to random split.")
         n_val = int(len(dataset) * args.val_split)
         n_train = len(dataset) - n_val
