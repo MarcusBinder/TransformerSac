@@ -366,8 +366,10 @@ class WindFarmPretrainDataset(Dataset):
         has_profiles = "receptivity" in self.layouts[0]
         if has_profiles:
             n_dirs = self.layouts[0]["receptivity"].shape[1]
-            self._receptivity = torch.zeros(N, self.max_turbines, n_dirs, dtype=torch.float32)
-            self._influence = torch.zeros(N, self.max_turbines, n_dirs, dtype=torch.float32)
+            n_episodes = sum(len(l["episode_meta"]) for l in self.layouts)
+            self._ep_receptivity = torch.zeros(n_episodes, self.max_turbines, n_dirs, dtype=torch.float32)
+            self._ep_influence = torch.zeros(n_episodes, self.max_turbines, n_dirs, dtype=torch.float32)
+            self._sample_ep_idx = torch.zeros(N, dtype=torch.long)
         self._has_profiles = has_profiles
 
         # Group sample indices by (layout_idx, episode_key) for bulk processing
@@ -376,6 +378,7 @@ class WindFarmPretrainDataset(Dataset):
         for global_idx, (li, ep_key, t) in enumerate(self.index):
             groups[(li, ep_key)].append((global_idx, t))
 
+        ep_counter = 0
         done = 0
         for (li, ep_key), samples in groups.items():
             layout = self.layouts[li]
@@ -442,17 +445,17 @@ class WindFarmPretrainDataset(Dataset):
             pos_tensor = torch.from_numpy(positions_norm)  # (n_turb, 2)
             self._positions[global_idxs, :n_turb] = pos_tensor.unsqueeze(0).expand(n_samples, -1, -1)
 
-            # --- Profiles: same for all samples in this episode ---
+            # --- Profiles: store once per episode, map samples → episode index ---
             if has_profiles:
                 recep = layout["receptivity"]
                 infl = layout["influence"]
                 if self.rotate_profiles:
                     recep = rotate_profiles_numpy(recep, mean_wd)
                     infl = rotate_profiles_numpy(infl, mean_wd)
-                recep_t = torch.from_numpy(recep)  # (n_turb, n_dirs)
-                infl_t = torch.from_numpy(infl)
-                self._receptivity[global_idxs, :n_turb] = recep_t.unsqueeze(0).expand(n_samples, -1, -1)
-                self._influence[global_idxs, :n_turb] = infl_t.unsqueeze(0).expand(n_samples, -1, -1)
+                self._ep_receptivity[ep_counter, :n_turb] = torch.from_numpy(recep)
+                self._ep_influence[ep_counter, :n_turb] = torch.from_numpy(infl)
+                self._sample_ep_idx[global_idxs] = ep_counter
+                ep_counter += 1
 
             done += n_samples
             if done % 200000 < n_samples:
@@ -504,8 +507,9 @@ class WindFarmPretrainDataset(Dataset):
         if self._actions is not None:
             sample["actions"] = self._actions[idx]
         if self._has_profiles:
-            sample["receptivity"] = self._receptivity[idx]
-            sample["influence"] = self._influence[idx]
+            ep_idx = self._sample_ep_idx[idx]
+            sample["receptivity"] = self._ep_receptivity[ep_idx]
+            sample["influence"] = self._ep_influence[ep_idx]
         return sample
 
 
