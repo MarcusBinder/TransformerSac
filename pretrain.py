@@ -188,9 +188,9 @@ class Args:
     # === Training Hyperparameters ===
     epochs: int = 50
     """Number of training epochs."""
-    batch_size: int = 256
+    batch_size: int = 1024
     """Batch size."""
-    lr: float = 3e-4
+    lr: float = 1.2e-3
     """Learning rate."""
     weight_decay: float = 1e-4
     """AdamW weight decay."""
@@ -1928,8 +1928,17 @@ def main():
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=args.lr * 0.01,
+    warmup_epochs = 5
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs - warmup_epochs, eta_min=args.lr * 0.01,
+    )
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1.0 / warmup_epochs, end_factor=1.0,
+        total_iters=warmup_epochs,
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_epochs],
     )
 
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
