@@ -33,6 +33,7 @@ except ImportError:
 from transformer_sac_windfarm import TransformerActor
 from helpers.helper_funcs import (
     transform_to_wind_relative,
+    rotate_profiles_tensor,
     EnhancedPerTurbineWrapper,
     find_checkpoints,
     load_actor_from_checkpoint,
@@ -58,12 +59,42 @@ def create_eval_env(layout: str, args: dict, seed: int = 42):
     wind_turbine = WT()
 
     layout_names = [l.strip() for l in layout.split(",")]
-    # print("Creating eval env for layouts:", layout_names)
     layouts = []
     for name in layout_names:
         x_pos, y_pos = get_layout_positions(name, wind_turbine)
-        layouts.append(LayoutConfig(name=name, x_pos=x_pos, y_pos=y_pos))
-    # print("Created layouts:", [l.name for l in layouts])
+        layout_cfg = LayoutConfig(name=name, x_pos=x_pos, y_pos=y_pos)
+
+        # Compute profiles if the model was trained with them
+        if args.get("profile_encoding_type") is not None:
+            profile_source = args.get("profile_source", "geometric").lower()
+            n_dirs = args.get("n_profile_directions", 72)
+
+            if profile_source == "geometric":
+                from helpers.geometric_profiles import compute_layout_profiles_vectorized
+
+                D = wind_turbine.diameter()
+                receptivity_profiles, influence_profiles = compute_layout_profiles_vectorized(
+                    x_pos, y_pos,
+                    rotor_diameter=D,
+                    k_wake=0.04,
+                    n_directions=n_dirs,
+                    sigma_smooth=10.0,
+                    scale_factor=15.0,
+                )
+            elif profile_source == "pywake":
+                from helpers.receptivity_profiles import compute_layout_profiles
+
+                receptivity_profiles, influence_profiles = compute_layout_profiles(
+                    x_pos, y_pos, wind_turbine,
+                    n_directions=n_dirs,
+                )
+            else:
+                raise ValueError(f"Unknown profile_source: {profile_source}")
+
+            layout_cfg.receptivity_profiles = receptivity_profiles
+            layout_cfg.influence_profiles = influence_profiles
+
+        layouts.append(layout_cfg)
 
     # Environment config
     config = make_env_config()
@@ -162,7 +193,7 @@ def evaluate(
     if verbose:
         print(f"Layout has {n_turbines} turbines, obs_dim={obs_dim_per_turbine}")
 
-    # Create actor with same architecture
+    # Create actor with same architecture (including profile encoding args)
     actor = TransformerActor(
         obs_dim_per_turbine=obs_dim_per_turbine,
         action_dim_per_turbine=1,
@@ -172,17 +203,28 @@ def evaluate(
         num_layers=args["num_layers"],
         mlp_ratio=args["mlp_ratio"],
         dropout=0.0,  # No dropout during eval
-        use_farm_token=args["use_farm_token"],
         action_scale=action_scale,
         action_bias=action_bias,
         pos_encoding_type=args["pos_encoding_type"],
         rel_pos_hidden_dim=args["rel_pos_hidden_dim"],
         rel_pos_per_head=args["rel_pos_per_head"],
+        pos_embedding_mode=args.get("pos_embedding_mode", "concat"),
+        # Profile args
+        profile_encoding=args.get("profile_encoding_type", None),
+        profile_encoder_hidden=args.get("profile_encoder_hidden", 128),
+        n_profile_directions=args.get("n_profile_directions", 72),
+        profile_fusion_type=args.get("profile_fusion_type", "add"),
+        profile_embed_mode=args.get("profile_embed_mode", "add"),
+        args=argparse.Namespace(**args),
     ).to(device)
 
     # Load weights
     actor.load_state_dict(checkpoint["actor_state_dict"])
     actor.eval()
+
+    # Profile settings
+    use_profiles = args.get("profile_encoding_type") is not None
+    rotate_profiles = args.get("rotate_profiles", False)
 
     # Run evaluation
     episode_returns = []
@@ -207,10 +249,37 @@ def evaluate(
             wind_dir_tensor = torch.tensor([wind_dir], dtype=torch.float32, device=device)
             positions_transformed = transform_to_wind_relative(positions_tensor, wind_dir_tensor)
 
+            # Attention mask: True = padding (invalid turbine positions)
+            mask_tensor = torch.tensor(
+                env.attention_mask, dtype=torch.bool, device=device
+            ).unsqueeze(0)
+
+            # Prepare profiles if model was trained with them
+            recep_tensor = None
+            influence_tensor = None
+            if use_profiles:
+                recep_np = env.receptivity_profiles  # (max_turbines, n_directions)
+                influence_np = env.influence_profiles
+                recep_tensor = torch.tensor(
+                    recep_np, dtype=torch.float32, device=device
+                ).unsqueeze(0)
+                influence_tensor = torch.tensor(
+                    influence_np, dtype=torch.float32, device=device
+                ).unsqueeze(0)
+
+                if rotate_profiles:
+                    recep_tensor = rotate_profiles_tensor(recep_tensor, wind_dir_tensor)
+                    influence_tensor = rotate_profiles_tensor(influence_tensor, wind_dir_tensor)
+
             # Get action
             with torch.no_grad():
                 action, _, mean_action, _ = actor.get_action(
-                    obs_tensor, positions_transformed, key_padding_mask=None, deterministic=deterministic
+                    obs_tensor,
+                    positions_transformed,
+                    key_padding_mask=mask_tensor,
+                    deterministic=deterministic,
+                    recep_profile=recep_tensor,
+                    influence_profile=influence_tensor,
                 )
 
             action_np = action.squeeze(0).squeeze(-1).cpu().numpy()
