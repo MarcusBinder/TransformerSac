@@ -632,7 +632,7 @@ def masked_logprob_loss(
 
     # Tanh Jacobian correction
     y_t = torch.tanh(x_t)
-    log_jac = torch.log((1 - y_t.pow(2)).clamp(min=eps))  # NOTE: no action scaling here. Fine if scale=1.
+    log_jac = torch.log((action_scale * (1 - y_t.pow(2))).clamp(min=eps))
 
     # Full log-prob with correction
     log_prob = log_p - log_jac  # (B, N, action_dim)
