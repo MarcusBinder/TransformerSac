@@ -723,6 +723,7 @@ def collect_plot_data(model, dataset, device, n_samples=256, batch_size=64,
     all_pos, all_mask, all_embed, all_obs = [], [], [], []
     all_attn = None
     all_recep_embed, all_influence_embed, all_profile_embed = [], [], []
+    all_mean_wd, all_layout_idx = [], []
 
     # Mode-specific collectors
     all_pred_power, all_target_power = [], []
@@ -767,6 +768,8 @@ def collect_plot_data(model, dataset, device, n_samples=256, batch_size=64,
         all_pos.append(batch["positions"])
         all_mask.append(batch["attention_mask"])
         all_obs.append(batch["obs"])
+        all_mean_wd.append(batch["mean_wd"])
+        all_layout_idx.append(batch["layout_idx"])
 
         if all_attn is None:
             all_attn = [[] for _ in range(len(attn))]
@@ -779,6 +782,8 @@ def collect_plot_data(model, dataset, device, n_samples=256, batch_size=64,
         "embeddings": torch.cat(all_embed).numpy(),
         "obs": torch.cat(all_obs).numpy(),
         "attn_weights": [torch.cat(layer_list).numpy() for layer_list in all_attn],
+        "mean_wd": torch.cat(all_mean_wd).numpy(),
+        "layout_idx": torch.cat(all_layout_idx).numpy(),
     }
 
     if pretrain_mode == "power":
@@ -858,6 +863,22 @@ def fig_attention_on_layout(results, sample_idx=0, top_k=3):
         ax.set_title(title, fontsize=9)
         ax.set_aspect("equal")
         ax.grid(True, alpha=0.3)
+
+        # Wind direction arrow (positions are wind-relative: wind from left)
+        x_range = pos_real[:, 0].max() - pos_real[:, 0].min()
+        y_mid = pos_real[:, 1].mean()
+        x_start = pos_real[:, 0].min() - 0.15 * max(x_range, 0.1)
+        arrow_len = 0.12 * max(x_range, 0.1)
+        ax.annotate(
+            "", xy=(x_start + arrow_len, y_mid), xytext=(x_start, y_mid),
+            arrowprops=dict(arrowstyle="->,head_width=0.3,head_length=0.15",
+                            color="dodgerblue", lw=2.0),
+            zorder=7,
+        )
+        ax.text(x_start + arrow_len / 2, y_mid + 0.04 * max(x_range, 0.1),
+                "Wind", fontsize=7, ha="center", color="dodgerblue",
+                fontweight="bold", zorder=7)
+
         return sc
 
     def _normalize_rows(a):
@@ -1093,6 +1114,69 @@ def fig_masked_reconstruction(results):
     return fig, stats
 
 
+def fig_reconstruction_vs_streamwise(results):
+    """
+    Per-turbine masked reconstruction error vs. streamwise position.
+
+    If the model has learned wake structure, upstream turbines (free-stream,
+    simpler flow) should have lower error than downstream turbines.
+
+    Returns (fig, scalar_stats) where scalar_stats contains:
+      masked/streamwise_slope — positive = wake-aware reconstruction
+    """
+    if "predicted_obs" not in results:
+        return None, {}
+
+    pred_obs = results["predicted_obs"]     # (S, N, obs_dim)
+    orig_obs = results["original_obs"]      # (S, N, obs_dim)
+    predict_mask = results["predict_mask"]  # (S, N) bool
+    pos = results["positions"]              # (S, N, 2)
+    mask = results["attention_mask"]        # (S, N) bool
+    real = ~mask
+
+    n_samples, n_turbines, obs_dim = pred_obs.shape
+
+    # Per-turbine MSE at masked positions
+    sq_error = np.sum((pred_obs - orig_obs) ** 2, axis=-1) / obs_dim  # (S, N)
+    # Only count positions that are both masked AND real
+    valid = predict_mask & real  # (S, N)
+
+    turbine_mse = np.full(n_turbines, np.nan)
+    turbine_x = np.full(n_turbines, np.nan)
+    for t in range(n_turbines):
+        t_valid = valid[:, t]
+        if t_valid.sum() > 0:
+            turbine_mse[t] = sq_error[t_valid, t].mean()
+            turbine_x[t] = pos[t_valid, t, 0].mean()  # mean streamwise position
+
+    active = ~np.isnan(turbine_mse)
+    if active.sum() < 2:
+        return None, {}
+
+    x_active = turbine_x[active]
+    mse_active = turbine_mse[active]
+
+    # Linear fit: MSE = slope * x + intercept
+    slope, intercept = np.polyfit(x_active, mse_active, 1)
+    stats = {"masked/streamwise_slope": float(slope)}
+
+    # --- Figure ---
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.scatter(x_active, mse_active, s=80, c=mse_active, cmap="hot_r",
+               edgecolors="black", linewidth=0.8, zorder=5)
+    x_line = np.linspace(x_active.min(), x_active.max(), 50)
+    ax.plot(x_line, slope * x_line + intercept, "b--", alpha=0.7,
+            label=f"slope = {slope:.4f}")
+    ax.set_xlabel("Streamwise Position (x, wind-relative)")
+    ax.set_ylabel("Mean Reconstruction MSE")
+    ax.set_title("Masked Reconstruction Error vs. Streamwise Position")
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    return fig, stats
+
+
 def compute_attention_entropy(results):
     """
     Compute attention entropy per layer/head as scalar metrics.
@@ -1124,6 +1208,76 @@ def compute_attention_entropy(results):
         all_means.append(layer_mean)
 
     stats["attn_entropy/mean"] = float(np.mean(all_means))
+    return stats
+
+
+def compute_wake_alignment(results):
+    """
+    Compute wake alignment score per attention head.
+
+    For each head, measures the fraction of attention weight flowing from
+    downstream queries to upstream keys (the physically-correct direction
+    for wake modeling). Positions are wind-relative (wind from 270° = negative x),
+    so upstream = lower x-coordinate.
+
+    Returns a dict of scalars for wandb.log():
+      wake/L{l}_H{h} — per-head score ∈ [0, 1]
+      wake/L{l}_mean — per-layer mean
+      wake/mean      — overall mean (primary sweep ranking metric)
+    Score >0.5 = model attends preferentially upstream. ~0.5 = random.
+    """
+    pos = results["positions"]       # (S, N, 2)
+    mask = results["attention_mask"]  # (S, N) bool
+    real = ~mask                      # (S, N)
+    n_layers = len(results["attn_weights"])
+
+    stats = {}
+    all_layer_means = []
+
+    for l in range(n_layers):
+        attn = results["attn_weights"][l]  # (S, H, N, N)
+        n_heads = attn.shape[1]
+        head_scores = []
+
+        for h in range(n_heads):
+            attn_h = attn[:, h, :, :]  # (S, N, N) — attn_h[s, i, j] = query i attends to key j
+
+            # Streamwise positions: x-coordinate (column 0)
+            x = pos[:, :, 0]  # (S, N)
+
+            # upstream_mask[s, i, j] = True if key j is upstream of query i
+            # i.e. x[j] < x[i]  (lower x = upstream in wind-relative coords)
+            x_query = x[:, :, np.newaxis]  # (S, N, 1)
+            x_key = x[:, np.newaxis, :]    # (S, 1, N)
+            upstream_mask = x_key < x_query  # (S, N, N)
+
+            # Self-attention mask: exclude i==j
+            N = attn_h.shape[-1]
+            self_mask = np.eye(N, dtype=bool)[np.newaxis, :, :]  # (1, N, N)
+
+            # Real turbine mask: both query and key must be real
+            real_query = real[:, :, np.newaxis]  # (S, N, 1)
+            real_key = real[:, np.newaxis, :]    # (S, 1, N)
+            valid = real_query & real_key & ~self_mask  # (S, N, N)
+
+            # Compute score: sum of attention at upstream positions / total attention
+            attn_valid = attn_h * valid
+            attn_upstream = attn_h * valid * upstream_mask
+
+            total = attn_valid.sum()
+            if total > 1e-10:
+                score = float(attn_upstream.sum() / total)
+            else:
+                score = 0.5  # undefined → neutral
+
+            stats[f"wake/L{l}_H{h}"] = score
+            head_scores.append(score)
+
+        layer_mean = float(np.mean(head_scores))
+        stats[f"wake/L{l}_mean"] = layer_mean
+        all_layer_means.append(layer_mean)
+
+    stats["wake/mean"] = float(np.mean(all_layer_means))
     return stats
 
 
@@ -1376,12 +1530,30 @@ def generate_diagnostic_plots(
         except Exception as e:
             print(f"    Warning: masked reconstruction plot failed: {e}")
 
+    # 4b. Reconstruction error vs. streamwise position (masked mode only)
+    if args.pretrain_mode == "masked":
+        try:
+            fig, streamwise_stats = fig_reconstruction_vs_streamwise(results)
+            if fig is not None:
+                images["plots/reconstruction_vs_streamwise"] = wandb.Image(fig)
+                plt.close(fig)
+            images.update(streamwise_stats)
+        except Exception as e:
+            print(f"    Warning: reconstruction vs streamwise plot failed: {e}")
+
     # 5. Attention entropy (as scalar metrics for native wandb line charts)
     try:
         entropy_stats = compute_attention_entropy(results)
         images.update(entropy_stats)
     except Exception as e:
         print(f"    Warning: entropy computation failed: {e}")
+
+    # 5b. Wake alignment — scalar metric for sweep ranking
+    try:
+        wake_stats = compute_wake_alignment(results)
+        images.update(wake_stats)
+    except Exception as e:
+        print(f"    Warning: wake alignment computation failed: {e}")
 
     # 6. Embedding t-SNE (skip if sklearn missing or too slow)
     try:
@@ -1402,6 +1574,23 @@ def generate_diagnostic_plots(
     except Exception as e:
         print(f"    Warning: profile embedding plot failed: {e}")
 
+    # 7b. Profile contribution ratio — how much signal profiles add
+    try:
+        if "profile_embed" in results:
+            prof_emb = results["profile_embed"]       # (S, N, D)
+            final_emb = results["embeddings"]         # (S, N, D_embed)
+            real = ~results["attention_mask"]          # (S, N)
+            prof_norms = np.linalg.norm(prof_emb, axis=-1)   # (S, N)
+            final_norms = np.linalg.norm(final_emb, axis=-1)  # (S, N)
+            mean_prof = prof_norms[real].mean()
+            mean_final = final_norms[real].mean()
+            if mean_final > 1e-10:
+                images["profile/contribution_ratio"] = float(mean_prof / mean_final)
+            else:
+                images["profile/contribution_ratio"] = 0.0
+    except Exception as e:
+        print(f"    Warning: profile contribution ratio failed: {e}")
+
     dt = time.time() - t0
     print(f"  Generated {len(images)} plot(s) in {dt:.1f}s")
     return images
@@ -1417,6 +1606,7 @@ def train_one_epoch_power(model, loader, optimizer, device, epoch,
                           log_wandb=False, scaler=None):
     model.train()
     total_loss = 0.0
+    grad_norm_sum = 0.0
     n_batches = 0
 
     for batch in loader:
@@ -1437,17 +1627,12 @@ def train_one_epoch_power(model, loader, optimizer, device, epoch,
         scaler.update()
 
         total_loss += loss.item()
+        grad_norm_sum += grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
         n_batches += 1
 
-        if log_wandb:
-            global_step = (epoch - 1) * len(loader) + n_batches
-            wandb.log({
-                "train/step_loss": loss.item(),
-                "train/grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
-                "global_step": global_step,
-            })
-
-    return total_loss / max(n_batches, 1)
+    avg_loss = total_loss / max(n_batches, 1)
+    avg_grad_norm = grad_norm_sum / max(n_batches, 1)
+    return avg_loss, avg_grad_norm
 
 
 @torch.no_grad()
@@ -1526,6 +1711,7 @@ def train_one_epoch_masked(model, loader, optimizer, device, epoch,
                            feature_weights=None, log_wandb=False, scaler=None):
     model.train()
     total_loss = 0.0
+    grad_norm_sum = 0.0
     n_batches = 0
 
     for batch in loader:
@@ -1550,17 +1736,12 @@ def train_one_epoch_masked(model, loader, optimizer, device, epoch,
         scaler.update()
 
         total_loss += loss.item()
+        grad_norm_sum += grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
         n_batches += 1
 
-        if log_wandb:
-            global_step = (epoch - 1) * len(loader) + n_batches
-            wandb.log({
-                "train/step_loss": loss.item(),
-                "train/grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
-                "global_step": global_step,
-            })
-
-    return total_loss / max(n_batches, 1)
+    avg_loss = total_loss / max(n_batches, 1)
+    avg_grad_norm = grad_norm_sum / max(n_batches, 1)
+    return avg_loss, avg_grad_norm
 
 
 @torch.no_grad()
@@ -1965,12 +2146,12 @@ def main():
 
         # ---- Train ----
         if args.pretrain_mode == "power":
-            train_loss = train_one_epoch_power(
+            train_loss, train_grad_norm = train_one_epoch_power(
                 model, train_loader, optimizer, device, epoch,
                 log_wandb=use_wandb, scaler=scaler,
             )
         else:
-            train_loss = train_one_epoch_masked(
+            train_loss, train_grad_norm = train_one_epoch_masked(
                 model, train_loader, optimizer, device, epoch,
                 feature_weights=feature_weights, log_wandb=use_wandb,
                 scaler=scaler,
@@ -2014,10 +2195,17 @@ def main():
             log_dict = {
                 "epoch": epoch,
                 "train/loss": train_loss,
+                "train/grad_norm": train_grad_norm,
                 "val/loss": val_loss,
                 "lr": lr_now,
                 "epoch_time_s": dt,
+                "throughput/samples_per_sec": len(train_loader.dataset) / dt,
             }
+            if device.type == "cuda":
+                log_dict["gpu/mem_allocated_gb"] = torch.cuda.max_memory_allocated(device) / 1e9
+                log_dict["gpu/mem_reserved_gb"] = torch.cuda.max_memory_reserved(device) / 1e9
+                torch.cuda.reset_peak_memory_stats(device)
+
             if args.pretrain_mode == "power":
                 log_dict["val/mse"] = val_mse
                 log_dict["val/mae"] = val_mae
