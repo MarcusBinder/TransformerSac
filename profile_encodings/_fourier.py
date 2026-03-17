@@ -177,11 +177,20 @@ class FourierProfileEncoderWithContext(nn.Module):
         embed_dim: int = 128,
         n_harmonics: int = 8,
         wind_dir_embed_dim: int = 16,
+        learnable_weights: bool = True,
         **kwargs,
     ):
         super().__init__()
         self.n_harmonics = n_harmonics
         self.feature_dim = 1 + 2 * n_harmonics
+
+        # Learnable harmonic importance weights (matching base class)
+        if learnable_weights:
+            init_weights = torch.ones(n_harmonics + 1)
+            init_weights[1:] = torch.exp(-0.1 * torch.arange(1, n_harmonics + 1).float())
+            self.harmonic_weights = nn.Parameter(init_weights)
+        else:
+            self.register_buffer('harmonic_weights', torch.ones(n_harmonics + 1))
 
         # Wind direction embedding (sin/cos encoding)
         self.wind_embed = nn.Sequential(
@@ -224,6 +233,9 @@ class FourierProfileEncoderWithContext(nn.Module):
                 dtype=fft.dtype, device=fft.device
             )
             fft = torch.cat([fft, padding], dim=-1)
+
+        # Apply learnable harmonic weights
+        fft = fft * self.harmonic_weights.to(fft.device)
 
         fourier_features = torch.cat([
             fft[:, 0:1].real,
