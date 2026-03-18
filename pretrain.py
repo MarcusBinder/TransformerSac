@@ -806,6 +806,12 @@ def collect_plot_data(model, dataset, device, n_samples=256, batch_size=64,
 # DIAGNOSTIC PLOTS
 # =============================================================================
 
+def _largest_layout(dataset, layout_idxs):
+    """Return (layout_idx, layout_name, n_turbines) for the layout with the most turbines."""
+    best = max(layout_idxs, key=lambda i: dataset.layouts[i]["n_turbines"])
+    return best, dataset.layouts[best].get("layout_name", f"layout_{best}"), dataset.layouts[best]["n_turbines"]
+
+
 def fig_attention_on_layout(results, sample_idx=0, top_k=3):
     """
     Attention maps overlaid on the physical farm layout, per head.
@@ -1466,37 +1472,89 @@ def fig_profile_embeddings(results, sample_indices=None):
 
 def generate_diagnostic_plots(
     model, val_dataset, device, epoch, args,
+    train_set=None, dataset=None,
+    train_layout_idxs=None, val_layout_idxs=None,
 ):
     """
     Collect inference results and generate all diagnostic plots.
     Returns a dict of {wandb_key: wandb.Image} ready for wandb.log().
+
+    When train_set/dataset/layout_idxs are provided, attention and profile
+    plots are drawn for the largest training and validation layouts (by
+    turbine count) instead of arbitrary evenly-spaced samples.
     """
     print(f"  Generating diagnostic plots (n_samples={args.plot_n_samples})...")
     t0 = time.time()
 
-    results = collect_plot_data(
+    val_results = collect_plot_data(
         model, val_dataset, device,
         n_samples=args.plot_n_samples,
         batch_size=args.batch_size,
         pretrain_mode=args.pretrain_mode,
     )
 
+    # Collect train data for layout-aware plots (only when layout info is available)
+    train_results = None
+    if train_set is not None and train_layout_idxs is not None and val_layout_idxs is not None:
+        train_results = collect_plot_data(
+            model, train_set, device,
+            n_samples=args.plot_n_samples,
+            batch_size=args.batch_size,
+            pretrain_mode=args.pretrain_mode,
+        )
+
+    # Use val_results as the primary results for aggregate metrics
+    results = val_results
+
     images = {}
 
-    # 1. Attention on layout — per head, per layer, multiple samples
-    n_samples_available = results["positions"].shape[0]
-    sample_indices = np.linspace(0, n_samples_available - 1,
-                                  args.plot_n_sample_indices, dtype=int)
-    for i, idx in enumerate(sample_indices):
-        try:
-            layer_figs = fig_attention_on_layout(
-                results, sample_idx=int(idx), top_k=args.plot_attn_top_k
-            )
-            for layer_idx, fig in layer_figs.items():
-                images[f"plots/attention_L{layer_idx}_s{idx}"] = wandb.Image(fig)
-                plt.close(fig)
-        except Exception as e:
-            print(f"    Warning: attention plot failed for sample {idx}: {e}")
+    # 1. Attention on layout — largest layout from each split
+    layout_aware = (dataset is not None and train_layout_idxs is not None
+                    and val_layout_idxs is not None and train_results is not None)
+
+    val_match = np.array([], dtype=int)
+    if layout_aware:
+        # Find largest layouts by turbine count
+        val_li, val_name, val_nt = _largest_layout(dataset, val_layout_idxs)
+        train_li, train_name, train_nt = _largest_layout(dataset, train_layout_idxs)
+        print(f"    Attention plots: val layout={val_name} ({val_nt}T), "
+              f"train layout={train_name} ({train_nt}T)")
+
+        # Find first sample matching each layout
+        val_match = np.where(val_results["layout_idx"] == val_li)[0]
+        train_match = np.where(train_results["layout_idx"] == train_li)[0]
+
+        plot_specs = []
+        if len(val_match) > 0:
+            plot_specs.append((val_results, int(val_match[0]), f"val_{val_name}"))
+        if len(train_match) > 0:
+            plot_specs.append((train_results, int(train_match[0]), f"train_{train_name}"))
+
+        for res, idx, label in plot_specs:
+            try:
+                layer_figs = fig_attention_on_layout(
+                    res, sample_idx=idx, top_k=args.plot_attn_top_k
+                )
+                for layer_idx, fig in layer_figs.items():
+                    images[f"plots/attention_L{layer_idx}_{label}"] = wandb.Image(fig)
+                    plt.close(fig)
+            except Exception as e:
+                print(f"    Warning: attention plot failed for {label}: {e}")
+    else:
+        # Fallback: evenly-spaced samples from val set
+        n_samples_available = results["positions"].shape[0]
+        sample_indices = np.linspace(0, n_samples_available - 1,
+                                      args.plot_n_sample_indices, dtype=int)
+        for i, idx in enumerate(sample_indices):
+            try:
+                layer_figs = fig_attention_on_layout(
+                    results, sample_idx=int(idx), top_k=args.plot_attn_top_k
+                )
+                for layer_idx, fig in layer_figs.items():
+                    images[f"plots/attention_L{layer_idx}_s{idx}"] = wandb.Image(fig)
+                    plt.close(fig)
+            except Exception as e:
+                print(f"    Warning: attention plot failed for sample {idx}: {e}")
 
     # 2. Predicted vs. actual scatter (power mode only)
     if args.pretrain_mode == "power":
@@ -1565,8 +1623,14 @@ def generate_diagnostic_plots(
         print(f"    Warning: t-SNE plot failed: {e}")
 
     # 7. Profile embedding diagnostics (if profiles are enabled)
+    #    Use layout-selected sample indices when available
     try:
-        fig, profile_stats = fig_profile_embeddings(results)
+        profile_sample_indices = None
+        if layout_aware and len(val_match) > 0:
+            profile_sample_indices = np.array([int(val_match[0])])
+        fig, profile_stats = fig_profile_embeddings(
+            results, sample_indices=profile_sample_indices,
+        )
         if fig is not None:
             images["plots/profile_embeddings"] = wandb.Image(fig)
             plt.close(fig)
@@ -2226,6 +2290,10 @@ def main():
                             or epoch == args.epochs):
                 plot_images = generate_diagnostic_plots(
                     model, val_set, device, epoch, args,
+                    train_set=train_set,
+                    dataset=dataset,
+                    train_layout_idxs=train_layout_idxs,
+                    val_layout_idxs=val_layout_idxs,
                 )
                 log_dict.update(plot_images)
 
