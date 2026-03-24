@@ -435,8 +435,8 @@ def rotate_profiles_tensor(
 
 def save_checkpoint(
     actor: nn.Module,
-    qf1: nn.Module,
-    qf2: nn.Module,
+    qf1: Optional[nn.Module],
+    qf2: Optional[nn.Module],
     actor_optimizer: optim.Optimizer,
     q_optimizer: optim.Optimizer,
     step: int,
@@ -444,36 +444,41 @@ def save_checkpoint(
     args: Any,
     log_alpha: Optional[torch.Tensor] = None,
     alpha_optimizer: Optional[optim.Optimizer] = None,
+    tqc_critic: Optional[nn.Module] = None,
 ) -> str:
     """
     Save training checkpoint.
-    
+
     Returns:
         Path to saved checkpoint
     """
     checkpoint_dir = f"runs/{run_name}/checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
-    
+
     checkpoint_path = f"{checkpoint_dir}/step_{step}.pt"
-    
+
     checkpoint = {
         "step": step,
         "actor_state_dict": actor.state_dict(),
-        "qf1_state_dict": qf1.state_dict(),
-        "qf2_state_dict": qf2.state_dict(),
         "actor_optimizer_state_dict": actor_optimizer.state_dict(),
         "q_optimizer_state_dict": q_optimizer.state_dict(),
         "args": vars(args),
     }
-    
+
+    if tqc_critic is not None:
+        checkpoint["tqc_critic_state_dict"] = tqc_critic.state_dict()
+    else:
+        checkpoint["qf1_state_dict"] = qf1.state_dict()
+        checkpoint["qf2_state_dict"] = qf2.state_dict()
+
     if log_alpha is not None:
         checkpoint["log_alpha"] = log_alpha.detach().cpu()
     if alpha_optimizer is not None:
         checkpoint["alpha_optimizer_state_dict"] = alpha_optimizer.state_dict()
-    
+
     torch.save(checkpoint, checkpoint_path)
     print(f"Checkpoint saved to {checkpoint_path}")
-    
+
     return checkpoint_path
 
 
@@ -530,15 +535,17 @@ def load_old_sac_checkpoint(checkpoint_path: str, device: torch.device):
 def load_checkpoint(
     checkpoint_path: str,
     actor: nn.Module,
-    qf1: nn.Module,
-    qf2: nn.Module,
-    qf1_target: nn.Module,
-    qf2_target: nn.Module,
+    qf1: Optional[nn.Module],
+    qf2: Optional[nn.Module],
+    qf1_target: Optional[nn.Module],
+    qf2_target: Optional[nn.Module],
     actor_optimizer: optim.Optimizer,
     q_optimizer: optim.Optimizer,
     device: torch.device,
     log_alpha: Optional[torch.Tensor] = None,
     alpha_optimizer: Optional[optim.Optimizer] = None,
+    tqc_critic: Optional[nn.Module] = None,
+    tqc_critic_target: Optional[nn.Module] = None,
 ) -> int:
     """
     Load training checkpoint.
@@ -546,15 +553,17 @@ def load_checkpoint(
     Args:
         checkpoint_path: Path to checkpoint file
         actor: Actor network
-        qf1: First critic network
-        qf2: Second critic network
-        qf1_target: First target critic network
-        qf2_target: Second target critic network
+        qf1: First critic network (None for TQC)
+        qf2: Second critic network (None for TQC)
+        qf1_target: First target critic network (None for TQC)
+        qf2_target: Second target critic network (None for TQC)
         actor_optimizer: Actor optimizer
         q_optimizer: Critic optimizer
         device: Torch device
         log_alpha: Optional entropy coefficient (log scale)
         alpha_optimizer: Optional entropy optimizer
+        tqc_critic: TQC critic (None for SAC)
+        tqc_critic_target: TQC target critic (None for SAC)
 
     Returns:
         Step number from checkpoint
@@ -562,10 +571,16 @@ def load_checkpoint(
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     actor.load_state_dict(checkpoint["actor_state_dict"])
-    qf1.load_state_dict(checkpoint["qf1_state_dict"])
-    qf2.load_state_dict(checkpoint["qf2_state_dict"])
-    qf1_target.load_state_dict(checkpoint["qf1_state_dict"])
-    qf2_target.load_state_dict(checkpoint["qf2_state_dict"])
+
+    if tqc_critic is not None and "tqc_critic_state_dict" in checkpoint:
+        tqc_critic.load_state_dict(checkpoint["tqc_critic_state_dict"])
+        tqc_critic_target.load_state_dict(checkpoint["tqc_critic_state_dict"])
+    else:
+        qf1.load_state_dict(checkpoint["qf1_state_dict"])
+        qf2.load_state_dict(checkpoint["qf2_state_dict"])
+        qf1_target.load_state_dict(checkpoint["qf1_state_dict"])
+        qf2_target.load_state_dict(checkpoint["qf2_state_dict"])
+
     actor_optimizer.load_state_dict(checkpoint["actor_optimizer_state_dict"])
     q_optimizer.load_state_dict(checkpoint["q_optimizer_state_dict"])
 

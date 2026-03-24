@@ -186,6 +186,19 @@ class Args:
     rel_pos_per_head: bool = True
     pos_embedding_mode: str = "concat"  # "add" or "concat" positional embedding to token (only for absolute types)
     
+    # === Algorithm Selection ===
+    algorithm: str = "sac"  # "sac" or "tqc"
+    use_droq: bool = False  # Enable DroQ regularization (dropout + LayerNorm in critic MLPs)
+
+    # === TQC Hyperparameters (only used when algorithm="tqc") ===
+    tqc_n_critics: int = 5               # Number of critic networks
+    tqc_n_quantiles: int = 25            # Quantiles per critic
+    tqc_top_quantiles_to_drop: int = 2   # Truncation: drop top-d per-sample quantiles
+
+    # === DroQ Hyperparameters (only used when use_droq=True) ===
+    droq_dropout: float = 0.01           # Dropout rate for DroQ critic MLPs
+    droq_layer_norm: bool = True         # LayerNorm in DroQ critic MLPs
+
     # === SAC Hyperparameters ===
     utd_ratio: float = 1.0           # Update-to-data ratio
     total_timesteps: int = 100_000
@@ -1050,7 +1063,7 @@ class TransformerCritic(nn.Module):
     The pooling operation aggregates information from all turbines
     into a single scalar Q-value for the entire farm.
     """
-    
+
     def __init__(
         self,
         obs_dim_per_turbine: int,
@@ -1076,6 +1089,9 @@ class TransformerCritic(nn.Module):
         shared_recep_encoder: Optional[nn.Module] = None,
         shared_influence_encoder: Optional[nn.Module] = None,
         args: Optional[Args] = None,  # For flexible encoder kwargs (e.g. Fourier n_harmonics, MultiRes scales
+        # DroQ settings (dropout + LayerNorm in critic MLPs)
+        droq_dropout: float = 0.0,
+        droq_layer_norm: bool = False,
     ):
         super().__init__()
         
@@ -1114,12 +1130,17 @@ class TransformerCritic(nn.Module):
 
 
         # Observation + action encoder
-        self.obs_action_encoder = nn.Sequential(
+        obs_action_layers: list[nn.Module] = [
             nn.Linear(obs_dim_per_turbine + action_dim_per_turbine, embed_dim),
-            nn.ReLU(),
-            nn.Linear(embed_dim, embed_dim),
-        )
-                
+        ]
+        if droq_layer_norm:
+            obs_action_layers.append(nn.LayerNorm(embed_dim))
+        obs_action_layers.append(nn.ReLU())
+        if droq_dropout > 0.0:
+            obs_action_layers.append(nn.Dropout(droq_dropout))
+        obs_action_layers.append(nn.Linear(embed_dim, embed_dim))
+        self.obs_action_encoder = nn.Sequential(*obs_action_layers)
+
         # Input projection: only needed when concatenating position embedding
         if self.embedding_mode == "concat":
             self.input_proj = nn.Linear(embed_dim + pos_embed_dim, embed_dim)
@@ -1144,11 +1165,14 @@ class TransformerCritic(nn.Module):
         )
     
         # Q-value head (after pooling)
-        self.q_head = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
-            nn.ReLU(),
-            nn.Linear(embed_dim, 1),
-        )
+        q_head_layers: list[nn.Module] = [nn.Linear(embed_dim, embed_dim)]
+        if droq_layer_norm:
+            q_head_layers.append(nn.LayerNorm(embed_dim))
+        q_head_layers.append(nn.ReLU())
+        if droq_dropout > 0.0:
+            q_head_layers.append(nn.Dropout(droq_dropout))
+        q_head_layers.append(nn.Linear(embed_dim, 1))
+        self.q_head = nn.Sequential(*q_head_layers)
     
     def forward(
         self,
@@ -1235,6 +1259,86 @@ class TransformerCritic(nn.Module):
         q = self.q_head(h_pooled)  # (batch, 1)
         
         return q
+
+
+# =============================================================================
+# TQC CRITIC (Truncated Quantile Critics)
+# =============================================================================
+
+class TransformerTQCCritic(nn.Module):
+    """
+    TQC critic: N independent TransformerCritic networks, each outputting
+    M quantiles instead of a single Q-value.
+
+    Forward returns (n_critics, batch, n_quantiles).
+    """
+
+    def __init__(self, n_critics: int, n_quantiles: int, **critic_kwargs):
+        super().__init__()
+        self.n_critics = n_critics
+        self.n_quantiles = n_quantiles
+        self.critics = nn.ModuleList([
+            TransformerCritic(**critic_kwargs) for _ in range(n_critics)
+        ])
+        # Override each critic's q_head to output n_quantiles instead of 1
+        # Read DroQ settings (without removing — TransformerCritic also uses them)
+        droq_dropout = critic_kwargs.get("droq_dropout", 0.0)
+        droq_layer_norm = critic_kwargs.get("droq_layer_norm", False)
+
+        for critic in self.critics:
+            embed_dim = critic.embed_dim
+            q_head_layers: list[nn.Module] = [nn.Linear(embed_dim, embed_dim)]
+            if droq_layer_norm:
+                q_head_layers.append(nn.LayerNorm(embed_dim))
+            q_head_layers.append(nn.ReLU())
+            if droq_dropout > 0.0:
+                q_head_layers.append(nn.Dropout(droq_dropout))
+            q_head_layers.append(nn.Linear(embed_dim, n_quantiles))
+            critic.q_head = nn.Sequential(*q_head_layers)
+
+    def forward(
+        self,
+        obs: torch.Tensor,
+        action: torch.Tensor,
+        positions: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        recep_profile: Optional[torch.Tensor] = None,
+        influence_profile: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Returns (n_critics, batch, n_quantiles)."""
+        return torch.stack([
+            c(obs, action, positions, key_padding_mask,
+              recep_profile, influence_profile)
+            for c in self.critics
+        ], dim=0)
+
+
+def quantile_huber_loss(
+    quantiles_pred: torch.Tensor,
+    target: torch.Tensor,
+    taus: torch.Tensor,
+    kappa: float = 1.0,
+) -> torch.Tensor:
+    """
+    Quantile regression loss with Huber penalty.
+
+    Args:
+        quantiles_pred: (batch, n_quantiles) predicted quantile values
+        target: (batch, 1) target Q-values
+        taus: (n_quantiles,) quantile midpoints
+        kappa: Huber loss threshold
+    Returns:
+        Scalar loss
+    """
+    # Pairwise TD errors: (batch, 1, n_quantiles) - (batch, 1, 1)
+    td_error = target.unsqueeze(-1) - quantiles_pred.unsqueeze(1)
+    huber = torch.where(
+        td_error.abs() <= kappa,
+        0.5 * td_error.pow(2),
+        kappa * (td_error.abs() - 0.5 * kappa),
+    )
+    quantile_weight = (taus - (td_error < 0).float()).abs()
+    return (quantile_weight * huber).mean()
 
 
 # =============================================================================
@@ -1698,10 +1802,15 @@ def main():
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
     
+    assert args.algorithm in ("sac", "tqc"), \
+        f"--algorithm must be 'sac' or 'tqc', got '{args.algorithm}'"
+
+    if args.use_droq and args.utd_ratio < 10:
+        print(f"WARNING: DroQ is enabled but utd_ratio={args.utd_ratio}. "
+              f"DroQ typically benefits from high UTD ratios (>=10, often 20).")
+
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     print(f"Using device: {device}")
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Force math SDPA backend (avoids ROCm Flash/MemEfficient kernel bugs)
     # ONLY RELEVANT FOR LUMI. TODO make it such this only works on lumi
@@ -2106,7 +2215,6 @@ def main():
         "shared_influence_encoder": shared_influence_encoder,
         "args": args,  # Pass full args for any additional config needs
     }
-        
 
     # Actor has additional action scaling params
     actor = TransformerActor(
@@ -2128,28 +2236,11 @@ def main():
     # Update evaluator with actor reference
     evaluator.agent = agent
 
-    # Critics all use the same config
-    qf1 = TransformerCritic(**common_kwargs).to(device)
-    qf2 = TransformerCritic(**common_kwargs).to(device)
-    qf1_target = TransformerCritic(**common_kwargs).to(device)
-    qf2_target = TransformerCritic(**common_kwargs).to(device)
-    
-    qf1_target.load_state_dict(qf1.state_dict())
-    qf2_target.load_state_dict(qf2.state_dict())
-    
-    # Count parameters
-    actor_params = sum(p.numel() for p in actor.parameters())
-    critic_params = sum(p.numel() for p in qf1.parameters())
-    print(f"Actor parameters: {actor_params:,}")
-    print(f"Critic parameters: {critic_params:,} (x2)")
-    
-    # Optimizers
-    actor_optimizer = optim.Adam(actor.parameters(), lr=args.policy_lr)
-    # q_optimizer = optim.Adam(
-    #     list(qf1.parameters()) + list(qf2.parameters()),
-    #     lr=args.q_lr
-    # )
-    
+    # Add DroQ-specific kwargs to critic config (after actor, which doesn't accept these)
+    if args.use_droq:
+        common_kwargs["droq_dropout"] = args.droq_dropout
+        common_kwargs["droq_layer_norm"] = args.droq_layer_norm
+
     # Get critic parameters, excluding shared profile encoders
     def get_critic_params_excluding_shared(critic, shared_recep, shared_influence):
         '''Get critic parameters, excluding shared modules.'''
@@ -2158,11 +2249,7 @@ def main():
             shared_param_ids.update(id(p) for p in shared_recep.parameters())
         if shared_influence is not None:
             shared_param_ids.update(id(p) for p in shared_influence.parameters())
-        
         return [p for p in critic.parameters() if id(p) not in shared_param_ids]
-    
-    qf1_params = get_critic_params_excluding_shared(qf1, shared_recep_encoder, shared_influence_encoder)
-    qf2_params = get_critic_params_excluding_shared(qf2, shared_recep_encoder, shared_influence_encoder)
 
     # Collect shared encoder params so they receive gradients from critic loss too
     shared_encoder_params = []
@@ -2171,19 +2258,76 @@ def main():
     if shared_influence_encoder is not None:
         shared_encoder_params += list(shared_influence_encoder.parameters())
 
-    q_optimizer = optim.Adam(
-        qf1_params + qf2_params + shared_encoder_params,
-        lr=args.q_lr
-    )
-    
+    # Initialize critic variables (some will be None depending on algorithm)
+    qf1 = qf2 = qf1_target = qf2_target = None
+    tqc_critic = tqc_critic_target = None
+    taus = None
+
+    if args.algorithm == "tqc":
+        tqc_critic = TransformerTQCCritic(
+            n_critics=args.tqc_n_critics,
+            n_quantiles=args.tqc_n_quantiles,
+            **common_kwargs,
+        ).to(device)
+        tqc_critic_target = TransformerTQCCritic(
+            n_critics=args.tqc_n_critics,
+            n_quantiles=args.tqc_n_quantiles,
+            **common_kwargs,
+        ).to(device)
+        tqc_critic_target.load_state_dict(tqc_critic.state_dict())
+
+        # Precompute quantile midpoints: tau_i = (i + 0.5) / N
+        taus = (torch.arange(args.tqc_n_quantiles, device=device).float() + 0.5) / args.tqc_n_quantiles
+
+        tqc_params = get_critic_params_excluding_shared(tqc_critic, shared_recep_encoder, shared_influence_encoder)
+        q_optimizer = optim.Adam(tqc_params + shared_encoder_params, lr=args.q_lr)
+
+        actor_params = sum(p.numel() for p in actor.parameters())
+        critic_params = sum(p.numel() for p in tqc_critic.parameters())
+        print(f"Actor parameters: {actor_params:,}")
+        print(f"TQC Critic parameters: {critic_params:,} ({args.tqc_n_critics} critics x {args.tqc_n_quantiles} quantiles)")
+    else:
+        # SAC: standard dual-critic setup (DroQ regularization applied via common_kwargs if enabled)
+        qf1 = TransformerCritic(**common_kwargs).to(device)
+        qf2 = TransformerCritic(**common_kwargs).to(device)
+        qf1_target = TransformerCritic(**common_kwargs).to(device)
+        qf2_target = TransformerCritic(**common_kwargs).to(device)
+
+        qf1_target.load_state_dict(qf1.state_dict())
+        qf2_target.load_state_dict(qf2.state_dict())
+
+        qf1_params = get_critic_params_excluding_shared(qf1, shared_recep_encoder, shared_influence_encoder)
+        qf2_params = get_critic_params_excluding_shared(qf2, shared_recep_encoder, shared_influence_encoder)
+
+        q_optimizer = optim.Adam(
+            qf1_params + qf2_params + shared_encoder_params,
+            lr=args.q_lr,
+        )
+
+        actor_params = sum(p.numel() for p in actor.parameters())
+        critic_params = sum(p.numel() for p in qf1.parameters())
+        print(f"Actor parameters: {actor_params:,}")
+        print(f"Critic parameters: {critic_params:,} (x2)")
+
+    # Optimizers
+    actor_optimizer = optim.Adam(actor.parameters(), lr=args.policy_lr)
+
     # Verify parameter counts
     if shared_recep_encoder is not None:
         actor_unique = sum(p.numel() for p in actor.parameters())
-        critic_unique = sum(p.numel() for p in qf1_params)
+        if args.algorithm == "tqc":
+            critic_unique = sum(p.numel() for p in tqc_params)
+        else:
+            critic_unique = sum(p.numel() for p in qf1_params)
         shared_total = sum(p.numel() for p in shared_encoder_params)
         print(f"Actor parameters (includes shared): {actor_unique:,}")
-        print(f"Critic parameters (excluding shared): {critic_unique:,} (x2)")
+        print(f"Critic parameters (excluding shared): {critic_unique:,}")
         print(f"Shared encoder parameters (in both optimizers): {shared_total:,}")
+
+    algo_str = args.algorithm.upper()
+    if args.use_droq:
+        algo_str += " + DroQ"
+    print(f"Algorithm: {algo_str}")
 
 
     # Entropy tuning
@@ -2212,13 +2356,30 @@ def main():
             raise FileNotFoundError(f"Checkpoint not found: {args.resume_checkpoint}")
         
         checkpoint = torch.load(args.resume_checkpoint, map_location=device, weights_only=False)
-        
+
+        # Validate checkpoint matches current algorithm
+        ckpt_is_tqc = "tqc_critic_state_dict" in checkpoint
+        if args.algorithm == "tqc" and not ckpt_is_tqc:
+            raise ValueError(
+                f"--algorithm=tqc but checkpoint has no TQC critic weights. "
+                f"Checkpoint was saved with algorithm={checkpoint.get('args', {}).get('algorithm', 'sac')}."
+            )
+        if args.algorithm != "tqc" and ckpt_is_tqc:
+            raise ValueError(
+                f"--algorithm={args.algorithm} but checkpoint contains TQC critic weights. "
+                f"Use --algorithm=tqc to resume this checkpoint."
+            )
+
         # Load network weights
         actor.load_state_dict(checkpoint["actor_state_dict"])
-        qf1.load_state_dict(checkpoint["qf1_state_dict"])
-        qf2.load_state_dict(checkpoint["qf2_state_dict"])
-        qf1_target.load_state_dict(checkpoint["qf1_state_dict"])
-        qf2_target.load_state_dict(checkpoint["qf2_state_dict"])
+        if args.algorithm == "tqc":
+            tqc_critic.load_state_dict(checkpoint["tqc_critic_state_dict"])
+            tqc_critic_target.load_state_dict(checkpoint["tqc_critic_state_dict"])
+        else:
+            qf1.load_state_dict(checkpoint["qf1_state_dict"])
+            qf2.load_state_dict(checkpoint["qf2_state_dict"])
+            qf1_target.load_state_dict(checkpoint["qf1_state_dict"])
+            qf2_target.load_state_dict(checkpoint["qf2_state_dict"])
         
         print(f"✓ Loaded network weights from step {checkpoint['step']}")
         
@@ -2358,13 +2519,15 @@ def main():
             n_actor = load_pretrained_into(actor, "Actor", _pretrain_encoder_sd)
 
         # Critics always get encoder-only loading (obs_action_encoder input dim differs)
-        n_qf1 = load_pretrained_into(qf1, "Critic qf1", _pretrain_encoder_sd)
-        n_qf2 = load_pretrained_into(qf2, "Critic qf2", _pretrain_encoder_sd)
-        # n_qfX is the number of variables loaded in.
-        
-        # Re-sync target networks
-        qf1_target.load_state_dict(qf1.state_dict())
-        qf2_target.load_state_dict(qf2.state_dict())
+        if args.algorithm == "tqc":
+            for i, critic in enumerate(tqc_critic.critics):
+                load_pretrained_into(critic, f"TQC Critic {i}", _pretrain_encoder_sd)
+            tqc_critic_target.load_state_dict(tqc_critic.state_dict())
+        else:
+            n_qf1 = load_pretrained_into(qf1, "Critic qf1", _pretrain_encoder_sd)
+            n_qf2 = load_pretrained_into(qf2, "Critic qf2", _pretrain_encoder_sd)
+            qf1_target.load_state_dict(qf1.state_dict())
+            qf2_target.load_state_dict(qf2.state_dict())
         print(f"\n  Target networks synced ✓")
 
         if n_actor == 0:
@@ -2419,7 +2582,8 @@ def main():
 
     save_checkpoint(
         actor, qf1, qf2, actor_optimizer, q_optimizer,
-        0, run_name, args, log_alpha, alpha_optimizer
+        0, run_name, args, log_alpha, alpha_optimizer,
+        tqc_critic=tqc_critic,
     )
 
 
@@ -2439,6 +2603,15 @@ def main():
               f"Power ratio: {eval_metrics.power_ratio:.4f}")
 
 
+    # DroQ: target networks must be in eval mode to disable dropout
+    if args.use_droq:
+        if tqc_critic_target is not None:
+            tqc_critic_target.eval()
+        if qf1_target is not None:
+            qf1_target.eval()
+        if qf2_target is not None:
+            qf2_target.eval()
+
     start_time = time.time()
     global_step = start_step  # Start from checkpoint step if resuming, else 0
     total_gradient_steps = 0  # Track total gradient updates for logging
@@ -2450,9 +2623,14 @@ def main():
     # next_save_step = ((start_step // args.save_interval) + 1) * args.save_interval  # Account for resumed step
     next_save_step = start_step + args.save_interval 
     # For logging losses (we'll average over the UTD updates)
-    loss_accumulator = {
-        'qf1_loss': [], 'qf2_loss': [], 'actor_loss': [], 'alpha_loss': []
-    }
+    if args.algorithm == "tqc":
+        loss_accumulator = {
+            'qf_loss': [], 'actor_loss': [], 'alpha_loss': []
+        }
+    else:
+        loss_accumulator = {
+            'qf1_loss': [], 'qf2_loss': [], 'actor_loss': [], 'alpha_loss': []
+        }
 
     # Calculate remaining updates if resuming
     remaining_timesteps = args.total_timesteps - start_step
@@ -2602,67 +2780,109 @@ def main():
                         recep_profile=batch_receptivity,
                         influence_profile=batch_influence,
                     )
-                    
-                    # Compute target Q-values
-                    qf1_next = qf1_target(
-                        data["next_observations"], next_actions, 
-                        data["positions"], batch_mask, 
+
+                if args.algorithm == "tqc":
+                    # --- TQC critic update ---
+                    with torch.no_grad():
+                        # Target quantiles: (n_critics, batch, n_quantiles)
+                        target_quantiles = tqc_critic_target(
+                            data["next_observations"], next_actions,
+                            data["positions"], batch_mask,
+                            recep_profile=batch_receptivity,
+                            influence_profile=batch_influence,
+                        )
+                        batch_size_cur = data["rewards"].shape[0]
+                        # Flatten across critics, sort, truncate top-d
+                        all_target_q = target_quantiles.permute(1, 0, 2).reshape(batch_size_cur, -1)
+                        sorted_q, _ = all_target_q.sort(dim=1)
+                        n_keep = args.tqc_n_critics * args.tqc_n_quantiles - args.tqc_top_quantiles_to_drop
+                        truncated_mean = sorted_q[:, :n_keep].mean(dim=1, keepdim=True)
+                        target_q = data["rewards"] + (1 - data["dones"]) * args.gamma * (truncated_mean - alpha * next_log_pi)
+
+                    # Current quantiles: (n_critics, batch, n_quantiles)
+                    current_q = tqc_critic(
+                        data["observations"], data["actions"],
+                        data["positions"], batch_mask,
                         recep_profile=batch_receptivity,
                         influence_profile=batch_influence,
                     )
-                    qf2_next = qf2_target(
-                        data["next_observations"], next_actions, 
-                        data["positions"], batch_mask, 
-                        recep_profile=batch_receptivity,
-                        influence_profile=batch_influence,
-                    )
-                    min_qf_next = torch.min(qf1_next, qf2_next) - alpha * next_log_pi
-                    
-                    # Bellman target
-                    target_q = data["rewards"] + (1 - data["dones"]) * args.gamma * min_qf_next
-                
-                # Current Q-values
-                qf1_value = qf1(data["observations"], data["actions"], 
-                                data["positions"], batch_mask, 
-                                recep_profile=batch_receptivity,
-                                influence_profile=batch_influence)
-                
-                qf2_value = qf2(data["observations"], data["actions"], 
-                                data["positions"], batch_mask, 
-                                recep_profile=batch_receptivity,
-                                influence_profile=batch_influence)
-                
-                # Log Q-value statistics (frequency controlled by logger)
-                if debug_logger.should_log_q_values(total_gradient_steps):
-                    debug_logger.log_q_value_stats(
-                        qf1_values=qf1_value,
-                        qf2_values=qf2_value,
-                        target_q=target_q,
-                        writer=writer,
-                        global_step=global_step,
+                    qf_loss = sum(
+                        quantile_huber_loss(current_q[i], target_q, taus)
+                        for i in range(args.tqc_n_critics)
                     )
 
-                # Critic loss
-                qf1_loss = F.mse_loss(qf1_value, target_q)
-                qf2_loss = F.mse_loss(qf2_value, target_q)
-                qf_loss = qf1_loss + qf2_loss
-                
-                # Update critics
-                q_optimizer.zero_grad(set_to_none=True)
-                qf_loss.backward()
-                if args.grad_clip:
-                    torch.nn.utils.clip_grad_norm_(
-                        qf1_params + qf2_params + shared_encoder_params,
-                        max_norm=args.grad_clip_max_norm
-                    )
-                q_optimizer.step()
-                
-                if debug_logger.should_log_gradients(total_gradient_steps):
-                    debug_logger.log_critic_gradient_norms(qf1, qf2, writer, global_step)
+                    q_optimizer.zero_grad(set_to_none=True)
+                    qf_loss.backward()
+                    if args.grad_clip:
+                        torch.nn.utils.clip_grad_norm_(
+                            tqc_critic.parameters(),
+                            max_norm=args.grad_clip_max_norm,
+                        )
+                    q_optimizer.step()
 
-                # Accumulate losses for logging
-                loss_accumulator['qf1_loss'].append(qf1_loss.item())
-                loss_accumulator['qf2_loss'].append(qf2_loss.item())
+                    if debug_logger.should_log_gradients(total_gradient_steps):
+                        for i, critic in enumerate(tqc_critic.critics):
+                            grad_norm = sum(
+                                p.grad.norm().item() ** 2
+                                for p in critic.parameters() if p.grad is not None
+                            ) ** 0.5
+                            writer.add_scalar(f"debug/grad_norm/tqc_critic_{i}", grad_norm, global_step)
+
+                    loss_accumulator['qf_loss'].append(qf_loss.item())
+                else:
+                    # --- SAC critic update ---
+                    with torch.no_grad():
+                        qf1_next = qf1_target(
+                            data["next_observations"], next_actions,
+                            data["positions"], batch_mask,
+                            recep_profile=batch_receptivity,
+                            influence_profile=batch_influence,
+                        )
+                        qf2_next = qf2_target(
+                            data["next_observations"], next_actions,
+                            data["positions"], batch_mask,
+                            recep_profile=batch_receptivity,
+                            influence_profile=batch_influence,
+                        )
+                        min_qf_next = torch.min(qf1_next, qf2_next) - alpha * next_log_pi
+                        target_q = data["rewards"] + (1 - data["dones"]) * args.gamma * min_qf_next
+
+                    qf1_value = qf1(data["observations"], data["actions"],
+                                    data["positions"], batch_mask,
+                                    recep_profile=batch_receptivity,
+                                    influence_profile=batch_influence)
+                    qf2_value = qf2(data["observations"], data["actions"],
+                                    data["positions"], batch_mask,
+                                    recep_profile=batch_receptivity,
+                                    influence_profile=batch_influence)
+
+                    if debug_logger.should_log_q_values(total_gradient_steps):
+                        debug_logger.log_q_value_stats(
+                            qf1_values=qf1_value,
+                            qf2_values=qf2_value,
+                            target_q=target_q,
+                            writer=writer,
+                            global_step=global_step,
+                        )
+
+                    qf1_loss = F.mse_loss(qf1_value, target_q)
+                    qf2_loss = F.mse_loss(qf2_value, target_q)
+                    qf_loss = qf1_loss + qf2_loss
+
+                    q_optimizer.zero_grad(set_to_none=True)
+                    qf_loss.backward()
+                    if args.grad_clip:
+                        torch.nn.utils.clip_grad_norm_(
+                            qf1_params + qf2_params + shared_encoder_params,
+                            max_norm=args.grad_clip_max_norm,
+                        )
+                    q_optimizer.step()
+
+                    if debug_logger.should_log_gradients(total_gradient_steps):
+                        debug_logger.log_critic_gradient_norms(qf1, qf2, writer, global_step)
+
+                    loss_accumulator['qf1_loss'].append(qf1_loss.item())
+                    loss_accumulator['qf2_loss'].append(qf2_loss.item())
 
                 # -----------------------------------------------------------------
                 # Update Actor (delayed based on total gradient steps)
@@ -2676,16 +2896,29 @@ def main():
                     )
                     
                     # Q-values for policy actions
-                    qf1_pi = qf1(data["observations"], actions_pi, data["positions"], 
-                                 batch_mask, 
-                                 recep_profile=batch_receptivity,
-                                 influence_profile=batch_influence)
-                    qf2_pi = qf2(data["observations"], actions_pi, data["positions"], 
-                                 batch_mask, 
-                                 recep_profile=batch_receptivity,
-                                 influence_profile=batch_influence)
-                    min_qf_pi = torch.min(qf1_pi, qf2_pi)
-                    
+                    if args.algorithm == "tqc":
+                        all_q = tqc_critic(
+                            data["observations"], actions_pi,
+                            data["positions"], batch_mask,
+                            recep_profile=batch_receptivity,
+                            influence_profile=batch_influence,
+                        )  # (n_critics, batch, n_quantiles)
+                        batch_size_cur = data["rewards"].shape[0]
+                        all_q_flat = all_q.permute(1, 0, 2).reshape(batch_size_cur, -1)
+                        sorted_q, _ = all_q_flat.sort(dim=1)
+                        n_keep = args.tqc_n_critics * args.tqc_n_quantiles - args.tqc_top_quantiles_to_drop
+                        min_qf_pi = sorted_q[:, :n_keep].mean(dim=1, keepdim=True)
+                    else:
+                        qf1_pi = qf1(data["observations"], actions_pi, data["positions"],
+                                     batch_mask,
+                                     recep_profile=batch_receptivity,
+                                     influence_profile=batch_influence)
+                        qf2_pi = qf2(data["observations"], actions_pi, data["positions"],
+                                     batch_mask,
+                                     recep_profile=batch_receptivity,
+                                     influence_profile=batch_influence)
+                        min_qf_pi = torch.min(qf1_pi, qf2_pi)
+
                     # Policy loss (maximize Q - alpha * entropy)
                     actor_loss = (alpha * log_pi - min_qf_pi).mean()
                     
@@ -2729,12 +2962,12 @@ def main():
                 # -----------------------------------------------------------------
                 # Update Target Networks
                 # -----------------------------------------------------------------
-                # NOTE: When share_profile_encoder=True, the shared encoder params appear in both
-                 # qf1 and qf1_target, making the soft-update a no-op (x ← τx + (1-τ)x = x) for those params.
                 if total_gradient_steps % args.target_network_frequency == 0:
-
-                    soft_update(qf1, qf1_target, args.tau)
-                    soft_update(qf2, qf2_target, args.tau)
+                    if args.algorithm == "tqc":
+                        soft_update(tqc_critic, tqc_critic_target, args.tau)
+                    else:
+                        soft_update(qf1, qf1_target, args.tau)
+                        soft_update(qf2, qf2_target, args.tau)
                 
                 # Attention physics analysis (frequency controlled by logger)
                 if debug_logger.should_log_attention(total_gradient_steps):
@@ -2786,12 +3019,18 @@ def main():
                 mean_reward = float(np.mean(step_reward_window)) if step_reward_window else 0.0
                 
                 # Average losses over the UTD updates
-                mean_qf1_loss = np.mean(loss_accumulator['qf1_loss']) if loss_accumulator['qf1_loss'] else 0
-                mean_qf2_loss = np.mean(loss_accumulator['qf2_loss']) if loss_accumulator['qf2_loss'] else 0
                 mean_actor_loss = np.mean(loss_accumulator['actor_loss']) if loss_accumulator['actor_loss'] else 0
-                
-                writer.add_scalar("losses/qf1_loss", mean_qf1_loss, global_step)
-                writer.add_scalar("losses/qf2_loss", mean_qf2_loss, global_step)
+
+                if args.algorithm == "tqc":
+                    mean_qf_loss = np.mean(loss_accumulator['qf_loss']) if loss_accumulator['qf_loss'] else 0
+                    writer.add_scalar("losses/qf_loss", mean_qf_loss, global_step)
+                else:
+                    mean_qf1_loss = np.mean(loss_accumulator['qf1_loss']) if loss_accumulator['qf1_loss'] else 0
+                    mean_qf2_loss = np.mean(loss_accumulator['qf2_loss']) if loss_accumulator['qf2_loss'] else 0
+                    mean_qf_loss = mean_qf1_loss + mean_qf2_loss
+                    writer.add_scalar("losses/qf1_loss", mean_qf1_loss, global_step)
+                    writer.add_scalar("losses/qf2_loss", mean_qf2_loss, global_step)
+
                 writer.add_scalar("losses/actor_loss", mean_actor_loss, global_step)
                 writer.add_scalar("losses/alpha", alpha, global_step)
                 writer.add_scalar("charts/SPS", sps, global_step)
@@ -2799,17 +3038,17 @@ def main():
                 writer.add_scalar("debug/mean_wind_direction", float(np.mean(wind_dirs)), global_step)
                 writer.add_scalar("debug/total_gradient_steps", total_gradient_steps, global_step)
                 writer.add_scalar("debug/gradient_updates_per_iter", num_gradient_updates, global_step)
-                
-                print(f"Step {global_step}: SPS={sps}, qf_loss={mean_qf1_loss + mean_qf2_loss:.4f}, "
+
+                print(f"Step {global_step}: SPS={sps}, qf_loss={mean_qf_loss:.4f}, "
                       f"actor_loss={mean_actor_loss:.4f}, alpha={alpha:.4f}, "
                       f"reward_mean={mean_reward:.4f}, grad_steps={total_gradient_steps}")
         
 
                 # === Fine-tuning diagnostics (when resuming from checkpoint) ===
-                if args.resume_checkpoint is not None and update % 100 == 0:
+                if args.resume_checkpoint is not None and update % 100 == 0 and args.algorithm != "tqc":
                     # Collect recent episode returns for Q-value comparison
                     recent_returns = list(envs.return_queue)[-10:] if hasattr(envs, 'return_queue') else []
-                    
+
                     # Compute policy entropy from recent actions
                     with torch.no_grad():
                         _, log_pi_diag, _, _ = actor.get_action(
@@ -2820,7 +3059,7 @@ def main():
                             influence_profile=batch_influence[:32] if batch_influence is not None else None,
                         )
                         policy_entropy = -log_pi_diag.mean().item()
-                    
+
                     log_finetune_diagnostics(
                         writer=writer,
                         global_step=global_step,
@@ -2856,7 +3095,8 @@ def main():
         if args.save_model and global_step >= next_save_step:
             save_checkpoint(
                 actor, qf1, qf2, actor_optimizer, q_optimizer,
-                global_step, run_name, args, log_alpha, alpha_optimizer
+                global_step, run_name, args, log_alpha, alpha_optimizer,
+                tqc_critic=tqc_critic,
             )
             next_save_step += args.save_interval
 
@@ -2892,7 +3132,8 @@ def main():
     if args.save_model:
         save_checkpoint(
             actor, qf1, qf2, actor_optimizer, q_optimizer,
-            global_step, run_name, args, log_alpha, alpha_optimizer
+            global_step, run_name, args, log_alpha, alpha_optimizer,
+            tqc_critic=tqc_critic,
         )
     
     print("\n" + "=" * 60)
