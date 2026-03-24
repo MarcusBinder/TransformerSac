@@ -58,7 +58,7 @@ except ImportError:
     print("wandb not installed — logging disabled. Install with: pip install wandb")
 
 # Import real RL model architecture (ensures identical weight keys)
-from transformer_sac_windfarm import (
+from networks import (
     TransformerActor,
     TransformerEncoder,
     TransformerEncoderLayer,

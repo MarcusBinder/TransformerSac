@@ -30,7 +30,7 @@ except ImportError:
     from multiprocessing import Pool
     HAS_PATHOS = False
 
-from transformer_sac_windfarm import TransformerActor
+from networks import TransformerActor
 from helpers.helper_funcs import (
     transform_to_wind_relative,
     rotate_profiles_tensor,

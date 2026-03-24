@@ -37,7 +37,7 @@ from helpers.helper_funcs import (
 from helpers.layouts import get_layout_positions
 from helpers.env_configs import make_env_config
 from helpers.multi_layout_env import MultiLayoutEnv, LayoutConfig
-from transformer_sac_windfarm import TransformerActor
+from networks import TransformerActor
 from config import Args
 
 import gymnasium as gym
