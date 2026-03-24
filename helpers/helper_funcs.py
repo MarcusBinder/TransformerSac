@@ -70,7 +70,7 @@ def find_checkpoints(checkpoint_dir: str) -> list:
             
             
             if match:
-                step = match.group(1) or match.group(2)
+                step = match.group(1)
                 step = int(step)
                 checkpoints.append((step, str(filepath)))
 
