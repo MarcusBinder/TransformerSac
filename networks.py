@@ -918,6 +918,9 @@ class TransformerCritic(nn.Module):
 
 
         # Observation + action encoder
+        # TODO: DroQ dropout/LayerNorm is currently applied here in the input projection,
+        # but Hiraoka et al. apply it only to the Q-network's final MLP heads (q_head).
+        # Consider removing DroQ from obs_action_encoder and keeping it only in q_head.
         obs_action_layers: list[nn.Module] = [
             nn.Linear(obs_dim_per_turbine + action_dim_per_turbine, embed_dim),
         ]
