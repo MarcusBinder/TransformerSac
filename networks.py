@@ -917,20 +917,12 @@ class TransformerCritic(nn.Module):
                 )
 
 
-        # Observation + action encoder
-        # TODO: DroQ dropout/LayerNorm is currently applied here in the input projection,
-        # but Hiraoka et al. apply it only to the Q-network's final MLP heads (q_head).
-        # Consider removing DroQ from obs_action_encoder and keeping it only in q_head.
-        obs_action_layers: list[nn.Module] = [
+        # Observation + action encoder (no DroQ here — applied only in q_head per Hiraoka et al.)
+        self.obs_action_encoder = nn.Sequential(
             nn.Linear(obs_dim_per_turbine + action_dim_per_turbine, embed_dim),
-        ]
-        if droq_layer_norm:
-            obs_action_layers.append(nn.LayerNorm(embed_dim))
-        obs_action_layers.append(nn.ReLU())
-        if droq_dropout > 0.0:
-            obs_action_layers.append(nn.Dropout(droq_dropout))
-        obs_action_layers.append(nn.Linear(embed_dim, embed_dim))
-        self.obs_action_encoder = nn.Sequential(*obs_action_layers)
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
 
         # Input projection: only needed when concatenating position embedding
         if self.embedding_mode == "concat":

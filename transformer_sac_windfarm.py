@@ -612,12 +612,15 @@ def main():
             shared_param_ids.update(id(p) for p in shared_influence.parameters())
         return [p for p in critic.parameters() if id(p) not in shared_param_ids]
 
-    # Collect shared encoder params so they receive gradients from critic loss too
+    # Collect shared encoder params so they receive gradients from critic loss.
+    # These are excluded from actor_optimizer to avoid double updates with
+    # conflicting Adam states — q_optimizer is the sole owner.
     shared_encoder_params = []
     if shared_recep_encoder is not None:
         shared_encoder_params += list(shared_recep_encoder.parameters())
     if shared_influence_encoder is not None:
         shared_encoder_params += list(shared_influence_encoder.parameters())
+    shared_param_ids = {id(p) for p in shared_encoder_params}
 
     # Initialize critic variables (some will be None depending on algorithm)
     qf1 = qf2 = qf1_target = qf2_target = None
@@ -670,8 +673,11 @@ def main():
         print(f"Actor parameters: {actor_params:,}")
         print(f"Critic parameters: {critic_params:,} (x2)")
 
-    # Optimizers
-    actor_optimizer = optim.Adam(actor.parameters(), lr=args.policy_lr)
+    # Optimizers (exclude shared encoder params — handled by q_optimizer only)
+    actor_optimizer = optim.Adam(
+        [p for p in actor.parameters() if id(p) not in shared_param_ids],
+        lr=args.policy_lr,
+    )
 
     # Verify parameter counts
     if shared_recep_encoder is not None:
@@ -902,7 +908,8 @@ def main():
                     param.requires_grad = False
                     frozen.append(name)
             actor_optimizer = optim.Adam(
-                [p for p in actor.parameters() if p.requires_grad], lr=args.policy_lr
+                [p for p in actor.parameters() if p.requires_grad and id(p) not in shared_param_ids],
+                lr=args.policy_lr,
             )
             print(f"\n  Froze {len(frozen)} encoder params for {args.pretrain_freeze_steps} steps")
 
@@ -1011,7 +1018,10 @@ def main():
             and global_step - args.num_envs < args.pretrain_freeze_steps):
             for name, param in actor.named_parameters():
                 param.requires_grad = True
-            actor_optimizer = optim.Adam(actor.parameters(), lr=args.policy_lr)
+            actor_optimizer = optim.Adam(
+                [p for p in actor.parameters() if id(p) not in shared_param_ids],
+                lr=args.policy_lr,
+            )
             print(f"\n[Step {global_step}] Unfroze pretrained encoder parameters")
         
         # Get environment info (needed for replay buffer)
