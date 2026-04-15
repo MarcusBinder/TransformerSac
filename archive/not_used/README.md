@@ -1,1 +1,0 @@
-THis works kinda like a thrash can, just a collection of older scripts that may not be usefull longterm.

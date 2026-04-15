@@ -1,1 +1,0 @@
-Every time I did a new evaluation, I made a specific file for it. I just meved it here to clean up the main folder
