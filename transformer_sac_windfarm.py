@@ -194,6 +194,8 @@ def main():
         from py_wake.examples.data.dtu10mw import DTU10MW as WT
     elif args.turbtype == "V80":
         from py_wake.examples.data.hornsrev1 import V80 as WT
+    elif args.turbtype.lower() == "iea22":
+        from iea_22_rwt import IEA_22MW_280_RWT as WT
     else:
         raise ValueError(f"Unknown turbine type: {args.turbtype}")
     

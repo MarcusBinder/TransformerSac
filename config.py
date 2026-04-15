@@ -40,7 +40,7 @@ class Args:
     share_profile_encoder: bool = False         # Whether to share weights between actor and critic for profile encoder
 
     # === Environment Settings ===
-    turbtype: str = "DTU10MW"  # Wind turbine type
+    turbtype: str = "IEA22"  # Wind turbine type
     TI_type: str = "Random"   # Turbulence intensity sampling
     dt_sim: int = 5           # Simulation timestep (seconds)
     dt_env: int = 10          # Environment timestep (seconds)
