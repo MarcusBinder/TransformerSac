@@ -25,7 +25,7 @@ import os
 import random
 import time
 from typing import Optional, Tuple, List, Dict, Any, Union
-from collections import deque
+from collections import deque, defaultdict
 import json
 
 from config import Args
@@ -990,6 +990,7 @@ def main():
     
     # Tracking
     step_reward_window = deque(maxlen=1000)
+    yaw_accumulator = defaultdict(list)
     # next_save_step = ((start_step // args.save_interval) + 1) * args.save_interval  # Account for resumed step
     next_save_step = start_step + args.save_interval 
     # For logging losses (we'll average over the UTD updates)
@@ -1073,7 +1074,19 @@ def main():
 
         # Track rewards
         step_reward_window.extend(np.array(rewards).flatten().tolist())
-        
+
+        # Track yaw angles (from info dict; shape (num_envs, n_turbines))
+        if "yaw angles agent" in infos:
+            yaw_deg = np.array(infos["yaw angles agent"])
+            yaw_accumulator['yaw_abs_mean_deg'].append(float(np.abs(yaw_deg).mean()))
+            yaw_accumulator['yaw_max_deg'].append(float(np.abs(yaw_deg).max()))
+            yaw_accumulator['yaw_over_20_frac'].append(float(np.mean(np.abs(yaw_deg) > 20.0)))
+            for t in range(yaw_deg.shape[-1]):
+                yaw_accumulator[f'yaw_turb{t}_abs_deg'].append(float(np.abs(yaw_deg[:, t]).mean()))
+            env0_yaw = yaw_deg[0] if yaw_deg.ndim > 1 else yaw_deg
+            for t in range(len(env0_yaw)):
+                yaw_accumulator[f'yaw_env0_turb{t}_deg'].append(float(env0_yaw[t]))
+
         # Log episode stats
         if "final_info" in infos:
             ep_return = np.mean(envs.return_queue)
@@ -1411,6 +1424,21 @@ def main():
                 writer.add_scalar("debug/mean_wind_direction", float(np.mean(wind_dirs)), global_step)
                 writer.add_scalar("debug/total_gradient_steps", total_gradient_steps, global_step)
                 writer.add_scalar("debug/gradient_updates_per_iter", num_gradient_updates, global_step)
+
+                # Yaw statistics (per-step summaries + env0 per-turbine traces)
+                if yaw_accumulator['yaw_abs_mean_deg']:
+                    writer.add_scalar("yaw/abs_mean_deg", np.mean(yaw_accumulator['yaw_abs_mean_deg']), global_step)
+                    writer.add_scalar("yaw/max_abs_deg", np.mean(yaw_accumulator['yaw_max_deg']), global_step)
+                    writer.add_scalar("yaw/over_20_frac", np.mean(yaw_accumulator['yaw_over_20_frac']), global_step)
+                    for t in range(n_turbines_max):
+                        key = f'yaw_turb{t}_abs_deg'
+                        if yaw_accumulator.get(key):
+                            writer.add_scalar(f"yaw/turbine_{t}_abs_deg", np.mean(yaw_accumulator[key]), global_step)
+                    for t in range(n_turbines_max):
+                        key = f'yaw_env0_turb{t}_deg'
+                        if yaw_accumulator.get(key):
+                            writer.add_scalar(f"yaw_env0/turbine_{t}_deg", np.mean(yaw_accumulator[key]), global_step)
+                    yaw_accumulator.clear()
 
                 print(f"Step {global_step}: SPS={sps}, qf_loss={mean_qf_loss:.4f}, "
                       f"actor_loss={mean_actor_loss:.4f}, alpha={alpha:.4f}, "

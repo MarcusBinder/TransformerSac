@@ -87,7 +87,7 @@ ENV_CONFIGS: Dict[str, Dict[str, Any]] = {
     },
     "LES": {
         "wind": {
-            "wd_min": 268, "wd_max": 272,
+            "wd_min": 270, "wd_max": 270,
             "ws_min": 12, "ws_max": 12,
         },
     },
