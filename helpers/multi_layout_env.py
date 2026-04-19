@@ -98,7 +98,11 @@ class MultiLayoutEnv(gym.Env):
         self.env_factory = env_factory
         self.per_turbine_wrapper = per_turbine_wrapper
         self.seed_value = seed
-        self.rng = np.random.default_rng(seed)
+        # Separate RNGs so that enabling shuffle doesn't change the
+        # layout selection sequence (the permutation generation would
+        # otherwise advance a shared RNG, causing different layouts).
+        self.layout_rng = np.random.default_rng(seed)
+        self.shuffle_rng = np.random.default_rng(seed + 1_000_000)
         self.pad_value = pad_value
         self.shuffle = shuffle
 
@@ -575,8 +579,9 @@ class MultiLayoutEnv(gym.Env):
             info: Dict containing layout information (with padded arrays)
         """
         if seed is not None:
-            self.rng = np.random.default_rng(seed)
-        
+            self.layout_rng = np.random.default_rng(seed)
+            self.shuffle_rng = np.random.default_rng(seed + 1_000_000)
+
         # Determine which layout to use
         if options is not None and 'layout_name' in options:
             # Use specified layout by name
@@ -592,17 +597,17 @@ class MultiLayoutEnv(gym.Env):
             new_layout = self.layouts[layout_idx]
         else:
             # Randomly sample a layout
-            new_layout = self.rng.choice(self.layouts)
-        
+            new_layout = self.layout_rng.choice(self.layouts)
+
         # Only reinitialize if layout changed (optimization for single-layout case)
         if new_layout.name != self.current_layout.name:
             # print(f"Resetting environment with layout: {new_layout.name}")
             self._create_env(new_layout)
-        
+
         # Generate new shuffle permutation if shuffle is enabled
         if self.shuffle:
             # print("Shuffling turbine indices on reset")
-            self._perm = self.rng.permutation(self.n_turbines)
+            self._perm = self.shuffle_rng.permutation(self.n_turbines)
             self._inv_perm = np.argsort(self._perm)
         else:
             self._perm = np.arange(self.n_turbines)
