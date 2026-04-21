@@ -1434,11 +1434,20 @@ def main():
                         key = f'yaw_turb{t}_abs_deg'
                         if yaw_accumulator.get(key):
                             writer.add_scalar(f"yaw/turbine_{t}_abs_deg", np.mean(yaw_accumulator[key]), global_step)
-                    for t in range(n_turbines_max):
-                        key = f'yaw_env0_turb{t}_deg'
+                    
+                    for t in range(n_turbines_max):                        
+                        key = f"yaw_env0_turb{t}_deg"
                         if yaw_accumulator.get(key):
                             writer.add_scalar(f"yaw_env0/turbine_{t}_deg", np.mean(yaw_accumulator[key]), global_step)
+                            writer.add_histogram(
+                                f"yaw_env0_hist/turbine_{t}",                                                               
+                                np.array(yaw_accumulator[key]),            
+                                global_step,                                                                                
+                            )
                     yaw_accumulator.clear()
+
+
+
 
                 print(f"Step {global_step}: SPS={sps}, qf_loss={mean_qf_loss:.4f}, "
                       f"actor_loss={mean_actor_loss:.4f}, alpha={alpha:.4f}, "
