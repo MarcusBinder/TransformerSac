@@ -51,7 +51,8 @@ class IEA_22MW_H2S(WindTurbine): # This turbine uses data from Riccardo
         method : {'linear', 'pchip'}
             linear(fast) or pchip(smooth and gradient friendly) interpolation
         """
-        pwr = np.loadtxt("./iea_22_rwt.pwr")
+
+        pwr = np.loadtxt(DATA_PATH / "iea_22_rwt.pwr")
         WindTurbine.__init__(
             self,
             name="IEA_22MW_280_RWT",
