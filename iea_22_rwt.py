@@ -43,6 +43,31 @@ class IEA_22MW_280_RWT(WindTurbine):
             ),
         )
 
+class IEA_22MW_H2S(WindTurbine): # This turbine uses data from Riccardo
+    def __init__(self, method="linear"):
+        """
+        Parameters
+        ----------
+        method : {'linear', 'pchip'}
+            linear(fast) or pchip(smooth and gradient friendly) interpolation
+        """
+        pwr = np.loadtxt("./iea_22_rwt.pwr")
+        WindTurbine.__init__(
+            self,
+            name="IEA_22MW_280_RWT",
+            diameter=284,
+            hub_height=170,
+            powerCtFunction=PowerCtTabular(
+                ws=pwr[:, 0],
+                power=pwr[:, 1] * 0.9542919819763047,
+                power_unit="kW",
+                ct=pwr[:, 4],
+                ws_cutin=3.0,
+                ws_cutout=25.0,
+                power_idle=0.0,
+                ct_idle=0.0,
+            ),
+        )
 
 def main():
     wt = IEA_22MW_280_RWT()
