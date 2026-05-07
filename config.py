@@ -141,6 +141,6 @@ class Args:
     dr_posterior_path: Optional[str] = None
 
     # Subset of `param_names` to actually feed into the env. Must be a subset
-    # of the posterior columns. Joint structure is preserved across all four
+    # of the posterior columns. Joint structure is preserved across all
     # calibrated dimensions even if only a subset is exposed (row-bootstrap).
-    dr_keys: Tuple[str, ...] = ("k1", "k2", "ti_w", "d_meander")
+    dr_keys: Tuple[str, ...] = ("k1", "k2", "d_particle")
