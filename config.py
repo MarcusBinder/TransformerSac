@@ -4,8 +4,8 @@ Configuration dataclass for Transformer-SAC wind farm training.
 All CLI arguments are defined here via a tyro-compatible dataclass.
 """
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, Tuple
 
 
 @dataclass
@@ -132,3 +132,17 @@ class Args:
 
     # === Action Settings ===
     action_type: str = "wind"   # "wind" (target setpoint) or "yaw" (delta). Overridden by BC checkpoint if provided.
+
+    # === LES-calibrated Domain Randomization ===
+    # Path to a posterior .npz file containing `samples` (N, d) and
+    # `param_names` (d,) arrays. When set, each parallel env draws DWM closure
+    # parameters from the posterior on every reset via DWMRandomizationWrapper.
+    # When None (default) DR is disabled and behaviour matches pre-DR training.
+    dr_posterior_path: Optional[str] = None
+
+    # Subset of `param_names` to actually feed into the env. Must be a subset
+    # of the posterior columns. Joint structure is preserved across all four
+    # calibrated dimensions even if only a subset is exposed (row-bootstrap).
+    dr_keys: Tuple[str, ...] = field(
+        default_factory=lambda: ("k1", "k2", "ti_w", "d_meander")
+    )

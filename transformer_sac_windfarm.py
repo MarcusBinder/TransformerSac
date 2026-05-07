@@ -51,7 +51,12 @@ from torch.utils.tensorboard import SummaryWriter
 
 # WindGym imports (adjust path as needed for your setup)
 from WindGym import WindFarmEnv
-from WindGym.wrappers import RecordEpisodeVals, PerTurbineObservationWrapper
+from WindGym.wrappers import (
+    RecordEpisodeVals,
+    PerTurbineObservationWrapper,
+    DWMRandomizationWrapper,
+)
+from helpers.dr_posterior import load_posterior, make_dr_sampler
 from helpers.agent import WindFarmAgent
 
 # Logging utilities for multi-layout training
@@ -186,7 +191,11 @@ def main():
     
     # Import WindGym components
     from WindGym import WindFarmEnv
-    from WindGym.wrappers import RecordEpisodeVals, PerTurbineObservationWrapper
+    from WindGym.wrappers import (
+        RecordEpisodeVals,
+        PerTurbineObservationWrapper,
+        DWMRandomizationWrapper,
+    )
     from helpers.multi_layout_env import MultiLayoutEnv, LayoutConfig
     
     # Wind turbine
@@ -340,6 +349,20 @@ def main():
             env = EnhancedPerTurbineWrapper(env, wd_scale_range=args.wd_scale_range)
         return env
     
+    # === LES-calibrated domain randomization ===
+    # Pre-load the posterior once on the main process; the dict is pickled into
+    # each AsyncVectorEnv worker via the env-factory closure (314 KB, cheap).
+    # Disabled when args.dr_posterior_path is None — make_env_fn falls back to
+    # plain MultiLayoutEnv exactly as before.
+    _dr_posterior = (
+        load_posterior(args.dr_posterior_path) if args.dr_posterior_path else None
+    )
+    if _dr_posterior is not None:
+        print(
+            f"[DR] loaded posterior with {len(_dr_posterior['samples'])} samples "
+            f"over {_dr_posterior['names']}; randomizing keys {tuple(args.dr_keys)}"
+        )
+
     def make_env_fn(seed):
         """Factory function for vectorized environments."""
         def _init():
@@ -351,6 +374,13 @@ def main():
                 shuffle=args.shuffle_turbs,  # Shuffle turbines within each layout
                 max_episode_steps=args.max_episode_steps,
             )
+            # DR wrapper sits OUTSIDE MultiLayoutEnv so its RNG survives layout
+            # changes (MultiLayoutEnv reconstructs the inner WindFarmEnv on
+            # layout change, which would reset any wrapper installed via
+            # per_turbine_wrapper and silently break reproducibility).
+            if _dr_posterior is not None:
+                sampler = make_dr_sampler(_dr_posterior, keys=tuple(args.dr_keys))
+                env = DWMRandomizationWrapper(env, sampler=sampler, seed=seed)
             return env
         return _init
 
