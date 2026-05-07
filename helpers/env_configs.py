@@ -93,7 +93,14 @@ ENV_CONFIGS: Dict[str, Dict[str, Any]] = {
         },
         "farm": {"yaw_min": -45, "yaw_max": 45},
     },
-
+    "test": {
+        "wind": {
+            "wd_min": 270, "wd_max": 270,
+            "ws_min": 10, "ws_max": 10,
+            "TI_min": 0.038, "TI_max": 0.038,
+        },
+        "farm": {"yaw_min": -45, "yaw_max": 45},
+    },
     "basic": {
         "yaw_init": "Random",
         "BaseController": "Local",
