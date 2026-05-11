@@ -358,9 +358,25 @@ def main():
         load_posterior(args.dr_posterior_path) if args.dr_posterior_path else None
     )
     if _dr_posterior is not None:
+        # Fail fast on the misconfiguration where Mann-box keys are randomized
+        # under a turbtype that doesn't regenerate the box (Random/MannLoad/
+        # MannFixed/None). The env raises the same message on its first reset,
+        # but checking here surfaces the error before AsyncVectorEnv workers
+        # spawn — much easier to debug than a worker traceback.
+        _mann_in_dr = tuple(
+            k for k in args.dr_keys if k in WindFarmEnv._MANN_PARAM_KEYS
+        )
+        if _mann_in_dr and args.TI_type != "MannGenerate":
+            raise ValueError(
+                f"dr_keys includes Mann-box keys {_mann_in_dr} but "
+                f"TI_type={args.TI_type!r} does not regenerate the box from "
+                "those statistics. Either pass --TI-type MannGenerate, or "
+                f"remove {_mann_in_dr} from --dr-keys."
+            )
         print(
             f"[DR] loaded posterior with {len(_dr_posterior['samples'])} samples "
-            f"over {_dr_posterior['names']}; randomizing keys {tuple(args.dr_keys)}"
+            f"over {_dr_posterior['names']}; randomizing keys {tuple(args.dr_keys)} "
+            f"(turbtype={args.TI_type})"
         )
 
     def make_env_fn(seed):
