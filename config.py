@@ -143,4 +143,9 @@ class Args:
     # Subset of `param_names` to actually feed into the env. Must be a subset
     # of the posterior columns. Joint structure is preserved across all
     # calibrated dimensions even if only a subset is exposed (row-bootstrap).
-    dr_keys: Tuple[str, ...] = ("k1", "k2", "d_particle")
+    # The Mann subset (`mann_L`, `mann_GAMMA`, `mann_AE`) only takes effect when
+    # the env is built with `turbtype="MannGenerate"` — under MannLoad/MannFixed
+    # the env raises rather than silently ignoring per-episode Mann statistics.
+    dr_keys: Tuple[str, ...] = (
+        "k1", "k2", "d_particle", "mann_L", "mann_GAMMA", "mann_AE",
+    )
