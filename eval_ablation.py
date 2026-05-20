@@ -7,9 +7,17 @@ import random
 import torch
 
 # ---- Imports from your codebase ----
-from transformer_sac_windfarm import *
-from agent import WindFarmAgent
-from MultiLayoutEnv import MultiLayoutEnv, LayoutConfig
+import gymnasium as gym
+from config import Args
+from networks import TransformerActor, create_profile_encoding
+from helpers.agent import WindFarmAgent
+from helpers.layouts import get_layout_positions
+from helpers.env_configs import make_env_config
+from helpers.multi_layout_env import MultiLayoutEnv, LayoutConfig
+from helpers.helper_funcs import EnhancedPerTurbineWrapper
+from helpers.receptivity_profiles import compute_layout_profiles
+from WindGym import WindFarmEnv
+from WindGym.wrappers import RecordEpisodeVals, PerTurbineObservationWrapper
 
 
 def load_actor_from_checkpoint(checkpoint_path: str, device: torch.device):
@@ -41,7 +49,7 @@ def create_eval_env(layout: str, args: dict, seed: int = 42, n_envs: int = 1):
 
         if args["profile_encoding_type"] is not None:
             if args["profile_source"].lower() == "geometric":
-                from geometric_profiles import compute_layout_profiles_vectorized
+                from helpers.geometric_profiles import compute_layout_profiles_vectorized
 
                 D = wind_turbine.diameter()
                 print(f"Computing GEOMETRIC profiles for layout: {name}")
@@ -258,10 +266,13 @@ def evaluate_run_on_layout(run_name, eval_layout, n_envs):
     _, args_ns = load_actor_from_checkpoint(first_path, device)
     args = vars(args_ns) if hasattr(args_ns, '__dict__') and not isinstance(args_ns, dict) else args_ns
 
-    # _, args = load_actor_from_checkpoint(first_path, device)
-
-    # # Add defaults for keys that may be missing in older checkpoints:
-    # args.setdefault("profile_encoder_kwargs", "{}")
+    # Older checkpoints predate some config flags; backfill from current Args() defaults
+    # so attribute/dict access never KeyErrors. Actual checkpoint values always win.
+    _defaults = vars(Args())
+    _missing = [k for k in _defaults if k not in args]
+    args = {**_defaults, **args}
+    if _missing and VERBOSE:
+        print(f"  [INFO] Backfilled {len(_missing)} missing args from defaults: {sorted(_missing)}")
 
     # Create env for eval layout
     env, wind_turbine = create_eval_env(layout=eval_layout, args=args, seed=INPUT_SEED, n_envs=n_envs)
@@ -493,7 +504,7 @@ if __name__ == "__main__":
 
     # Evaluate all runs in BASE_DIR
     all_runs = sorted(os.listdir(BASE_DIR))
-    all_runs = [r for r in all_runs if r.startswith("A")]
+    all_runs = [r for r in all_runs if r.startswith("B")]
     random.shuffle(all_runs)
 
     for run_name in all_runs:
