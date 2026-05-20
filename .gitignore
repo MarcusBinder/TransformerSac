@@ -33,3 +33,4 @@ pretrained_pt/
 .vscode/
 .ipynb_checkpoints/
 .claude/
+/boxes
