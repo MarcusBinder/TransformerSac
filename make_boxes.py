@@ -37,7 +37,7 @@ if __name__ == '__main__':
                                         
                                         
                                         
-        filename = boxes_dir / ("TF_seed_" + str(seed))
+        filename = boxes_dir / ("TF_seed_" + str(seed) + ".nc")
         tf.to_netcdf(filename = str(filename))
 
     print("Is is done")

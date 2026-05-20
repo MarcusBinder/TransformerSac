@@ -310,7 +310,7 @@ def main():
     base_env_kwargs = {
         "turbine": wind_turbine,
         "n_passthrough": args.max_eps,
-        "TurbBox": "/work/users/manils/rl_timestep/Boxes/V80env/",  # Adjust path as needed
+        "TurbBox": "./boxes/",  # Adjust path as needed
         "config": config,
         "turbtype": args.TI_type,
         "dt_sim": args.dt_sim,
