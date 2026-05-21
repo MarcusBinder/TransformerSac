@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import time
 import numpy as np
 import xarray as xr
 import random
@@ -152,10 +153,11 @@ def create_eval_env(layout: str, args: dict, seed: int = 42, n_envs: int = 1):
     return env, wind_turbine
 
 
-def evaluate_checkpoint_episodes(env, agent, num_batches, num_envs, num_steps, deterministic, seed=None):
+def evaluate_checkpoint_episodes(env, agent, num_batches, num_envs, num_steps, deterministic, seed=None, progress_prefix=""):
     all_episodes = []
 
     for batch in range(num_batches):
+        batch_start = time.time()
         # Deterministic seeding: each batch gets a unique but reproducible seed
         # so every checkpoint sees the exact same set of episodes.
         if seed is not None:
@@ -206,6 +208,9 @@ def evaluate_checkpoint_episodes(env, agent, num_batches, num_envs, num_steps, d
                 "mean_baseline_power": np.mean(baseline_powers_per_env[i]) if baseline_powers_per_env[i] else None,
             }
             all_episodes.append(episode_data)
+
+        print(f"{progress_prefix}      batch {batch + 1}/{num_batches} "
+              f"({time.time() - batch_start:.1f}s)")
 
     return all_episodes
 
@@ -354,7 +359,12 @@ def evaluate_run_on_layout(run_name, eval_layout, n_envs):
     # ---- Loop over checkpoints ----
     all_results = {}
 
-    for file in sorted(files):
+    sorted_files = sorted(files)
+    n_ckpts = len(sorted_files)
+    elapsed_total = 0.0
+
+    for ci, file in enumerate(sorted_files):
+        ckpt_start = time.time()
         step_number = int(file.split("_")[1].split(".")[0])
         file_path = os.path.join(checkpoint_dir, file)
 
@@ -372,7 +382,8 @@ def evaluate_run_on_layout(run_name, eval_layout, n_envs):
         actor.eval()
 
         episodes = evaluate_checkpoint_episodes(
-            env, agent, num_batches, num_envs, NUM_STEPS, DETERMINISTIC, seed=INPUT_SEED
+            env, agent, num_batches, num_envs, NUM_STEPS, DETERMINISTIC,
+            seed=INPUT_SEED, progress_prefix="  ",
         )
 
         episode_returns = [ep["episode_return"] for ep in episodes]
@@ -391,6 +402,14 @@ def evaluate_run_on_layout(run_name, eval_layout, n_envs):
             "mean_length": np.mean([ep["episode_length"] for ep in episodes]),
             "episodes": episodes,
         }
+
+        dt = time.time() - ckpt_start
+        elapsed_total += dt
+        avg_per_ckpt = elapsed_total / (ci + 1)
+        eta = avg_per_ckpt * (n_ckpts - (ci + 1))
+        print(f"    [{ci + 1}/{n_ckpts}] step {step_number}: "
+              f"gain={all_results[step_number]['power_gain_pct']:+.2f}%  "
+              f"({dt:.1f}s, ETA {eta / 60:.1f}m)")
 
     env.close()
 
@@ -487,6 +506,12 @@ def evaluate_run_on_layout(run_name, eval_layout, n_envs):
 # ---- Main ----
 if __name__ == "__main__":
 
+    # Line-buffer stdout/stderr so progress shows up promptly even when the
+    # script's output is redirected to a file (e.g. a SLURM .out log), where
+    # CPython would otherwise block-buffer it.
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+
     # ---- Configuration ----
     BASE_DIR = "/users/nilsenma/runs"
     OUTPUT_DIR = "/users/nilsenma/evals"
@@ -508,14 +533,16 @@ if __name__ == "__main__":
     all_runs = [r for r in all_runs if r.startswith("B")]
     random.shuffle(all_runs)
 
-    for run_name in all_runs:
+    n_runs = len(all_runs)
+    for run_idx, run_name in enumerate(all_runs):
         config_name, layout_str, seed = parse_run_name(run_name)
         if config_name is None:
             print(f"[SKIP] Cannot parse run name: {run_name}")
             continue
 
         print(f"\n{'='*60}")
-        print(f"Run: {run_name}  (config={config_name}, train_layout={layout_str}, seed={seed})")
+        print(f"Run {run_idx + 1}/{n_runs}: {run_name}  "
+              f"(config={config_name}, train_layout={layout_str}, seed={seed})")
         print(f"{'='*60}")
 
         evaluate_run_on_layout(run_name, EVAL_LAYOUT, n_envs=N_ENVS)
