@@ -28,6 +28,15 @@ class Args:
     shuffle_turbs: bool = False  # Shuffle turbine order in obs/action
     max_episode_steps: Optional[int] = None # Max steps per episode (None = use env default)
 
+    # === Staggered warm-up episode lengths ===
+    # Phase-offsets each env's resets/shuffles so they don't all happen on the
+    # same global step. Only the FIRST episode of each env is staggered; every
+    # episode after uses max_episode_steps. A one-time offset is enough to keep
+    # the reset phases permanently desynchronized.
+    stagger_warmup: bool = False                   # Enable one-time staggered warm-up
+    warmup_group_size: int = 5                      # Envs per group (1 = every env distinct)
+    warmup_min_episode_steps: Optional[int] = None  # Shortest warm-up length (e.g. 800)
+
     # === Receptivity Profile Settings ===
     profile_encoder_kwargs: str = "{}"  # JSON string of encoder-specific kwargs
     profile_source: str = "PyWake"  # "pywake" or "geometric"

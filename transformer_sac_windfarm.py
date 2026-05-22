@@ -338,7 +338,7 @@ def main():
             env = EnhancedPerTurbineWrapper(env, wd_scale_range=args.wd_scale_range)
         return env
     
-    def make_env_fn(seed):
+    def make_env_fn(seed, warmup_steps=None):
         """Factory function for vectorized environments."""
         def _init():
             env = MultiLayoutEnv(
@@ -348,14 +348,43 @@ def main():
                 seed=seed,
                 shuffle=args.shuffle_turbs,  # Shuffle turbines within each layout
                 max_episode_steps=args.max_episode_steps,
+                warmup_episode_steps=warmup_steps,
             )
             return env
         return _init
 
+    # Compute per-env one-time warm-up episode lengths. Staggering only the first
+    # episode permanently phase-offsets each group's resets/shuffles while keeping
+    # every subsequent episode at the standard max_episode_steps.
+    warmup_lengths = [None] * args.num_envs  # default: no stagger (current behavior)
+    if args.stagger_warmup:
+        assert args.max_episode_steps is not None, \
+            "--stagger_warmup requires --max_episode_steps to be set"
+        assert args.warmup_min_episode_steps is not None, \
+            "--stagger_warmup requires --warmup_min_episode_steps"
+        assert args.warmup_min_episode_steps <= args.max_episode_steps, \
+            "--warmup_min_episode_steps must be <= --max_episode_steps"
+
+        num_groups = -(-args.num_envs // args.warmup_group_size)  # integer ceil
+        if num_groups == 1:
+            # A single group has nothing to desync; warm-up is a no-op.
+            group_lengths = [args.max_episode_steps]
+            print("NOTE: stagger_warmup with a single group is a no-op "
+                  "(all envs use the standard episode length).")
+        else:
+            lo = max(1, args.warmup_min_episode_steps)
+            group_lengths = [int(round(v)) for v in
+                             np.linspace(lo, args.max_episode_steps, num_groups)]
+        warmup_lengths = [
+            group_lengths[min(i // args.warmup_group_size, len(group_lengths) - 1)]
+            for i in range(args.num_envs)
+        ]
+        print(f"Staggered warm-up lengths per env: {warmup_lengths}")
+
     # Create vectorized environments
     print(f"Creating {args.num_envs} parallel environment(s)...")
     envs = gym.vector.AsyncVectorEnv(
-        [make_env_fn(args.seed + i) for i in range(args.num_envs)],
+        [make_env_fn(args.seed + i, warmup_lengths[i]) for i in range(args.num_envs)],
         autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,
     )
     envs = RecordEpisodeVals(envs)
