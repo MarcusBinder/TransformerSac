@@ -71,7 +71,8 @@ class MultiLayoutEnv(gym.Env):
         pad_value: float = 0.0,
         shuffle: bool = False,
         max_turbines: Optional[int] = None,
-        max_episode_steps: Optional[int] = None,  
+        max_episode_steps: Optional[int] = None,
+        warmup_episode_steps: Optional[int] = None,
     ):
         """
         Args:
@@ -155,6 +156,14 @@ class MultiLayoutEnv(gym.Env):
         self._attention_mask = self._compute_attention_mask()
 
         self.max_episode_steps = max_episode_steps
+        # One-time warm-up: the first episode uses warmup_episode_steps (if set),
+        # then every subsequent episode uses max_episode_steps. This phase-offsets
+        # resets across envs without changing the canonical episode length.
+        self.warmup_episode_steps = warmup_episode_steps
+        self._episodes_started = 0
+        # Active limit for the current episode; updated in reset(). Initialized
+        # here so a step() before any reset() still has a valid limit.
+        self._active_max_steps = max_episode_steps
         self._elapsed_steps = 0
     
     def _create_env(self, layout: LayoutConfig) -> None:
@@ -643,6 +652,14 @@ class MultiLayoutEnv(gym.Env):
         
         self._elapsed_steps = 0
 
+        # Select the episode-length limit for the episode being started.
+        # Only the very first episode uses the warm-up length (if provided).
+        if self._episodes_started == 0 and self.warmup_episode_steps is not None:
+            self._active_max_steps = self.warmup_episode_steps
+        else:
+            self._active_max_steps = self.max_episode_steps
+        self._episodes_started += 1
+
         return padded_obs, info
     
     def step(
@@ -685,7 +702,7 @@ class MultiLayoutEnv(gym.Env):
         info['attention_mask'] = self._attention_mask.copy()
 
         self._elapsed_steps += 1
-        if self.max_episode_steps is not None and self._elapsed_steps >= self.max_episode_steps:
+        if self._active_max_steps is not None and self._elapsed_steps >= self._active_max_steps:
             truncated = True
 
         return padded_obs, reward, terminated, truncated, info
