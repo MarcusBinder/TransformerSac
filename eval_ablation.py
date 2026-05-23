@@ -524,13 +524,13 @@ if __name__ == "__main__":
     DETERMINISTIC = True
     VERBOSE = True
 
-    EVAL_LAYOUT = "E6"
+    EVAL_LAYOUT = "E4"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Evaluate all runs in BASE_DIR
     all_runs = sorted(os.listdir(BASE_DIR))
-    all_runs = [r for r in all_runs if r.startswith("B")]
+    all_runs = [r for r in all_runs if r.startswith("C") or r.startswith("D")]
     random.shuffle(all_runs)
 
     n_runs = len(all_runs)
