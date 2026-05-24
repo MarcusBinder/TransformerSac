@@ -110,7 +110,7 @@ def create_eval_env(layout: str, args: dict, seed: int = 42, n_envs: int = 1):
         "TurbBox": TURBBOX_PATH,
         "config": config,
         # "turbtype": args["TI_type"],
-        "turbtype": "Random", # Just keep it random here.
+        "turbtype": "MannGenerate", # Just keep it random here.
         "dt_sim": args["dt_sim"],
         "dt_env": args["dt_env"],
         "yaw_step_sim": args["yaw_step"],
