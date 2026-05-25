@@ -109,8 +109,8 @@ def create_eval_env(layout: str, args: dict, seed: int = 42, n_envs: int = 1):
         "n_passthrough": args["max_eps"],
         "TurbBox": TURBBOX_PATH,
         "config": config,
-        # "turbtype": args["TI_type"],
-        "turbtype": "MannGenerate", # Just keep it random here.
+        "turbtype": args["TI_type"],
+        # "turbtype": "MannGenerate", # Just keep it random here.
         "dt_sim": args["dt_sim"],
         "dt_env": args["dt_env"],
         "yaw_step_sim": args["yaw_step"],
@@ -515,7 +515,7 @@ if __name__ == "__main__":
     # ---- Configuration ----
     BASE_DIR = "/users/nilsenma/runs"
     OUTPUT_DIR = "/users/nilsenma/evals"
-    TURBBOX_PATH = "/users/nilsenma/Boxes/V80env/"  # <-- UPDATE if different on LUMI
+    TURBBOX_PATH = "./boxes/"  # <-- UPDATE if different on LUMI
 
     INPUT_SEED = 42
     N_ENVS = 20          # 100 episodes / 20 envs = 5 batches
