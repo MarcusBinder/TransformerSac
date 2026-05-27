@@ -515,7 +515,7 @@ if __name__ == "__main__":
     # ---- Configuration ----
     BASE_DIR = "/users/nilsenma/runs"
     OUTPUT_DIR = "/users/nilsenma/evals"
-    TURBBOX_PATH = "./boxes/"  # <-- UPDATE if different on LUMI
+    TURBBOX_PATH = "./boxes/"  # 
 
     INPUT_SEED = 42
     N_ENVS = 20          # 100 episodes / 20 envs = 5 batches
@@ -523,8 +523,8 @@ if __name__ == "__main__":
     NUM_STEPS = 250
     DETERMINISTIC = True
     VERBOSE = True
-
-    EVAL_LAYOUT = "E4"
+    
+    EVAL_LAYOUTS = ["E4", "E5"]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -542,7 +542,9 @@ if __name__ == "__main__":
 
         print(f"\n{'='*60}")
         print(f"Run {run_idx + 1}/{n_runs}: {run_name}  "
-              f"(config={config_name}, train_layout={layout_str}, seed={seed})")
+            f"(config={config_name}, train_layout={layout_str}, seed={seed})")
         print(f"{'='*60}")
 
-        evaluate_run_on_layout(run_name, EVAL_LAYOUT, n_envs=N_ENVS)
+        for eval_layout in EVAL_LAYOUTS:
+            print(f"\n--- Evaluating on {eval_layout} ---")
+            evaluate_run_on_layout(run_name, eval_layout, n_envs=N_ENVS)
