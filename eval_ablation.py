@@ -530,7 +530,7 @@ if __name__ == "__main__":
 
     # Evaluate all runs in BASE_DIR
     all_runs = sorted(os.listdir(BASE_DIR))
-    all_runs = [r for r in all_runs if r.startswith("E")]
+    all_runs = [r for r in all_runs if r.startswith("F")]
     random.shuffle(all_runs)
 
     n_runs = len(all_runs)
