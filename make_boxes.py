@@ -29,6 +29,8 @@ if __name__ == '__main__':
     boxes_dir = Path("boxes")
     boxes_dir.mkdir(exist_ok=True)
 
+    print("starting seed: ", args.seed_start)
+
     for seed in range(args.num_boxes):
         print("Generating turb box number ", seed)
 
