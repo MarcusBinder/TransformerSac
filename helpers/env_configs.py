@@ -85,6 +85,13 @@ ENV_CONFIGS: Dict[str, Dict[str, Any]] = {
             "ws_min": 10, "ws_max": 14,
         },
     },
+    "hard_2": {
+        "power_def": {"Power_reward": "Wake_recovery", "Power_avg": 5, "Power_scaling": 1.0},
+        "wind": {
+            "wd_min": 225, "wd_max": 315,
+            "ws_min": 10, "ws_max": 14,
+        },
+    },
 
     "basic": {
         "yaw_init": "Random",
