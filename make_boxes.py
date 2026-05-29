@@ -14,6 +14,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Generate Mann turbulence boxes for seeding.")
     parser.add_argument("-n", "--num-boxes", type=int, default=10,
                         help="Number of turbulence boxes to generate (default: 10).")
+    parser.add_argument("-s", "--seed-start", type=int, default=0,
+                        help="Ransom seed starting point (default: 0).")
     args = parser.parse_args()
 
     dx = 3.0  #Liew sais to use 1.85
@@ -36,7 +38,7 @@ if __name__ == '__main__':
                                         L=33.6,
                                         Nxyz= (int(nx), int(ny), int(nz)),
                                         dxyz= (dx, dy, dz),
-                                        seed=seed)
+                                        seed=seed+args.seed_start)
 
 
 
