@@ -542,7 +542,9 @@ if __name__ == "__main__":
     # all_runs = [r for r in all_runs if r.startswith("G")]
 
     all_runs = sorted(os.listdir(BASE_DIR))
-    all_runs = [r for r in all_runs if parse_run_name(r)[0] == "G5"]
+    all_runs = [r for r in all_runs if r.startswith("G5_")]
+    print(f"Matched {len(all_runs)} runs: {all_runs}")
+
     random.shuffle(all_runs)
 
     n_runs = len(all_runs)
