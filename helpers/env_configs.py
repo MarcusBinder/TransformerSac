@@ -170,6 +170,27 @@ ENV_CONFIGS: Dict[str, Dict[str, Any]] = {
 }
 
 
+# Sensor-ablation variants of the LES config. Yaw is always present (WindGym's
+# FarmMes never gates yaw; mes_class.py only ANDs the turb_* flags into the
+# ws/wd/power channels). Only the turb_* flags differ from "LES"; turb_TI and
+# the farm_* flags keep their base values (all False) via the deep merge.
+_LES_ABLATIONS = {
+    # yaw + one sensor (build-up)
+    "LES_yaw":      {"turb_ws": False, "turb_wd": False, "turb_power": False},
+    "LES_yawpower": {"turb_ws": False, "turb_wd": False, "turb_power": True},
+    "LES_yawws":    {"turb_ws": True,  "turb_wd": False, "turb_power": False},
+    "LES_yawwd":    {"turb_ws": False, "turb_wd": True,  "turb_power": False},
+    # full set minus one sensor (leave-one-out)
+    "LES_nows":     {"turb_ws": False, "turb_wd": True,  "turb_power": True},
+    "LES_nowd":     {"turb_ws": True,  "turb_wd": False, "turb_power": True},
+    "LES_nopower":  {"turb_ws": True,  "turb_wd": True,  "turb_power": False},
+}
+for _name, _mes in _LES_ABLATIONS.items():
+    _cfg = deepcopy(ENV_CONFIGS["LES"])
+    _cfg["mes_level"] = dict(_mes)
+    ENV_CONFIGS[_name] = _cfg
+
+
 def make_env_config(name: str = "default") -> Dict[str, Any]:
     """Build an env config by name. Applies overrides on top of the base config."""
     if name not in ENV_CONFIGS:
@@ -178,3 +199,30 @@ def make_env_config(name: str = "default") -> Dict[str, Any]:
 
     config = deepcopy(_base_config())
     return _deep_update(config, deepcopy(ENV_CONFIGS[name]))
+
+
+def obs_dim_per_turbine(config: Dict[str, Any], history_length: int) -> int:
+    """Per-turbine observation size produced by WindGym's FarmMes for this config.
+
+    Mirrors TurbMes.observed_variables(): the ws/wd/power channels are gated by
+    the mes_level turb_* flags (FarmMes ANDs them into the per-channel
+    current/rolling settings), yaw is never gated, and turb_TI adds one value.
+    history_length is the history_N the caller writes into every channel dict
+    (both the training script and the eval scripts override it from args/ckpt).
+    """
+    mes = config["mes_level"]
+    H = int(history_length)
+
+    def n(prefix: str, enabled: bool = True) -> int:
+        c = config[f"{prefix}_mes"]
+        return int(enabled) * (
+            int(c[f"{prefix}_current"]) + int(c[f"{prefix}_rolling_mean"]) * H
+        )
+
+    return (
+        n("ws", mes["turb_ws"])
+        + n("wd", mes["turb_wd"])
+        + n("yaw")
+        + n("power", mes["turb_power"])
+        + int(mes["turb_TI"])
+    )
