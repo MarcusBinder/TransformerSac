@@ -66,6 +66,18 @@ class Args:
     use_wind_relative_pos: bool = True  # Transform positions to wind-relative frame
     wd_scale_range: float = 90.0        # Only used if use_wd_deviation=True. Wind direction deviation range for scaling (±degrees → [-1,1])
 
+    # Observation scaling bounds: map raw measurements to [-1,1] in FarmMes.
+    # Saved in the checkpoint args; the eval scripts read them back so train and
+    # eval always scale identically. Defaults equal the WindFarmEnv defaults.
+    # Yaw scaling is NOT settable here: WindFarmEnv._apply_config ties it to the
+    # env config's farm yaw_min/yaw_max.
+    ws_scaling_min: float = 0.0   # Wind speed scaling lower bound (m/s)
+    ws_scaling_max: float = 30.0  # Wind speed scaling upper bound (m/s)
+    wd_scaling_min: float = 0.0   # Wind direction scaling lower bound (deg)
+    wd_scaling_max: float = 360.0 # Wind direction scaling upper bound (deg)
+    ti_scaling_min: float = 0.0   # Turbulence intensity scaling lower bound (-)
+    ti_scaling_max: float = 1.0   # Turbulence intensity scaling upper bound (-)
+
     # === Transformer Architecture ===
     embed_dim: int = 128          # Transformer hidden dimension
     num_heads: int = 4            # Number of attention heads

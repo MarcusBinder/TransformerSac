@@ -327,6 +327,14 @@ def main():
         "dt_sim": args.dt_sim,
         "dt_env": args.dt_env,
         "yaw_step_sim": args.yaw_step,
+        # Observation scaling bounds; saved in ckpt args and read back at eval.
+        # Yaw scaling is set by _apply_config from the config farm yaw range.
+        "ws_scaling_min": args.ws_scaling_min,
+        "ws_scaling_max": args.ws_scaling_max,
+        "wd_scaling_min": args.wd_scaling_min,
+        "wd_scaling_max": args.wd_scaling_max,
+        "ti_scaling_min": args.ti_scaling_min,
+        "ti_scaling_max": args.ti_scaling_max,
     }
     
     def env_factory(x_pos: np.ndarray, y_pos: np.ndarray) -> gym.Env:
