@@ -4,6 +4,8 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+not_used*
+windgym*
 
 # Data files
 *.nc
