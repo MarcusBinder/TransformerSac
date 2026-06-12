@@ -5,6 +5,9 @@ Wind-relative transformation is applied at sample time. Profiles are looked up
 via vectorized gather on a pre-padded registry.
 """
 
+import json
+import os
+
 import numpy as np
 import torch
 from typing import Optional, List, Tuple, Dict
@@ -263,6 +266,116 @@ class TransformerReplayBuffer:
         # Build shifted index array: (batch, 1, n_directions)
         indices = (np.arange(n_directions)[None, None, :] + shifts[:, None, None]) % n_directions
         return np.take_along_axis(profiles, indices, axis=-1)
+
+    def save(self, path: str, extra_meta: Optional[dict] = None) -> None:
+        """
+        Save the filled portion of the buffer to an uncompressed .npz file.
+
+        Only the first `size` transitions are written (circular order does not
+        matter for uniform sampling). The write is atomic: data goes to a temp
+        file which is then renamed, so a killed job never leaves a truncated
+        buffer at `path`.
+
+        Args:
+            path: Destination .npz path
+            extra_meta: Optional JSON-serializable dict stored alongside the
+                data (e.g. layouts, seed, global_step) and returned by load()
+        """
+        n = self.size
+        payload = {
+            "obs": self._obs[:n],
+            "next_obs": self._next_obs[:n],
+            "actions": self._actions[:n],
+            "rewards": self._rewards[:n],
+            "dones": self._dones[:n],
+            "raw_positions": self._raw_positions[:n],
+            "attention_mask": self._attention_mask[:n],
+            "wind_directions": self._wind_directions[:n],
+            "size": np.int64(n),
+            "max_turbines": np.int64(self.max_turbines),
+            "obs_dim": np.int64(self._obs.shape[2]),
+            "action_dim": np.int64(self._actions.shape[2]),
+            "use_profiles": np.bool_(self.use_profiles),
+            "meta_json": np.str_(json.dumps(extra_meta or {})),
+        }
+        if self.use_profiles:
+            payload["layout_indices"] = self._layout_indices[:n]
+            payload["permutations"] = self._permutations[:n]
+            payload["n_layouts"] = np.int64(self._padded_recep.shape[0])
+            payload["n_dirs"] = np.int64(self._n_dirs)
+
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "wb") as f:
+            np.savez(f, **payload)
+        os.replace(tmp_path, path)
+
+        size_mb = os.path.getsize(path) / 1e6
+        print(f"[ReplayBuffer] Saved {n} transitions to {path} ({size_mb:.1f} MB)")
+
+    def load(self, path: str) -> dict:
+        """
+        Load transitions from a .npz file (created by save()) into this buffer.
+
+        The buffer must already be constructed with a compatible configuration
+        (same max_turbines/obs_dim/action_dim/use_profiles, and for profiles
+        the same registry layout count and direction resolution). Existing
+        contents are overwritten.
+
+        Args:
+            path: Source .npz path
+
+        Returns:
+            The extra_meta dict that was passed to save()
+        """
+        with np.load(path, allow_pickle=False) as data:
+            n = int(data["size"])
+
+            def _check(name: str, expected: int) -> None:
+                actual = int(data[name])
+                if actual != expected:
+                    raise ValueError(
+                        f"Replay buffer mismatch on '{name}': saved buffer has "
+                        f"{actual}, current buffer expects {expected} ({path})"
+                    )
+
+            _check("max_turbines", self.max_turbines)
+            _check("obs_dim", self._obs.shape[2])
+            _check("action_dim", self._actions.shape[2])
+            if bool(data["use_profiles"]) != self.use_profiles:
+                raise ValueError(
+                    f"Replay buffer mismatch on 'use_profiles': saved buffer has "
+                    f"{bool(data['use_profiles'])}, current buffer expects "
+                    f"{self.use_profiles} ({path})"
+                )
+            if n > self.capacity:
+                raise ValueError(
+                    f"Saved buffer holds {n} transitions but capacity is only "
+                    f"{self.capacity}. Increase --buffer_size."
+                )
+
+            self._obs[:n] = data["obs"]
+            self._next_obs[:n] = data["next_obs"]
+            self._actions[:n] = data["actions"]
+            self._rewards[:n] = data["rewards"]
+            self._dones[:n] = data["dones"]
+            self._raw_positions[:n] = data["raw_positions"]
+            self._attention_mask[:n] = data["attention_mask"]
+            self._wind_directions[:n] = data["wind_directions"]
+
+            if self.use_profiles:
+                _check("n_layouts", self._padded_recep.shape[0])
+                _check("n_dirs", self._n_dirs)
+                self._layout_indices[:n] = data["layout_indices"]
+                self._permutations[:n] = data["permutations"]
+
+            meta = json.loads(str(data["meta_json"]))
+
+        self.size = n
+        self.position = n % self.capacity
+
+        print(f"[ReplayBuffer] Loaded {n} transitions from {path}")
+        return meta
 
     def __len__(self) -> int:
         return self.size

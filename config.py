@@ -135,6 +135,13 @@ class Args:
     # === Initial Exploration Mode ===
     initial_exploration: str = "random"  # "random" = sample from action space, "policy" = use actor network (useful when resuming from checkpoint)
 
+    # === Replay Buffer Save/Load ===
+    load_buffer: Optional[str] = None           # Path to a saved replay buffer (.npz). Loading skips the exploration phase (learning_starts -> 0).
+    save_buffer_at_learning_starts: bool = False  # Save the replay buffer once global_step reaches learning_starts (buffer pre-generation)
+    buffer_only: bool = False                   # With save_buffer_at_learning_starts: exit right after saving (generation-only run)
+    save_buffer_final: bool = False             # Save the replay buffer at the end of training (for splitting runs across cluster jobs)
+    buffer_save_interval: int = 0               # If > 0, periodically save the buffer every N steps (overwrites runs/{run_name}/replay_buffer.npz). 0 = disabled.
+
     # === Pretrained Encoder Loading ===
     pretrain_checkpoint: Optional[str] = None   # Path to pretrained encoder .pt from pretrain_power.py
     pretrain_freeze_steps: int = 0             # Freeze encoder for this many env steps (0 = no freeze)

@@ -112,6 +112,16 @@ def main():
               "The actor is untrained, so 'policy' exploration will just be random Gaussian noise.")
     if args.initial_exploration == "policy":
         print(f"Initial exploration: using actor network for first {args.learning_starts} steps")
+
+    # Validate replay buffer save/load flags
+    assert not (args.buffer_only and args.load_buffer is not None), \
+        "--buffer_only generates a warmup buffer; combining it with --load_buffer is pointless"
+    if args.buffer_only and not args.save_buffer_at_learning_starts:
+        print("NOTE: --buffer_only implies --save_buffer_at_learning_starts, enabling it.")
+        args.save_buffer_at_learning_starts = True
+    if args.save_buffer_at_learning_starts and args.initial_exploration == "policy":
+        print("WARNING: Saving the warmup buffer with --initial_exploration=policy. "
+              "The saved transitions depend on the actor weights, not just the seed.")
     
     # Parse layouts
     layout_names = [l.strip() for l in args.layouts.split(",")]
@@ -174,11 +184,11 @@ def main():
 
     # Force math SDPA backend (avoids ROCm Flash/MemEfficient kernel bugs)
     # ONLY RELEVANT FOR LUMI. TODO make it such this only works on lumi
-    if device.type == "cuda":
-        torch.backends.cuda.enable_flash_sdp(False)
-        torch.backends.cuda.enable_mem_efficient_sdp(False)
-        torch.backends.cuda.enable_math_sdp(True)
-        print("Forced math SDPA backend")
+    # if device.type == "cuda":
+    #     torch.backends.cuda.enable_flash_sdp(False)
+    #     torch.backends.cuda.enable_mem_efficient_sdp(False)
+    #     torch.backends.cuda.enable_math_sdp(True)
+    #     print("Forced math SDPA backend")
 
     # =========================================================================
     # ENVIRONMENT SETUP
@@ -966,6 +976,43 @@ def main():
         profile_registry=profile_registry,
     )
 
+    # Shared metadata stored alongside every buffer save (also validated on load)
+    def buffer_meta(step: int) -> dict:
+        return {
+            "layouts": args.layouts,
+            "seed": args.seed,
+            "global_step": step,
+            "history_length": args.history_length,
+        }
+
+    if args.load_buffer is not None:
+        print(f"\n{'='*60}")
+        print(f"LOADING REPLAY BUFFER")
+        print(f"{'='*60}")
+        buffer_meta_loaded = rb.load(args.load_buffer)
+
+        if buffer_meta_loaded.get("layouts") != args.layouts:
+            raise ValueError(
+                f"Replay buffer was generated with layouts='{buffer_meta_loaded.get('layouts')}' "
+                f"but this run uses layouts='{args.layouts}'. Stored positions and "
+                f"layout indices would be inconsistent."
+            )
+        if buffer_meta_loaded.get("history_length") != args.history_length:
+            raise ValueError(
+                f"Replay buffer was generated with history_length="
+                f"{buffer_meta_loaded.get('history_length')} but this run uses "
+                f"{args.history_length}. Observation contents would be inconsistent."
+            )
+        if buffer_meta_loaded.get("seed") != args.seed:
+            print(f"NOTE: buffer was generated with seed={buffer_meta_loaded.get('seed')}, "
+                  f"this run uses seed={args.seed}.")
+
+        if args.learning_starts > 0:
+            print(f"Loaded {len(rb)} transitions; skipping exploration phase "
+                  f"(learning_starts: {args.learning_starts} -> 0)")
+            args.learning_starts = 0
+        print(f"{'='*60}\n")
+
 
     # =========================================================================
     # TRAINING LOOP
@@ -1018,7 +1065,10 @@ def main():
     # Tracking
     step_reward_window = deque(maxlen=1000)
     # next_save_step = ((start_step // args.save_interval) + 1) * args.save_interval  # Account for resumed step
-    next_save_step = start_step + args.save_interval 
+    next_save_step = start_step + args.save_interval
+    # Replay buffer saving
+    warmup_buffer_saved = False
+    next_buffer_save_step = start_step + args.buffer_save_interval
     # For logging losses (we'll average over the UTD updates)
     if args.algorithm == "tqc":
         loss_accumulator = {
@@ -1140,7 +1190,21 @@ def main():
                 permutation=perm_i,
             )
 
-
+        # One-shot warmup buffer save (buffer pre-generation for ablation runs)
+        if (args.save_buffer_at_learning_starts
+                and not warmup_buffer_saved
+                and global_step >= args.learning_starts):
+            rb.save(
+                f"runs/{run_name}/replay_buffer_warmup_{args.learning_starts}.npz",
+                extra_meta=buffer_meta(global_step),
+            )
+            warmup_buffer_saved = True
+            if args.buffer_only:
+                print("\n--buffer_only set: warmup buffer saved, exiting before training.")
+                evaluator.close()
+                envs.close()
+                writer.close()
+                return
 
         obs = next_obs
         
@@ -1511,6 +1575,15 @@ def main():
             )
             next_save_step += args.save_interval
 
+        # Periodic replay buffer save (overwrites a single file; atomic rename
+        # keeps the previous copy intact if the job is killed mid-write)
+        if args.buffer_save_interval > 0 and global_step >= next_buffer_save_step:
+            rb.save(
+                f"runs/{run_name}/replay_buffer.npz",
+                extra_meta=buffer_meta(global_step),
+            )
+            next_buffer_save_step += args.buffer_save_interval
+
         # =====================================================================
         # PERIODIC EVALUATION
         # =====================================================================
@@ -1546,7 +1619,13 @@ def main():
             global_step, run_name, args, log_alpha, alpha_optimizer,
             tqc_critic=tqc_critic,
         )
-    
+
+    if args.save_buffer_final or args.buffer_save_interval > 0:
+        rb.save(
+            f"runs/{run_name}/replay_buffer.npz",
+            extra_meta=buffer_meta(global_step),
+        )
+
     print("\n" + "=" * 60)
     print("Training finished!")
     print(f"Total time: {(time.time() - start_time) / 3600:.2f} hours")
