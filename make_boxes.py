@@ -44,7 +44,10 @@ if __name__ == '__main__':
 
 
 
-        filename = boxes_dir / ("TF_seed_" + str(seed) + ".nc")
+        # Name by the ACTUAL Mann seed (not the loop index) so runs with a
+        # nonzero --seed-start are honestly named and parallel single-box
+        # invocations never collide. Identical names for the default start 0.
+        filename = boxes_dir / ("TF_seed_" + str(seed + args.seed_start) + ".nc")
         tf.to_netcdf(filename = str(filename))
 
     print("Is is done")
