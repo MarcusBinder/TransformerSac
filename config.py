@@ -49,6 +49,7 @@ class Args:
     share_profile_encoder: bool = False         # Whether to share weights between actor and critic for profile encoder
 
     # === Environment Settings ===
+    backend: str = "dynamiks"  # Flow solver backend: "dynamiks" (default) or "pywake" (steady-state)
     turbtype: str = "DTU10MW"  # Wind turbine type
     TI_type: str = "Random"   # Turbulence intensity sampling
     dt_sim: int = 5           # Simulation timestep (seconds)

@@ -323,6 +323,7 @@ def main():
         "TurbBox": "./boxes/",  # Adjust path as needed
         "config": config,
         "turbtype": args.TI_type,
+        "backend": args.backend,
         "dt_sim": args.dt_sim,
         "dt_env": args.dt_env,
         "yaw_step_sim": args.yaw_step,
