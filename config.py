@@ -21,6 +21,7 @@ class Args:
     track: bool = True  # Enable wandb tracking
     wandb_project_name: str = "transformer_windfarm"
     wandb_entity: Optional[str] = None
+    exp_group: Optional[str] = None  # W&B run group (groups seeds of one config); None = ungrouped
     save_model: bool = True
     save_interval: int = 10000
     log_image: bool = False  # Log attention images to TensorBoard

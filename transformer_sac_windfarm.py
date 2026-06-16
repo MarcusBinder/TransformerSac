@@ -476,6 +476,7 @@ def main():
                 "debug/gradient_log_frequency": debug_logger.gradient_log_frequency,
             },
             name=run_name,
+            group=args.exp_group,
             monitor_gym=True,
             save_code=True,
         )
