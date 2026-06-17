@@ -29,10 +29,12 @@ class CNNProfileEncoder(nn.Module):
         embed_dim: int = 128,
         hidden_channels: int = 64,
         n_angular_bins: int = 8,  # Keep this many angular bins (not 1!)
+        input_resolution: int = None,  # If set, avg-pool the profile to this many bins first
         **kwargs,
     ):
         super().__init__()
         self.n_angular_bins = n_angular_bins
+        self.input_resolution = input_resolution
 
         # Scale 1: Full resolution
         self.conv1 = nn.Sequential(
@@ -76,14 +78,24 @@ class CNNProfileEncoder(nn.Module):
         """
         batch_size, n_turbines, n_dirs = profiles.shape
 
-        # Compute adaptive pool sizes based on actual input size
-        # Scale 2: ~1/4 of input, minimum 8
+        # Flatten batch and turbines: (batch * n_turbines, 1, n_directions)
+        x = profiles.reshape(batch_size * n_turbines, 1, n_dirs)
+
+        # Optional angular downsample BEFORE channel expansion. The CNN's peak
+        # GPU cost is the full-resolution activations (1 -> hidden_channels at
+        # n_dirs bins, retained for backward); at n_dirs=360 this dominates and
+        # OOMs when two seeds share a node. Wake profiles are smooth, so
+        # average-pooling 360 -> input_resolution bins drops negligible angular
+        # detail while cutting activation memory ~ n_dirs / input_resolution.
+        if self.input_resolution is not None and n_dirs > self.input_resolution:
+            x = F.adaptive_avg_pool1d(x, self.input_resolution)
+            n_dirs = self.input_resolution
+
+        # Compute adaptive pool sizes based on the (possibly reduced) input size
+        # Scale 2: ~1/4 of input, minimum n_angular_bins
         scale2_size = max(n_dirs // 4, self.n_angular_bins)
         # Scale 3: ~1/3 of scale2, minimum n_angular_bins
         scale3_size = max(scale2_size // 3, self.n_angular_bins)
-
-        # Flatten batch and turbines: (batch * n_turbines, 1, n_directions)
-        x = profiles.view(batch_size * n_turbines, 1, n_dirs)
 
         # Scale 1: (batch * n_turb, hidden, n_dirs)
         x1 = self.conv1(x)
