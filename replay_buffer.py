@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from typing import Optional, List, Tuple, Dict
 
-from helpers.helper_funcs import transform_to_wind_relative
+from helpers.helper_funcs import transform_to_wind_relative, rotate_profiles_tensor
 
 
 class TransformerReplayBuffer:
@@ -200,24 +200,26 @@ class TransformerReplayBuffer:
         # Normalize positions by rotor diameter
         positions_norm = raw_positions / self.rotor_diameter
 
-        # Convert to tensors
-        positions_tensor = torch.tensor(positions_norm, device=self.device, dtype=torch.float32)
+        # Move wind directions to device once (reused by the wind-relative
+        # transform and GPU-side profile rotation below).
+        need_wind = self.use_wind_relative or (self.use_profiles and self.rotate_profiles)
+        wind_dir_tensor = self._to_device(wind_directions) if need_wind else None
 
-        # Conditionally apply wind-relative transformation
+        # Positions: normalize on CPU (cheap), transfer, rotate to wind-relative on GPU.
+        positions_tensor = self._to_device(positions_norm)
         if self.use_wind_relative:
-            wind_dir_tensor = torch.tensor(wind_directions, device=self.device, dtype=torch.float32)
             positions_final = transform_to_wind_relative(positions_tensor, wind_dir_tensor)
         else:
             positions_final = positions_tensor
 
         result = {
-            "observations": torch.tensor(self._obs[indices], device=self.device, dtype=torch.float32),
-            "next_observations": torch.tensor(self._next_obs[indices], device=self.device, dtype=torch.float32),
-            "actions": torch.tensor(self._actions[indices], device=self.device, dtype=torch.float32),
+            "observations": self._to_device(self._obs[indices]),
+            "next_observations": self._to_device(self._next_obs[indices]),
+            "actions": self._to_device(self._actions[indices]),
             "positions": positions_final,
-            "attention_mask": torch.tensor(self._attention_mask[indices], device=self.device, dtype=torch.bool),
-            "rewards": torch.tensor(self._rewards[indices], device=self.device, dtype=torch.float32).unsqueeze(-1),
-            "dones": torch.tensor(self._dones[indices], device=self.device, dtype=torch.float32).unsqueeze(-1),
+            "attention_mask": self._to_device(self._attention_mask[indices]),
+            "rewards": self._to_device(self._rewards[indices]).unsqueeze(-1),
+            "dones": self._to_device(self._dones[indices]).unsqueeze(-1),
         }
 
         # --- Vectorized profile lookup + permutation ---
@@ -234,15 +236,32 @@ class TransformerReplayBuffer:
             recep_batch = np.take_along_axis(recep_batch, perm_batch[:, :, None], axis=1)
             infl_batch = np.take_along_axis(infl_batch, perm_batch[:, :, None], axis=1)
 
-            # Optionally rotate profiles to wind-relative frame
-            if self.rotate_profiles:
-                recep_batch = self._rotate_profiles_batch(recep_batch, wind_directions)
-                infl_batch = self._rotate_profiles_batch(infl_batch, wind_directions)
+            recep_t = self._to_device(recep_batch)
+            infl_t = self._to_device(infl_batch)
 
-            result["receptivity"] = torch.tensor(recep_batch, device=self.device, dtype=torch.float32)
-            result["influence"] = torch.tensor(infl_batch, device=self.device, dtype=torch.float32)
+            # Rotate to wind-relative frame on-device (avoids CPU rotation + re-copy)
+            if self.rotate_profiles:
+                recep_t = rotate_profiles_tensor(recep_t, wind_dir_tensor)
+                infl_t = rotate_profiles_tensor(infl_t, wind_dir_tensor)
+
+            result["receptivity"] = recep_t
+            result["influence"] = infl_t
 
         return result
+
+    def _to_device(self, arr: np.ndarray) -> torch.Tensor:
+        """
+        Host->device transfer for a sampled batch array.
+
+        On CUDA we stage through pinned memory and copy asynchronously so the
+        transfer overlaps with compute; on CPU we just wrap the array. Storage
+        arrays already hold the target dtypes (float32 / bool), so no cast is
+        needed here.
+        """
+        t = torch.from_numpy(np.ascontiguousarray(arr))
+        if self.device.type == "cuda":
+            return t.pin_memory().to(self.device, non_blocking=True)
+        return t.to(self.device)
 
     def _rotate_profiles_batch(
         self,

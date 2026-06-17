@@ -1020,6 +1020,31 @@ def main():
     # TRAINING LOOP
     # =========================================================================
     
+    # =========================================================================
+    # torch.compile (optional) — compile the network forward passes.
+    # We replace each module's .forward (not the module object) so state_dict
+    # keys are unchanged (checkpoints stay compatible) and the actor's
+    # get_action(self.forward(...)) hot path also hits the compiled graph.
+    # Shapes are static (padded max_turbines, fixed batch_size); the rare
+    # logging/eval calls with other batch sizes just trigger a one-time recompile.
+    # =========================================================================
+    if args.compile:
+        print("Compiling network forward passes with torch.compile (first steps are slow)...")
+
+        def _compile_forward(module):
+            if module is not None:
+                module.forward = torch.compile(module.forward)
+
+        _compile_forward(actor)
+        if args.algorithm == "tqc":
+            _compile_forward(tqc_critic)
+            _compile_forward(tqc_critic_target)
+        else:
+            _compile_forward(qf1)
+            _compile_forward(qf2)
+            _compile_forward(qf1_target)
+            _compile_forward(qf2_target)
+
     print(f"\nStarting training for {args.total_timesteps} timesteps...")
     print(f"UTD ratio: {args.utd_ratio} (gradient updates per env step)")
     print(f"With {args.num_envs} envs: {int(args.num_envs * args.utd_ratio)} gradient updates per iteration")
@@ -1061,6 +1086,23 @@ def main():
     start_time = time.time()
     global_step = start_step  # Start from checkpoint step if resuming, else 0
     total_gradient_steps = 0  # Track total gradient updates for logging
+
+    # Wall-clock breakdown (only populated when --log_timing). Accumulated over a
+    # logging window and reset on each flush. Syncs are gated so they add no
+    # overhead when timing is off.
+    timing = {"env": 0.0, "sample": 0.0, "critic": 0.0, "actor": 0.0}
+
+    def _sync_timer():
+        """Return perf_counter, syncing CUDA first so GPU work is included."""
+        if args.log_timing and device.type == "cuda":
+            torch.cuda.synchronize()
+        return time.perf_counter()
+
+    # AMP autocast context (bf16). Reused across all update forward passes; a
+    # no-op when --amp is off. bf16 keeps fp32 range so no GradScaler is needed.
+    amp_ctx = torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=args.amp)
+    if args.amp:
+        print(f"AMP enabled: bfloat16 autocast on {device.type}")
     # Reset environments
     obs, infos = envs.reset(seed=args.seed)
     
@@ -1120,20 +1162,25 @@ def main():
 
 
         # Select action
+        # Reuse the env state already fetched above to avoid duplicate get_attr IPC
+        act_state = dict(wind_dirs=wind_dirs, raw_positions=raw_positions, masks=current_masks)
         if global_step < args.learning_starts:
             if args.initial_exploration == "policy":
                 # Use the actor network (useful when resuming from checkpoint)
                 with torch.no_grad():
-                    actions = agent.act(envs, obs)
+                    actions = agent.act(envs, obs, **act_state)
             else:
                 # Random exploration (default for training from scratch)
                 actions = envs.action_space.sample()
         else:
             with torch.no_grad():
-                actions = agent.act(envs, obs)
+                actions = agent.act(envs, obs, **act_state)
         
         # Step environment
+        _t0 = _sync_timer()
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
+        if args.log_timing:
+            timing["env"] += time.perf_counter() - _t0
 
 
         # Get current layout names for each env
@@ -1226,8 +1273,13 @@ def main():
 
             for grad_step in range(num_gradient_updates):
                 # Sample a fresh batch for each gradient update
+                _t0 = _sync_timer()
                 data = rb.sample(args.batch_size)
-                
+                if args.log_timing:
+                    timing["sample"] += _sync_timer() - _t0
+
+                _t_critic = _sync_timer()
+
                 batch_mask = data["attention_mask"]
                 
                 # Get profiles from batch (will be None if not using profiles)
@@ -1237,7 +1289,7 @@ def main():
                 # -----------------------------------------------------------------
                 # Update Critics
                 # -----------------------------------------------------------------
-                with torch.no_grad():
+                with torch.no_grad(), amp_ctx:
                     # Get next actions from current policy
                     next_actions, next_log_pi, _, _ = actor.get_action(
                         data["next_observations"],
@@ -1249,7 +1301,7 @@ def main():
 
                 if args.algorithm == "tqc":
                     # --- TQC critic update ---
-                    with torch.no_grad():
+                    with torch.no_grad(), amp_ctx:
                         # Target quantiles: (n_critics, batch, n_quantiles)
                         target_quantiles = tqc_critic_target(
                             data["next_observations"], next_actions,
@@ -1258,24 +1310,25 @@ def main():
                             influence_profile=batch_influence,
                         )
                         batch_size_cur = data["rewards"].shape[0]
-                        # Flatten across critics, sort, truncate top-d
-                        all_target_q = target_quantiles.permute(1, 0, 2).reshape(batch_size_cur, -1)
+                        # Flatten across critics, sort, truncate top-d (fp32 for the target math)
+                        all_target_q = target_quantiles.float().permute(1, 0, 2).reshape(batch_size_cur, -1)
                         sorted_q, _ = all_target_q.sort(dim=1)
                         n_keep = args.tqc_n_critics * args.tqc_n_quantiles - args.tqc_top_quantiles_to_drop
                         truncated_mean = sorted_q[:, :n_keep].mean(dim=1, keepdim=True)
                         target_q = data["rewards"] + (1 - data["dones"]) * args.gamma * (truncated_mean - alpha * next_log_pi)
 
                     # Current quantiles: (n_critics, batch, n_quantiles)
-                    current_q = tqc_critic(
-                        data["observations"], data["actions"],
-                        data["positions"], batch_mask,
-                        recep_profile=batch_receptivity,
-                        influence_profile=batch_influence,
-                    )
-                    qf_loss = sum(
-                        quantile_huber_loss(current_q[i], target_q, taus)
-                        for i in range(args.tqc_n_critics)
-                    )
+                    with amp_ctx:
+                        current_q = tqc_critic(
+                            data["observations"], data["actions"],
+                            data["positions"], batch_mask,
+                            recep_profile=batch_receptivity,
+                            influence_profile=batch_influence,
+                        )
+                        qf_loss = sum(
+                            quantile_huber_loss(current_q[i].float(), target_q, taus)
+                            for i in range(args.tqc_n_critics)
+                        )
 
                     q_optimizer.zero_grad(set_to_none=True)
                     qf_loss.backward()
@@ -1297,7 +1350,7 @@ def main():
                     loss_accumulator['qf_loss'].append(qf_loss.item())
                 else:
                     # --- SAC critic update ---
-                    with torch.no_grad():
+                    with torch.no_grad(), amp_ctx:
                         qf1_next = qf1_target(
                             data["next_observations"], next_actions,
                             data["positions"], batch_mask,
@@ -1313,27 +1366,29 @@ def main():
                         min_qf_next = torch.min(qf1_next, qf2_next) - alpha * next_log_pi
                         target_q = data["rewards"] + (1 - data["dones"]) * args.gamma * min_qf_next
 
-                    qf1_value = qf1(data["observations"], data["actions"],
-                                    data["positions"], batch_mask,
-                                    recep_profile=batch_receptivity,
-                                    influence_profile=batch_influence)
-                    qf2_value = qf2(data["observations"], data["actions"],
-                                    data["positions"], batch_mask,
-                                    recep_profile=batch_receptivity,
-                                    influence_profile=batch_influence)
+                    with amp_ctx:
+                        qf1_value = qf1(data["observations"], data["actions"],
+                                        data["positions"], batch_mask,
+                                        recep_profile=batch_receptivity,
+                                        influence_profile=batch_influence)
+                        qf2_value = qf2(data["observations"], data["actions"],
+                                        data["positions"], batch_mask,
+                                        recep_profile=batch_receptivity,
+                                        influence_profile=batch_influence)
 
-                    if debug_logger.should_log_q_values(total_gradient_steps):
-                        debug_logger.log_q_value_stats(
-                            qf1_values=qf1_value,
-                            qf2_values=qf2_value,
-                            target_q=target_q,
-                            writer=writer,
-                            global_step=global_step,
-                        )
+                        if debug_logger.should_log_q_values(total_gradient_steps):
+                            debug_logger.log_q_value_stats(
+                                qf1_values=qf1_value,
+                                qf2_values=qf2_value,
+                                target_q=target_q,
+                                writer=writer,
+                                global_step=global_step,
+                            )
 
-                    qf1_loss = F.mse_loss(qf1_value, target_q)
-                    qf2_loss = F.mse_loss(qf2_value, target_q)
-                    qf_loss = qf1_loss + qf2_loss
+                        # Losses in fp32 for stability
+                        qf1_loss = F.mse_loss(qf1_value.float(), target_q)
+                        qf2_loss = F.mse_loss(qf2_value.float(), target_q)
+                        qf_loss = qf1_loss + qf2_loss
 
                     q_optimizer.zero_grad(set_to_none=True)
                     qf_loss.backward()
@@ -1350,44 +1405,49 @@ def main():
                     loss_accumulator['qf1_loss'].append(qf1_loss.item())
                     loss_accumulator['qf2_loss'].append(qf2_loss.item())
 
+                if args.log_timing:
+                    timing["critic"] += _sync_timer() - _t_critic
+
                 # -----------------------------------------------------------------
                 # Update Actor (delayed based on total gradient steps)
                 # -----------------------------------------------------------------
                 if total_gradient_steps % args.policy_frequency == 0:
-                    # Get actions from current policy
-                    actions_pi, log_pi, _, _ = actor.get_action(
-                        data["observations"], data["positions"], batch_mask,
-                        recep_profile=batch_receptivity,
-                        influence_profile=batch_influence,
-                    )
-                    
-                    # Q-values for policy actions
-                    if args.algorithm == "tqc":
-                        all_q = tqc_critic(
-                            data["observations"], actions_pi,
-                            data["positions"], batch_mask,
+                    _t_actor = _sync_timer()
+                    # Get actions from current policy + Q-values (under AMP autocast)
+                    with amp_ctx:
+                        actions_pi, log_pi, _, _ = actor.get_action(
+                            data["observations"], data["positions"], batch_mask,
                             recep_profile=batch_receptivity,
                             influence_profile=batch_influence,
-                        )  # (n_critics, batch, n_quantiles)
-                        batch_size_cur = data["rewards"].shape[0]
-                        all_q_flat = all_q.permute(1, 0, 2).reshape(batch_size_cur, -1)
-                        sorted_q, _ = all_q_flat.sort(dim=1)
-                        n_keep = args.tqc_n_critics * args.tqc_n_quantiles - args.tqc_top_quantiles_to_drop
-                        min_qf_pi = sorted_q[:, :n_keep].mean(dim=1, keepdim=True)
-                    else:
-                        qf1_pi = qf1(data["observations"], actions_pi, data["positions"],
-                                     batch_mask,
-                                     recep_profile=batch_receptivity,
-                                     influence_profile=batch_influence)
-                        qf2_pi = qf2(data["observations"], actions_pi, data["positions"],
-                                     batch_mask,
-                                     recep_profile=batch_receptivity,
-                                     influence_profile=batch_influence)
-                        min_qf_pi = torch.min(qf1_pi, qf2_pi)
+                        )
 
-                    # Policy loss (maximize Q - alpha * entropy)
-                    actor_loss = (alpha * log_pi - min_qf_pi).mean()
-                    
+                        # Q-values for policy actions
+                        if args.algorithm == "tqc":
+                            all_q = tqc_critic(
+                                data["observations"], actions_pi,
+                                data["positions"], batch_mask,
+                                recep_profile=batch_receptivity,
+                                influence_profile=batch_influence,
+                            )  # (n_critics, batch, n_quantiles)
+                            batch_size_cur = data["rewards"].shape[0]
+                            all_q_flat = all_q.permute(1, 0, 2).reshape(batch_size_cur, -1)
+                            sorted_q, _ = all_q_flat.sort(dim=1)
+                            n_keep = args.tqc_n_critics * args.tqc_n_quantiles - args.tqc_top_quantiles_to_drop
+                            min_qf_pi = sorted_q[:, :n_keep].mean(dim=1, keepdim=True)
+                        else:
+                            qf1_pi = qf1(data["observations"], actions_pi, data["positions"],
+                                         batch_mask,
+                                         recep_profile=batch_receptivity,
+                                         influence_profile=batch_influence)
+                            qf2_pi = qf2(data["observations"], actions_pi, data["positions"],
+                                         batch_mask,
+                                         recep_profile=batch_receptivity,
+                                         influence_profile=batch_influence)
+                            min_qf_pi = torch.min(qf1_pi, qf2_pi)
+
+                        # Policy loss (maximize Q - alpha * entropy), fp32 for stability
+                        actor_loss = (alpha * log_pi.float() - min_qf_pi.float()).mean()
+
                     # Update actor
                     actor_optimizer.zero_grad(set_to_none=True)
                     actor_loss.backward()
@@ -1424,7 +1484,10 @@ def main():
                         alpha = log_alpha.exp().item()
                         
                         loss_accumulator['alpha_loss'].append(alpha_loss.item())
-                
+
+                    if args.log_timing:
+                        timing["actor"] += _sync_timer() - _t_actor
+
                 # -----------------------------------------------------------------
                 # Update Target Networks
                 # -----------------------------------------------------------------
@@ -1504,6 +1567,14 @@ def main():
                 writer.add_scalar("debug/mean_wind_direction", float(np.mean(wind_dirs)), global_step)
                 writer.add_scalar("debug/total_gradient_steps", total_gradient_steps, global_step)
                 writer.add_scalar("debug/gradient_updates_per_iter", num_gradient_updates, global_step)
+
+                if args.log_timing:
+                    total_t = sum(timing.values()) or 1.0
+                    for k, v in timing.items():
+                        writer.add_scalar(f"timing/{k}_sec", v, global_step)
+                        writer.add_scalar(f"timing/{k}_frac", v / total_t, global_step)
+                    print(f"  timing(s): " + ", ".join(f"{k}={v:.2f}" for k, v in timing.items()))
+                    timing = {k: 0.0 for k in timing}
 
                 print(f"Step {global_step}: SPS={sps}, qf_loss={mean_qf_loss:.4f}, "
                       f"actor_loss={mean_actor_loss:.4f}, alpha={alpha:.4f}, "

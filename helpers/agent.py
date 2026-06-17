@@ -82,24 +82,34 @@ class BatchPreparer:
         self,
         envs: gym.vector.VectorEnv,
         obs: np.ndarray,
+        wind_dirs: Optional[np.ndarray] = None,
+        raw_positions: Optional[np.ndarray] = None,
+        masks: Optional[np.ndarray] = None,
     ) -> InferenceBatch:
         """
         Prepare batch from vectorized environment state.
-        
+
         Args:
             envs: Vectorized environment (AsyncVectorEnv or SyncVectorEnv)
             obs: Current observations, shape (num_envs, n_turbines, obs_dim)
-        
+            wind_dirs/raw_positions/masks: optional precomputed env state. When
+                provided (e.g. the training loop already fetched them), they are
+                used directly to avoid duplicate get_attr IPC to the async
+                workers. Any left as None is queried here.
+
         Returns:
             InferenceBatch ready for actor.get_action()
         """
         num_envs = obs.shape[0]
-        
-        # Query environment state
-        wind_dirs = np.array(envs.env.get_attr('wd'), dtype=np.float32)
-        raw_positions = np.array(envs.env.get_attr('turbine_positions'), dtype=np.float32)
-        masks = np.array(envs.env.get_attr('attention_mask'), dtype=bool)
-        
+
+        # Query environment state (skip the IPC for anything passed in)
+        if wind_dirs is None:
+            wind_dirs = np.array(envs.env.get_attr('wd'), dtype=np.float32)
+        if raw_positions is None:
+            raw_positions = np.array(envs.env.get_attr('turbine_positions'), dtype=np.float32)
+        if masks is None:
+            masks = np.array(envs.env.get_attr('attention_mask'), dtype=bool)
+
         # Convert observations to tensor
         obs_tensor = torch.tensor(obs, dtype=torch.float32, device=self.device)
         mask_tensor = torch.tensor(masks, dtype=torch.bool, device=self.device)
@@ -206,19 +216,26 @@ class WindFarmAgent:
         envs: gym.vector.VectorEnv,
         obs: np.ndarray,
         deterministic: bool = False,
+        wind_dirs: Optional[np.ndarray] = None,
+        raw_positions: Optional[np.ndarray] = None,
+        masks: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Select actions given current environment state.
-        
+
         Args:
             envs: Vectorized environment
             obs: Current observations, shape (num_envs, n_turbines, obs_dim)
             deterministic: If True, use mean action. If False, sample stochastically.
-        
+            wind_dirs/raw_positions/masks: optional precomputed env state forwarded
+                to BatchPreparer.from_envs to avoid duplicate get_attr IPC.
+
         Returns:
             actions: Action array, shape (num_envs, n_turbines)
         """
-        batch = self.batch_preparer.from_envs(envs, obs)
+        batch = self.batch_preparer.from_envs(
+            envs, obs, wind_dirs=wind_dirs, raw_positions=raw_positions, masks=masks,
+        )
         
         with torch.no_grad():
             action_tensor, _, _, _ = self.actor.get_action(

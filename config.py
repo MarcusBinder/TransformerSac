@@ -129,6 +129,11 @@ class Args:
     grad_clip: bool = True
     grad_clip_max_norm: float = 1.0
 
+    # === Performance / Speed ===
+    amp: bool = False        # Enable bfloat16 autocast (AMP) around the gradient updates
+    compile: bool = False    # torch.compile the network forward passes (static shapes)
+    log_timing: bool = False  # Log a wall-clock breakdown (env step / sample / critic / actor) to TensorBoard
+
     # === Fine-tuning / Resume Settings ===
     resume_checkpoint: Optional[str] = None  # Path to checkpoint .pt file for fine-tuning or resuming
     finetune_reset_actor_optimizer: int = 0     # If True, reset optimizers for fresh fine-tuning. If False, resume optimizer states too.
