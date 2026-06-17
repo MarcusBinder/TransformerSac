@@ -66,6 +66,7 @@ class Args:
     num_eval_episodes: int = 1        # Number of episodes per evaluation
     eval_layouts: str = ""            # Comma-separated eval layouts (empty = use training layouts)
     eval_seed: int = 42               # Seed for evaluation environments
+    eval_deterministic: bool = True   # Use the deterministic (mean) policy action during evaluation
 
     # === Layout Settings ===
     # Comma-separated list of layouts. Single = single-layout, Multiple = multi-layout

@@ -633,6 +633,7 @@ class TransformerActor(nn.Module):
             self.influence_encoder = shared_influence_encoder
         else:
             encoder_kwargs = json.loads(args.profile_encoder_kwargs)
+            encoder_kwargs.pop("hidden_channels", None)  # explicit hidden_channels arg already passed; avoid collision
             self.recep_encoder, self.influence_encoder = \
                 create_profile_encoding(
                     profile_type=profile_encoding,
@@ -908,6 +909,7 @@ class TransformerCritic(nn.Module):
             self.influence_encoder = shared_influence_encoder
         else:
             encoder_kwargs = json.loads(args.profile_encoder_kwargs)
+            encoder_kwargs.pop("hidden_channels", None)  # explicit hidden_channels arg already passed; avoid collision
             self.recep_encoder, self.influence_encoder = \
                 create_profile_encoding(
                     profile_type=profile_encoding,

@@ -426,7 +426,7 @@ def main():
         wind_turbine=wind_turbine,
         seed=args.eval_seed,
         max_turbines=n_turbines_max,
-        deterministic=False,
+        deterministic=args.eval_deterministic,
         use_profiles=use_profiles,  # NEW: Pass profile setting
         n_profile_directions=args.n_profile_directions,  # NEW: Pass profile resolution
         profile_source=args.profile_source,
