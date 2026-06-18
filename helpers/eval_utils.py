@@ -272,8 +272,13 @@ class PolicyEvaluator:
         n_turbines_max = self.eval_envs.single_observation_space.shape[0]
         
         for episode_idx in range(self.num_eval_episodes):
-            # Reset environments
-            obs, infos = self.eval_envs.reset(seed=self.seed + episode_idx)
+            # Reset environments. Stride the seed by num_envs: gymnasium seeds sub-env i
+            # with (base_seed + i), so a stride-1 base seed (self.seed + episode_idx) makes
+            # consecutive episode batches OVERLAP -> only (num_eval_episodes + num_envs - 1)
+            # unique (layout, wind) conditions instead of num_eval_episodes * num_envs (the
+            # base env is re-seeded from this seed in MultiLayoutEnv.reset, so collisions are
+            # exact-duplicate episodes). Striding by num_envs gives all-unique seed blocks.
+            obs, infos = self.eval_envs.reset(seed=self.seed + episode_idx * self.num_envs)
             
             episode_reward = np.zeros(self.num_envs)  # Track reward per env
             episode_power = []      # List of (num_envs,) arrays per step
