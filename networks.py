@@ -14,6 +14,7 @@ import torch.nn.functional as F
 
 from config import Args
 
+from positional_encodings._attn import MaskedScaledAttention, neighbour_allow_mask
 from positional_encodings import (
     AbsolutePositionalEncoding,
     RelativePositionalBias,
@@ -392,7 +393,9 @@ class TransformerEncoderLayer(nn.Module):
         embed_dim: int,
         num_heads: int,
         mlp_ratio: float = 2.0,
-        dropout: float = 0.0
+        dropout: float = 0.0,
+        attn_logit_scale: str = "none",   # v5: "none" | "logn"
+        attn_softmax: str = "softmax",    # v5: "softmax" | "entmax15"
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -402,12 +405,14 @@ class TransformerEncoderLayer(nn.Module):
         self.norm1 = nn.LayerNorm(embed_dim)
         self.norm2 = nn.LayerNorm(embed_dim)
 
-        # Multi-head attention
-        self.attn = nn.MultiheadAttention(
+        # Multi-head attention (custom: supports log-N scaling + local masking;
+        # identical to nn.MultiheadAttention when flags are off)
+        self.attn = MaskedScaledAttention(
             embed_dim,
             num_heads,
             dropout=dropout,
-            batch_first=True
+            logit_scale=attn_logit_scale,
+            softmax_type=attn_softmax,
         )
 
         # Feed-forward network
@@ -425,38 +430,30 @@ class TransformerEncoderLayer(nn.Module):
         x: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
         attn_bias: Optional[torch.Tensor] = None,
-        need_weights: bool = False,  # NEW
+        local_allow: Optional[torch.Tensor] = None,  # v5: (batch, n, n) bool, True = allowed
+        need_weights: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             x: (batch, n_tokens, embed_dim)
             key_padding_mask: (batch, n_tokens) where True = ignore this position
-            attention: (batch, n_heads, n_tokens, n_tokens) optional bias to add
+            attn_bias: (batch, n_heads, n_tokens, n_tokens) optional bias added
                        to attention logits (for relative positional encoding)
+            local_allow: (batch, n, n) optional bool mask; True = query may attend key
 
         Returns:
             x: Transformed tensor, same shape as input
-            attn_weights: (batch, n_heads, n_tokens, n_tokens) attention weights
+            attn_weights: (batch, n_heads, n_tokens, n_tokens) attention weights (or None)
         """
-        # Self-attention with pre-norm
+        # Self-attention with pre-norm. The custom attention takes the (B,H,N,N) bias
+        # directly (no reshape) and applies optional log-N scaling + local masking.
         x_norm = self.norm1(x)
-
-        # If we have attention bias, we need to use it as attn_mask
-        # PyTorch's MultiheadAttention adds attn_mask to attention logits
-        if attn_bias is not None:
-            # attn_mask in PyTorch MHA: (batch * num_heads, tgt_len, src_len) or (tgt_len, src_len)
-            # We need to reshape our bias: (batch, num_heads, n, n) → (batch * num_heads, n, n)
-            batch_size, num_heads, n, _ = attn_bias.shape
-            attn_mask = attn_bias.reshape(batch_size * num_heads, n, n)
-        else:
-            attn_mask = None
-
         attn_out, attn_weights = self.attn(
-            x_norm, x_norm, x_norm,
+            x_norm,
             key_padding_mask=key_padding_mask,
-            attn_mask=attn_mask,
-            average_attn_weights=False,  # Return per-head weights
-            need_weights=need_weights,  # Only compute if needed!
+            attn_bias=attn_bias,
+            local_allow=local_allow,
+            need_weights=need_weights,
         )
         x = x + attn_out
 
@@ -486,11 +483,14 @@ class TransformerEncoder(nn.Module):
         num_heads: int,
         num_layers: int,
         mlp_ratio: float = 2.0,
-        dropout: float = 0.0
+        dropout: float = 0.0,
+        attn_logit_scale: str = "none",   # v5
+        attn_softmax: str = "softmax",    # v5
     ):
         super().__init__()
         self.layers = nn.ModuleList([
-            TransformerEncoderLayer(embed_dim, num_heads, mlp_ratio, dropout)
+            TransformerEncoderLayer(embed_dim, num_heads, mlp_ratio, dropout,
+                                    attn_logit_scale=attn_logit_scale, attn_softmax=attn_softmax)
             for _ in range(num_layers)
         ])
         self.norm = nn.LayerNorm(embed_dim)  # Final layer norm
@@ -500,6 +500,7 @@ class TransformerEncoder(nn.Module):
         x: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
         attn_bias: Optional[torch.Tensor] = None,
+        local_allow: Optional[torch.Tensor] = None,  # v5
         need_weights: bool = False,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
@@ -507,6 +508,7 @@ class TransformerEncoder(nn.Module):
             x: (batch, n_tokens, embed_dim)
             key_padding_mask: (batch, n_tokens) where True = padding
             attn_bias: (batch, n_heads, n_tokens, n_tokens) optional attention bias
+            local_allow: (batch, n, n) optional bool local-attention mask (same for all layers)
             need_weights: If True, return attention weights (expensive). Default False.
 
         Returns:
@@ -516,7 +518,8 @@ class TransformerEncoder(nn.Module):
         all_attn_weights = []
 
         for layer in self.layers:
-            x, attn_weights = layer(x, key_padding_mask, attn_bias, need_weights=need_weights)
+            x, attn_weights = layer(x, key_padding_mask, attn_bias,
+                                    local_allow=local_allow, need_weights=need_weights)
             if need_weights:
                 all_attn_weights.append(attn_weights)
 
@@ -528,6 +531,19 @@ class TransformerEncoder(nn.Module):
 # =============================================================================
 # ACTOR NETWORK
 # =============================================================================
+
+def _read_attn_cfg(args):
+    """v5 attention flags from args, with backward-compatible defaults."""
+    if args is None:
+        return "none", "softmax", "none", 10.0, 5
+    return (
+        getattr(args, "attn_logit_scale", "none"),
+        getattr(args, "attn_softmax", "softmax"),
+        getattr(args, "attn_local", "none"),
+        float(getattr(args, "attn_local_radius_D", 10.0)),
+        int(getattr(args, "attn_local_k", 5)),
+    )
+
 
 LOG_STD_MAX = 2
 LOG_STD_MIN = -5
@@ -675,9 +691,11 @@ class TransformerActor(nn.Module):
             self.input_proj = nn.Identity()
 
 
-        # Standard transformer (with optional attention bias)
+        # Standard transformer (with optional attention bias + v5 log-N scaling / local attention)
+        _ls, _sm, self.attn_local, self.attn_local_radius_D, self.attn_local_k = _read_attn_cfg(args)
         self.transformer = TransformerEncoder(
-            embed_dim, num_heads, num_layers, mlp_ratio, dropout
+            embed_dim, num_heads, num_layers, mlp_ratio, dropout,
+            attn_logit_scale=_ls, attn_softmax=_sm,
         )
 
         # Action heads (shared across turbines)
@@ -760,8 +778,15 @@ class TransformerActor(nn.Module):
         if self.rel_pos_bias is not None:
             attn_bias = self.rel_pos_bias(positions, key_padding_mask)
 
+        # v5: local-attention mask from (rotor-diameter) positions
+        local_allow = None
+        if self.attn_local != "none":
+            local_allow = neighbour_allow_mask(
+                positions, key_padding_mask, self.attn_local,
+                radius_D=self.attn_local_radius_D, k=self.attn_local_k)
 
-        h, attn_weights = self.transformer(h, key_padding_mask, attn_bias, need_weights=need_weights)
+        h, attn_weights = self.transformer(h, key_padding_mask, attn_bias,
+                                           local_allow=local_allow, need_weights=need_weights)
 
         # Action distribution parameters
         mean = self.fc_mean(h)
@@ -952,9 +977,11 @@ class TransformerCritic(nn.Module):
         if profile_encoding is not None and profile_embed_mode == "concat":
             self.profile_proj = nn.Linear(2 * embed_dim, embed_dim)
 
-        # Transformer encoder (choose based on encoding type)
+        # Transformer encoder (+ v5 log-N scaling / local attention)
+        _ls, _sm, self.attn_local, self.attn_local_radius_D, self.attn_local_k = _read_attn_cfg(args)
         self.transformer = TransformerEncoder(
-            embed_dim, num_heads, num_layers, mlp_ratio, dropout
+            embed_dim, num_heads, num_layers, mlp_ratio, dropout,
+            attn_logit_scale=_ls, attn_softmax=_sm,
         )
 
         # Q-value head (after pooling)
@@ -1034,8 +1061,16 @@ class TransformerCritic(nn.Module):
         if self.rel_pos_bias is not None:
             attn_bias = self.rel_pos_bias(positions, key_padding_mask)
 
+        # v5: local-attention mask from (rotor-diameter) positions
+        local_allow = None
+        if self.attn_local != "none":
+            local_allow = neighbour_allow_mask(
+                positions, key_padding_mask, self.attn_local,
+                radius_D=self.attn_local_radius_D, k=self.attn_local_k)
+
         # Transformer (no need for attention weights in critic)
-        h, _ = self.transformer(h, key_padding_mask, attn_bias, need_weights=False)
+        h, _ = self.transformer(h, key_padding_mask, attn_bias,
+                                local_allow=local_allow, need_weights=False)
 
 
         # Masked mean pooling over turbines

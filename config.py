@@ -86,6 +86,14 @@ class Args:
     dropout: float = 0.0          # Dropout rate (0 for RL typically)
     pos_embed_dim: int = 32       # Dimension for positional encoding
 
+    # === v5 attention-dilution / size-generalization knobs ===
+    # Counteract softmax flattening as turbine count N grows (train small -> test large).
+    attn_logit_scale: str = "none"   # "none" | "logn" (Scalable-Softmax: scores *= softplus(s_h)*log(N))
+    attn_local: str = "none"         # "none" | "radius" | "knn" (hard local attention)
+    attn_local_radius_D: float = 10.0  # neighbour radius in rotor diameters (attn_local="radius")
+    attn_local_k: int = 5            # number of nearest neighbours (attn_local="knn")
+    attn_softmax: str = "softmax"    # "softmax" | "entmax15" (sparse; needs `entmax` pkg)
+
 
     # === Positional Encoding Settings ===
     # Options: "absolute_mlp", "relative_mlp", "relative_mlp_shared",
