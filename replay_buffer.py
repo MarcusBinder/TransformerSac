@@ -197,8 +197,10 @@ class TransformerReplayBuffer:
         raw_positions = self._raw_positions[indices]            # (B, T, 2)
         wind_directions = self._wind_directions[indices]        # (B,)
 
-        # Normalize positions by rotor diameter
-        positions_norm = raw_positions / self.rotor_diameter
+        # Normalize positions by rotor diameter. Force float32: float32 / python-float
+        # upcasts to float64 under numpy's legacy (pre-NEP50) promotion, which then
+        # crashes the float32 positional-bias MLP. The eval/agent path already casts.
+        positions_norm = (raw_positions / self.rotor_diameter).astype(np.float32)
 
         # Move wind directions to device once (reused by the wind-relative
         # transform and GPU-side profile rotation below).
