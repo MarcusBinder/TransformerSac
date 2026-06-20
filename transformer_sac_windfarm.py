@@ -1462,17 +1462,36 @@ def main():
                         debug_logger.log_actor_gradient_norms(actor, writer, global_step)
 
                     loss_accumulator['actor_loss'].append(actor_loss.item())
-                    
+
+                    # Entropy-vs-Q diagnostics (the large-farm "stay diffuse" pathology):
+                    # per-turbine log-prob is size-invariant so it is comparable across N,
+                    # and entropy_to_q_ratio shows whether the entropy term swamps the Q
+                    # term in the actor loss as farm size grows.
+                    with torch.no_grad():
+                        n_real_b = (~data["attention_mask"]).sum(dim=1).float().clamp(min=1.0)
+                        logpi_agg = log_pi.detach().float().squeeze(-1)
+                        logpi_per_turb = (logpi_agg if args.entropy_agg == "mean"
+                                          else logpi_agg / n_real_b)
+                        loss_accumulator.setdefault('logpi_per_turbine', []).append(
+                            logpi_per_turb.mean().item())
+                        loss_accumulator.setdefault('ent_term', []).append(
+                            (alpha * logpi_agg).mean().item())
+                        loss_accumulator.setdefault('q_term', []).append(
+                            min_qf_pi.detach().float().mean().item())
+                        loss_accumulator.setdefault('n_real_mean', []).append(
+                            n_real_b.mean().item())
+
                     # -------------------------------------------------------------
                     # Update Alpha (entropy coefficient)
                     # -------------------------------------------------------------
                     if args.autotune:
                         log_pi_detached = log_pi.detach()
                         
-                        # Adaptive target entropy per sample
+                        # Adaptive target entropy per sample (matched to actor.entropy_agg)
                         target_entropy_batch = compute_adaptive_target_entropy(
                             data["attention_mask"],
-                            action_dim_per_turbine
+                            action_dim_per_turbine,
+                            agg=args.entropy_agg,
                         )
                         
                         # Alpha loss
@@ -1562,6 +1581,18 @@ def main():
 
                 writer.add_scalar("losses/actor_loss", mean_actor_loss, global_step)
                 writer.add_scalar("losses/alpha", alpha, global_step)
+
+                # Entropy-scaling diagnostics (see actor-update block)
+                def _acc_mean(key):
+                    vals = loss_accumulator.get(key)
+                    return float(np.mean(vals)) if vals else 0.0
+                _ent_term = _acc_mean('ent_term')
+                _q_term = _acc_mean('q_term')
+                writer.add_scalar("entropy/logpi_per_turbine", _acc_mean('logpi_per_turbine'), global_step)
+                writer.add_scalar("entropy/actor_entropy_term", _ent_term, global_step)
+                writer.add_scalar("entropy/actor_q_term", _q_term, global_step)
+                writer.add_scalar("entropy/entropy_to_q_abs_ratio", abs(_ent_term) / (abs(_q_term) + 1e-8), global_step)
+                writer.add_scalar("entropy/n_real_mean", _acc_mean('n_real_mean'), global_step)
                 writer.add_scalar("charts/SPS", sps, global_step)
                 writer.add_scalar("charts/step_reward_mean_1000", mean_reward, global_step)
                 writer.add_scalar("debug/mean_wind_direction", float(np.mean(wind_dirs)), global_step)

@@ -89,9 +89,13 @@ class Args:
     # === v5 attention-dilution / size-generalization knobs ===
     # Counteract softmax flattening as turbine count N grows (train small -> test large).
     attn_logit_scale: str = "none"   # "none" | "logn" (Scalable-Softmax: scores *= softplus(s_h)*log(N))
-    attn_local: str = "none"         # "none" | "radius" | "knn" (hard local attention)
-    attn_local_radius_D: float = 10.0  # neighbour radius in rotor diameters (attn_local="radius")
-    attn_local_k: int = 5            # number of nearest neighbours (attn_local="knn")
+    attn_local: str = "none"         # "none" | "radius" | "knn" | "downwind" | "downwind_knn"
+                                     #   radius/knn: undirected locality (v5).
+                                     #   downwind[_knn]: v6 directed "causal wake graph" — attend only to
+                                     #   UPWIND sources inside a cone of half-angle attn_local_cone_deg.
+    attn_local_radius_D: float = 10.0  # neighbour radius in rotor diameters (radius / downwind streamwise cap)
+    attn_local_k: int = 5            # number of nearest neighbours (knn / downwind_knn)
+    attn_local_cone_deg: float = 40.0  # upwind cone half-angle in degrees (downwind / downwind_knn)
     attn_softmax: str = "softmax"    # "softmax" | "entmax15" (sparse; needs `entmax` pkg)
 
 
@@ -132,6 +136,10 @@ class Args:
     target_network_frequency: int = 1
     alpha: float = 0.2            # Initial entropy coefficient
     autotune: bool = True         # Auto-tune entropy coefficient
+    entropy_agg: str = "sum"      # Per-farm entropy aggregation over turbines: "sum"
+    # (standard SAC: log_pi summed -> O(N), target entropy -N) or "mean" (per-turbine
+    # MEAN -> O(1), target entropy -1/dim). "mean" makes the entropy regularization
+    # size-invariant so large farms are not pushed diffuse relative to the pooled farm-Q.
 
     # === Gradient Clipping ===
     grad_clip: bool = True

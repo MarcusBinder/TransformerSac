@@ -31,15 +31,29 @@ import torch.nn.functional as F
 def neighbour_allow_mask(
     positions: torch.Tensor,                 # (B, N, 2) in rotor-diameter units
     key_padding_mask: Optional[torch.Tensor],  # (B, N) True = padded
-    mode: str,                               # "radius" | "knn"
+    mode: str,                               # "radius" | "knn" | "downwind" | "downwind_knn"
     radius_D: float = 10.0,
     k: int = 5,
+    cone_deg: float = 40.0,
 ) -> torch.Tensor:
     """Return (B, N, N) bool: True where query i is ALLOWED to attend to key j.
 
     Self-attention (diagonal) is always allowed. Padded keys are never selected by
     knn (their distance is set to +inf); for radius they may pass the threshold but
     are removed later by the key_padding_mask in the attention itself.
+
+    Modes:
+      * "radius" / "knn": undirected locality (v5).
+      * "downwind" / "downwind_knn": DIRECTED "causal wake graph" (v6). Query i attends
+        key j only if j is UPWIND of i (a wake source) AND inside i's upstream cone of
+        half-angle ``cone_deg``. Encodes wake causality (wakes propagate downstream only)
+        and the upwind/downwind asymmetry. Positions are wind-relative with +x = upwind
+        (same convention as positional_encodings._bias), so rel[i,j] = pos[j] - pos[i]
+        has dx = x_j - x_i > 0 exactly when j is upwind of i.
+        "downwind"     keeps every upwind in-cone source within ``radius_D`` (streamwise cap).
+        "downwind_knn" keeps the k nearest upwind in-cone sources -> COUNT-INVARIANT local
+        structure (a turbine's neighbourhood at N=25 matches N=9; the size-generalisation
+        "d-pattern" fix, Yehudai et al. 2021).
     """
     B, N, _ = positions.shape
     dist = torch.cdist(positions, positions)  # (B, N, N)
@@ -53,6 +67,23 @@ def neighbour_allow_mask(
         idx = dd.topk(kk, dim=-1, largest=False).indices  # (B, N, kk)
         allow = torch.zeros_like(dist, dtype=torch.bool)
         allow.scatter_(-1, idx, True)
+    elif mode in ("downwind", "downwind_knn"):
+        # rel[i,j] = pos[j] - pos[i] (i = query dim 1, j = key dim 2), matching _bias.py.
+        rel = positions.unsqueeze(1) - positions.unsqueeze(2)  # (B, N, N, 2)
+        dx, dy = rel[..., 0], rel[..., 1]                      # dx>0: j upwind of i
+        tan_half = math.tan(math.radians(cone_deg))
+        in_cone = (dx > 0) & (dy.abs() <= tan_half * dx)       # j is an upwind wake source for i
+        if mode == "downwind":
+            allow = in_cone & (dist <= radius_D)
+        else:  # downwind_knn: k nearest in-cone upwind sources
+            dd = dist.masked_fill(~in_cone, float("inf"))
+            if key_padding_mask is not None:
+                dd = dd.masked_fill(key_padding_mask.unsqueeze(1), float("inf"))
+            kk = min(max(k, 1), N)
+            idx = dd.topk(kk, dim=-1, largest=False).indices   # (B, N, kk)
+            allow = torch.zeros_like(dist, dtype=torch.bool)
+            allow.scatter_(-1, idx, True)
+            allow &= torch.isfinite(dd)                        # drop padded-out topk slots when <k sources
     else:
         raise ValueError(f"unknown local mode {mode!r}")
     eye = torch.eye(N, dtype=torch.bool, device=positions.device).unsqueeze(0)

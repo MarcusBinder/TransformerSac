@@ -535,13 +535,14 @@ class TransformerEncoder(nn.Module):
 def _read_attn_cfg(args):
     """v5 attention flags from args, with backward-compatible defaults."""
     if args is None:
-        return "none", "softmax", "none", 10.0, 5
+        return "none", "softmax", "none", 10.0, 5, 40.0
     return (
         getattr(args, "attn_logit_scale", "none"),
         getattr(args, "attn_softmax", "softmax"),
         getattr(args, "attn_local", "none"),
         float(getattr(args, "attn_local_radius_D", 10.0)),
         int(getattr(args, "attn_local_k", 5)),
+        float(getattr(args, "attn_local_cone_deg", 40.0)),
     )
 
 
@@ -617,6 +618,9 @@ class TransformerActor(nn.Module):
 
         self.obs_dim_per_turbine = obs_dim_per_turbine
         self.action_dim_per_turbine = action_dim_per_turbine
+        # Entropy aggregation over turbines for the SAC log-prob ("sum" | "mean").
+        # "mean" keeps per-turbine entropy pressure size-invariant (see config.entropy_agg).
+        self.entropy_agg = getattr(args, "entropy_agg", "sum") if args is not None else "sum"
         self.embed_dim = embed_dim
         self.pos_encoding_type = pos_encoding_type
 
@@ -692,7 +696,8 @@ class TransformerActor(nn.Module):
 
 
         # Standard transformer (with optional attention bias + v5 log-N scaling / local attention)
-        _ls, _sm, self.attn_local, self.attn_local_radius_D, self.attn_local_k = _read_attn_cfg(args)
+        (_ls, _sm, self.attn_local, self.attn_local_radius_D,
+         self.attn_local_k, self.attn_local_cone_deg) = _read_attn_cfg(args)
         self.transformer = TransformerEncoder(
             embed_dim, num_heads, num_layers, mlp_ratio, dropout,
             attn_logit_scale=_ls, attn_softmax=_sm,
@@ -783,7 +788,8 @@ class TransformerActor(nn.Module):
         if self.attn_local != "none":
             local_allow = neighbour_allow_mask(
                 positions, key_padding_mask, self.attn_local,
-                radius_D=self.attn_local_radius_D, k=self.attn_local_k)
+                radius_D=self.attn_local_radius_D, k=self.attn_local_k,
+                cone_deg=self.attn_local_cone_deg)
 
         h, attn_weights = self.transformer(h, key_padding_mask, attn_bias,
                                            local_allow=local_allow, need_weights=need_weights)
@@ -846,14 +852,23 @@ class TransformerActor(nn.Module):
         log_prob = normal.log_prob(x_t)
         log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
 
-        # Mask out padded positions before summing
+        # Mask out padded positions before aggregating
         if key_padding_mask is not None:
             # key_padding_mask: (batch, n_turbines), True = padding
             mask = ~key_padding_mask.unsqueeze(-1)  # (batch, n_turb, 1), True = real
             log_prob = log_prob * mask.float()
+            n_real_dims = mask.float().sum(dim=(-2, -1)) * log_prob.shape[-1]  # (batch,) real action dims
+        else:
+            n_real_dims = log_prob.new_full(
+                (log_prob.shape[0],), float(log_prob.shape[-2] * log_prob.shape[-1])
+            )
 
-        # Sum over turbines and action dims -> (batch, 1)
-        log_prob = log_prob.sum(dim=(-2, -1), keepdim=False).unsqueeze(-1)
+        # Aggregate over turbines and action dims -> (batch, 1)
+        log_prob = log_prob.sum(dim=(-2, -1), keepdim=False)
+        if self.entropy_agg == "mean":
+            # Per-(turbine,action) MEAN: keeps entropy O(1) regardless of farm size N.
+            log_prob = log_prob / n_real_dims.clamp(min=1.0)
+        log_prob = log_prob.unsqueeze(-1)
 
         # Mean action (for logging)
         mean_action = torch.tanh(mean) * self.action_scale + self.action_bias_val
@@ -978,7 +993,8 @@ class TransformerCritic(nn.Module):
             self.profile_proj = nn.Linear(2 * embed_dim, embed_dim)
 
         # Transformer encoder (+ v5 log-N scaling / local attention)
-        _ls, _sm, self.attn_local, self.attn_local_radius_D, self.attn_local_k = _read_attn_cfg(args)
+        (_ls, _sm, self.attn_local, self.attn_local_radius_D,
+         self.attn_local_k, self.attn_local_cone_deg) = _read_attn_cfg(args)
         self.transformer = TransformerEncoder(
             embed_dim, num_heads, num_layers, mlp_ratio, dropout,
             attn_logit_scale=_ls, attn_softmax=_sm,
@@ -1066,7 +1082,8 @@ class TransformerCritic(nn.Module):
         if self.attn_local != "none":
             local_allow = neighbour_allow_mask(
                 positions, key_padding_mask, self.attn_local,
-                radius_D=self.attn_local_radius_D, k=self.attn_local_k)
+                radius_D=self.attn_local_radius_D, k=self.attn_local_k,
+                cone_deg=self.attn_local_cone_deg)
 
         # Transformer (no need for attention weights in critic)
         h, _ = self.transformer(h, key_padding_mask, attn_bias,
