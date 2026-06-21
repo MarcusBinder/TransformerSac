@@ -125,7 +125,8 @@ def main():
     
     # Parse layouts
     layout_names = [l.strip() for l in args.layouts.split(",")]
-    is_multi_layout = len(layout_names) > 1
+    dr_enabled = args.dr_n_hi is not None
+    is_multi_layout = len(layout_names) > 1 or dr_enabled
     
     # Parse evaluation layouts
     if args.eval_layouts.strip():
@@ -211,20 +212,23 @@ def main():
     
     # Create layout configurations
     print("Setting up layouts...")
-    layouts = []
-    for name in layout_names:
-        x_pos, y_pos = get_layout_positions(name, wind_turbine)
-        layout = LayoutConfig(name=name, x_pos=x_pos, y_pos=y_pos)
-        
 
+    def build_layout_config(name, x_pos, y_pos, verbose=True):
+        """Build a LayoutConfig and attach receptivity/influence profiles (if enabled).
+
+        Shared by the fixed named-layout path and the domain-randomization pool so
+        generated farms get profiles computed exactly like the hand-picked ones.
+        """
+        layout = LayoutConfig(name=name, x_pos=x_pos, y_pos=y_pos)
         if args.profile_encoding_type is not None:
             if args.profile_source.lower() == "geometric":
                 from helpers.geometric_profiles import compute_layout_profiles_vectorized
-                
+
                 # Get rotor diameter as a float (geometric version doesn't need the full WT object)
                 D = wind_turbine.diameter()  # or however DTU10MW exposes this
-                
-                print(f"Computing GEOMETRIC profiles for layout: {name}")
+
+                if verbose:
+                    print(f"Computing GEOMETRIC profiles for layout: {name}")
                 receptivity_profiles, influence_profiles = compute_layout_profiles_vectorized(
                     x_pos, y_pos,
                     rotor_diameter=D,
@@ -234,7 +238,8 @@ def main():
                     scale_factor=15.0,
                 )
             elif args.profile_source.lower() == "pywake":
-                print(f"Computing PyWake profiles for layout: {name}")
+                if verbose:
+                    print(f"Computing PyWake profiles for layout: {name}")
                 receptivity_profiles, influence_profiles = compute_layout_profiles(
                     x_pos, y_pos, wind_turbine,
                     n_directions=args.n_profile_directions,
@@ -244,11 +249,38 @@ def main():
                     f"Unknown profile_source: {args.profile_source}. "
                     f"Use 'pywake' or 'geometric'."
                 )
-            
+
             layout.receptivity_profiles = receptivity_profiles  # (n_turbines, n_directions
             layout.influence_profiles = influence_profiles      # (n_turbines, n_directions
-            
-        layouts.append(layout)
+        return layout
+
+    layouts = []
+    if dr_enabled:
+        # Domain randomization (v8): training layouts are a large procedurally
+        # generated pool instead of the fixed named set. Pool seeded from --seed so
+        # different seeds draw different layout sets. See helpers/layout_gen.py.
+        from helpers.layout_gen import generate_layout_pool
+        print(f"Domain randomization: generating {args.dr_pool_size} layouts "
+              f"with n in [{args.dr_n_lo}, {args.dr_n_hi}] (seed={args.seed})...")
+        pool = generate_layout_pool(
+            pool_size=args.dr_pool_size,
+            n_lo=args.dr_n_lo,
+            n_hi=args.dr_n_hi,
+            D=wind_turbine.diameter(),
+            seed=args.seed,
+            min_dist_D=args.dr_min_dist_D,
+            screen_headroom=args.dr_screen_headroom,
+            min_involved_frac=args.dr_min_involved_frac,
+        )
+        for name, x_pos, y_pos in pool:
+            layouts.append(build_layout_config(name, x_pos, y_pos, verbose=False))
+        layout_names = [l.name for l in layouts]
+        print(f"  generated {len(layouts)} layouts; "
+              f"turbine counts {min(l.n_turbines for l in layouts)}..{max(l.n_turbines for l in layouts)}")
+    else:
+        for name in layout_names:
+            x_pos, y_pos = get_layout_positions(name, wind_turbine)
+            layouts.append(build_layout_config(name, x_pos, y_pos))
 
     if args.profile_encoding_type is not None:
         use_profiles = True
@@ -358,6 +390,7 @@ def main():
                 per_turbine_wrapper=combined_wrapper,  # Use combined wrapper
                 seed=seed,
                 shuffle=args.shuffle_turbs,  # Shuffle turbines within each layout
+                max_turbines=args.max_turbines,  # fixed padding/network size (DR: eval up to 25)
                 max_episode_steps=args.max_episode_steps,
                 warmup_episode_steps=warmup_steps,
             )
@@ -443,9 +476,14 @@ def main():
     # DEBUG LOGGER AND TRACKING SETUP
     # =========================================================================
 
-    # Initialize debug logger with configurable frequencies
+    # Initialize debug logger with configurable frequencies.
+    # Under domain randomization the training pool is huge (e.g. 2048 layouts), so
+    # per-layout debug stats are meaningless and would bloat the logger / W&B; bucket
+    # all DR training steps under a single "dr_pool" name. Per-layout EVAL metrics
+    # (the ones we analyse) come from the evaluator on the fixed eval ladder.
+    debug_layout_names = ["dr_pool"] if dr_enabled else layout_names
     debug_logger = create_debug_logger(
-        layout_names=layout_names,
+        layout_names=debug_layout_names,
         log_every=250000,  # Base frequency - others are multiples of this
     )
     # Frequencies will be:
@@ -455,7 +493,7 @@ def main():
     #   - q-value stats: every 50 steps
     #   - diagnostic print: every 2000 steps
 
-    print(f"Debug logger initialized for layouts: {layout_names}")
+    print(f"Debug logger initialized for layouts: {debug_layout_names}")
     print(f"  Attention logging every {debug_logger.attention_log_frequency} steps")
     print(f"  Gradient logging every {debug_logger.gradient_log_frequency} steps")
     
@@ -468,7 +506,9 @@ def main():
             config=vars(args) | {
                 # Debug/multi-layout config
                 "debug/n_layouts": len(layout_names),
-                "debug/layout_names": layout_names,
+                # Under DR the pool is huge; log a compact summary instead of 2048 names.
+                "debug/layout_names": (f"dr_pool[{args.dr_n_lo}-{args.dr_n_hi}]x{len(layout_names)}"
+                                       if dr_enabled else layout_names),
                 "debug/is_multi_layout": is_multi_layout,
                 "debug/max_turbines": n_turbines_max,
                 "debug/log_frequency": debug_logger.log_frequency,
@@ -1183,8 +1223,12 @@ def main():
             timing["env"] += time.perf_counter() - _t0
 
 
-        # Get current layout names for each env
-        current_layouts = get_env_current_layout(envs)
+        # Get current layout names for each env. Under domain randomization the pool
+        # is huge, so bucket every training layout under "dr_pool" for debug stats.
+        if dr_enabled:
+            current_layouts = ["dr_pool"] * args.num_envs
+        else:
+            current_layouts = get_env_current_layout(envs)
 
         # Log per-step data to debug tracker (always - internal deques handle storage)
         for i in range(args.num_envs):

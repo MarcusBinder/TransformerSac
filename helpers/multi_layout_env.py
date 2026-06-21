@@ -121,6 +121,7 @@ class MultiLayoutEnv(gym.Env):
         
         # Initialize with first layout to get observation dimensions
         self.current_layout: LayoutConfig = layouts[0]
+        self._current_layout_index: int = 0  # cached; kept in sync by reset()
         self._current_env: Optional[gym.Env] = None
         self._create_env(self.current_layout)
         
@@ -361,11 +362,8 @@ class MultiLayoutEnv(gym.Env):
     
     @property
     def current_layout_index(self) -> int:
-        """Index of current layout in self.layouts list."""
-        for i, layout in enumerate(self.layouts):
-            if layout.name == self.current_layout.name:
-                return i
-        raise ValueError(f"Current layout '{self.current_layout.name}' not found in layouts list")
+        """Index of current layout in self.layouts list (O(1), cached by reset())."""
+        return self._current_layout_index
 
     @property
     def n_turbines(self) -> int:
@@ -605,8 +603,11 @@ class MultiLayoutEnv(gym.Env):
             layout_idx = options['layout_index']
             new_layout = self.layouts[layout_idx]
         else:
-            # Randomly sample a layout
-            new_layout = self.layout_rng.choice(self.layouts)
+            # Randomly sample a layout (sample the index so we can cache it O(1) —
+            # current_layout_index is read every step and the DR pool can be large)
+            layout_idx = int(self.layout_rng.integers(len(self.layouts)))
+            new_layout = self.layouts[layout_idx]
+        self._current_layout_index = layout_idx
 
         # Only reinitialize if layout changed (optimization for single-layout case)
         if new_layout.name != self.current_layout.name:

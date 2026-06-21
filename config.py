@@ -71,6 +71,23 @@ class Args:
     # === Layout Settings ===
     # Comma-separated list of layouts. Single = single-layout, Multiple = multi-layout
     layouts: str = "test_layout"  # e.g., "square_1,square_2,circular_1"
+    # Override padding / network size (max turbines). None = derive from layout pool.
+    # Required for domain randomization so every config's network is sized for the
+    # largest farm it must EVALUATE on (e.g. 25), regardless of training-pool size.
+    max_turbines: Optional[int] = None
+
+    # === Domain-Randomization (v8) ===
+    # When dr_n_hi is set, training layouts are a procedurally-generated pool of
+    # dr_pool_size irregular farms (min-spacing rejection sampling, like v4_irreg),
+    # each episode sampling turbine count n ~ Uniform[dr_n_lo, dr_n_hi]. Replaces the
+    # frozen named-layout pool to test whether layout DIVERSITY (not architecture or
+    # entropy) unlocks large-farm learning. Pool is seeded from --seed so seeds differ.
+    dr_n_lo: Optional[int] = None    # lower turbine-count bound (inclusive)
+    dr_n_hi: Optional[int] = None    # upper turbine-count bound (inclusive); None = DR off
+    dr_pool_size: int = 2048         # number of distinct layouts generated per run
+    dr_min_dist_D: float = 3.0       # minimum turbine spacing in rotor diameters
+    dr_screen_headroom: bool = True  # reject generated layouts with no wake-steering headroom
+    dr_min_involved_frac: float = 0.5  # min fraction of turbines in a wake interaction to keep a layout
 
     # === Observation Settings ===
     history_length: int = 15            # Number of timesteps of history per feature
