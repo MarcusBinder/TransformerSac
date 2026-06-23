@@ -157,6 +157,13 @@ class Args:
     # (standard SAC: log_pi summed -> O(N), target entropy -N) or "mean" (per-turbine
     # MEAN -> O(1), target entropy -1/dim). "mean" makes the entropy regularization
     # size-invariant so large farms are not pushed diffuse relative to the pooled farm-Q.
+    critic_agg: str = "pool"      # Critic aggregation over turbines (v9): "pool" (standard:
+    # masked-MEAN of turbine embeddings -> single farm-Q; per-turbine policy gradient ~1/N)
+    # or "vdn" (value decomposition: per-turbine q_head -> masked-SUM -> farm-Q; removes the
+    # structural 1/N so each turbine gets an un-diluted gradient). Pairs with entropy_agg="sum".
+    reward_scale: float = 1.0    # Multiply the env reward by this (v9.1 probe). The Wake_recovery
+    # reward is tiny (~0.02-0.10/step) -> small Q -> small gradients; scaling tests signal-to-noise.
+    # Applied via a gymnasium reward wrapper in combined_wrapper; 1.0 = no change.
 
     # === Gradient Clipping ===
     grad_clip: bool = True

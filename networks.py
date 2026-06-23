@@ -933,6 +933,8 @@ class TransformerCritic(nn.Module):
         self.profile_encoding = profile_encoding
         self.profile_fusion_type = profile_fusion_type
         self.profile_embed_mode = profile_embed_mode
+        # v9: "pool" (masked-mean embeddings -> farm-Q) or "vdn" (per-turbine q_head -> masked-sum).
+        self.critic_agg = getattr(args, "critic_agg", "pool") if args is not None else "pool"
 
         # Create positional encoding modules based on type
         self.pos_encoder, self.rel_pos_bias, self.embedding_mode = \
@@ -1090,18 +1092,26 @@ class TransformerCritic(nn.Module):
                                 local_allow=local_allow, need_weights=False)
 
 
-        # Masked mean pooling over turbines
-        if key_padding_mask is not None:
-            mask = ~key_padding_mask.unsqueeze(-1)  # (batch, n_turb, 1), True = real
-            h = h * mask.float()
-            h_sum = h.sum(dim=1)  # (batch, embed_dim)
-            n_real = mask.float().sum(dim=1).clamp(min=1)  # (batch, 1)
-            h_pooled = h_sum / n_real
+        if self.critic_agg == "vdn":
+            # v9 value decomposition: per-turbine Q-head, then masked-SUM over turbines.
+            # q_head applies to the last dim, so it broadcasts over (batch, n_turb, embed).
+            # Padded turbines' embeddings are non-zero, so zero their per-turbine Q before summing.
+            q_per = self.q_head(h)  # (batch, n_turb, q_out)  [q_out=1 for SAC, n_quantiles for TQC]
+            if key_padding_mask is not None:
+                valid = (~key_padding_mask).unsqueeze(-1).float()  # (batch, n_turb, 1)
+                q_per = q_per * valid
+            q = q_per.sum(dim=1)  # (batch, q_out) — un-diluted per-turbine credit
         else:
-            h_pooled = h.mean(dim=1)  # (batch, embed_dim)
-
-        # Q-value
-        q = self.q_head(h_pooled)  # (batch, 1)
+            # "pool" (standard): masked-mean of turbine embeddings -> single farm-Q.
+            if key_padding_mask is not None:
+                mask = ~key_padding_mask.unsqueeze(-1)  # (batch, n_turb, 1), True = real
+                h = h * mask.float()
+                h_sum = h.sum(dim=1)  # (batch, embed_dim)
+                n_real = mask.float().sum(dim=1).clamp(min=1)  # (batch, 1)
+                h_pooled = h_sum / n_real
+            else:
+                h_pooled = h.mean(dim=1)  # (batch, embed_dim)
+            q = self.q_head(h_pooled)  # (batch, 1)
 
         return q
 

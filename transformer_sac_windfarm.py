@@ -379,6 +379,10 @@ def main():
         env = PerTurbineObservationWrapper(env)
         if args.use_wd_deviation:
             env = EnhancedPerTurbineWrapper(env, wd_scale_range=args.wd_scale_range)
+        # v9.1: scale the (tiny) Wake_recovery reward to probe optimization signal-to-noise.
+        if args.reward_scale != 1.0:
+            _scale = float(args.reward_scale)
+            env = gym.wrappers.TransformReward(env, lambda r: r * _scale)
         return env
     
     def make_env_fn(seed, warmup_steps=None):
