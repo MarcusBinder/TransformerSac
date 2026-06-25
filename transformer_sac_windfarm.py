@@ -1087,31 +1087,97 @@ def main():
     # Shapes are static (padded max_turbines, fixed batch_size); the rare
     # logging/eval calls with other batch sizes just trigger a one-time recompile.
     # =========================================================================
+    # Full-step-compile handles (populated only under --compile_update, SAC). When set,
+    # the update loop calls these instead of the eager critic/actor blocks.
+    next_action_fn = None
+    critic_loss_fn = None
+    actor_loss_fn = None
+
     if args.compile:
-        print("Compiling network forward passes with torch.compile (first steps are slow)...")
+        _full_update_compile = args.compile_update and args.algorithm == "sac"
 
-        def _compile_forward(module):
-            if module is not None:
-                # reduce-overhead (CUDA graphs) collapses the many tiny kernel launches
-                # of this small/short-sequence model into one replay -- the dominant
-                # cost for a launch-bound update loop. Requires the hot loop to be
-                # sync-free (see GPU-side loss accumulation) and the held critic
-                # outputs to be .clone()'d (shared CUDA-graph buffer pool).
-                # NOTE: must be consistent across ALL compiled forwards -- mixing
-                # reduce-overhead with a plain-compiled module corrupts the
-                # CUDA-graph-trees allocator. (A vmap-ensembled critic was tried and
-                # was ~2x SLOWER here, so we keep separate critics.)
-                module.forward = torch.compile(module.forward, mode="reduce-overhead")
+        if _full_update_compile:
+            # --- Full-step compile (SAC): compile the loss-PRODUCING functions, not just
+            # the forwards. torch.compile traces forward and AOTAutograd graphs the
+            # BACKWARD too, so both collapse into reduce-overhead CUDA-graph replays -- the
+            # backward was the dominant remaining eager cost on this launch-bound loop.
+            # optimizer.step() stays eager (fused Adam). This is all-or-nothing for SAC:
+            # the qf/actor modules are intentionally NOT per-forward-compiled here, so every
+            # call site (critic loss AND actor loss) must live inside a compiled function.
+            # Assumes --amp off (true on Turing); the closures don't autocast.
+            if args.amp:
+                print("WARNING: --compile_update ignores --amp (bf16 is slower on Turing anyway).")
+            print("Compiling full SAC update (forward+backward) with torch.compile reduce-overhead...")
+            _gamma = args.gamma
 
-        _compile_forward(actor)
-        if args.algorithm == "tqc":
-            _compile_forward(tqc_critic)
-            _compile_forward(tqc_critic_target)
+            def _next_action(next_obs, positions, mask, recep, infl):
+                with torch.no_grad():
+                    a, logp, _, _ = actor.get_action(
+                        next_obs, positions, mask,
+                        recep_profile=recep, influence_profile=infl,
+                    )
+                return a, logp
+
+            def _critic_loss(obs, actions, next_obs, positions, mask, recep, infl,
+                             rewards, dones, alpha, next_actions, next_log_pi):
+                # Target (no grad) + online forwards + MSE -- mirrors the eager block.
+                # No .clone() needed: one graph owns its buffers.
+                with torch.no_grad():
+                    qf1_next = qf1_target(next_obs, next_actions, positions, mask,
+                                          recep_profile=recep, influence_profile=infl)
+                    qf2_next = qf2_target(next_obs, next_actions, positions, mask,
+                                          recep_profile=recep, influence_profile=infl)
+                    min_qf_next = torch.min(qf1_next, qf2_next) - alpha * next_log_pi
+                    target_q = rewards + (1.0 - dones) * _gamma * min_qf_next
+                qf1_value = qf1(obs, actions, positions, mask,
+                                recep_profile=recep, influence_profile=infl)
+                qf2_value = qf2(obs, actions, positions, mask,
+                                recep_profile=recep, influence_profile=infl)
+                qf1_loss = F.mse_loss(qf1_value.float(), target_q)
+                qf2_loss = F.mse_loss(qf2_value.float(), target_q)
+                qf_loss = qf1_loss + qf2_loss
+                return (qf_loss, qf1_loss.detach(), qf2_loss.detach(),
+                        qf1_value.detach(), qf2_value.detach(), target_q)
+
+            def _actor_loss(obs, positions, mask, recep, infl, alpha):
+                actions_pi, log_pi, _, _ = actor.get_action(
+                    obs, positions, mask, recep_profile=recep, influence_profile=infl)
+                qf1_pi = qf1(obs, actions_pi, positions, mask,
+                             recep_profile=recep, influence_profile=infl)
+                qf2_pi = qf2(obs, actions_pi, positions, mask,
+                             recep_profile=recep, influence_profile=infl)
+                min_qf_pi = torch.min(qf1_pi, qf2_pi)
+                actor_loss = (alpha * log_pi.float() - min_qf_pi.float()).mean()
+                return actor_loss, log_pi.detach(), min_qf_pi.detach()
+
+            next_action_fn = torch.compile(_next_action, mode="reduce-overhead")
+            critic_loss_fn = torch.compile(_critic_loss, mode="reduce-overhead")
+            actor_loss_fn = torch.compile(_actor_loss, mode="reduce-overhead")
         else:
-            _compile_forward(qf1)
-            _compile_forward(qf2)
-            _compile_forward(qf1_target)
-            _compile_forward(qf2_target)
+            print("Compiling network forward passes with torch.compile (first steps are slow)...")
+
+            def _compile_forward(module):
+                if module is not None:
+                    # reduce-overhead (CUDA graphs) collapses the many tiny kernel launches
+                    # of this small/short-sequence model into one replay -- the dominant
+                    # cost for a launch-bound update loop. Requires the hot loop to be
+                    # sync-free (see GPU-side loss accumulation) and the held critic
+                    # outputs to be .clone()'d (shared CUDA-graph buffer pool).
+                    # NOTE: must be consistent across ALL compiled forwards -- mixing
+                    # reduce-overhead with a plain-compiled module corrupts the
+                    # CUDA-graph-trees allocator. (A vmap-ensembled critic was tried and
+                    # was ~2x SLOWER here, so we keep separate critics.)
+                    module.forward = torch.compile(module.forward, mode="reduce-overhead")
+
+            _compile_forward(actor)
+            if args.algorithm == "tqc":
+                _compile_forward(tqc_critic)
+                _compile_forward(tqc_critic_target)
+            else:
+                _compile_forward(qf1)
+                _compile_forward(qf2)
+                _compile_forward(qf1_target)
+                _compile_forward(qf2_target)
 
     print(f"\nStarting training for {args.total_timesteps} timesteps...")
     print(f"UTD ratio: {args.utd_ratio} (gradient updates per env step)")
@@ -1369,15 +1435,26 @@ def main():
                 # -----------------------------------------------------------------
                 # Update Critics
                 # -----------------------------------------------------------------
-                with torch.no_grad(), amp_ctx:
-                    # Get next actions from current policy
-                    next_actions, next_log_pi, _, _ = actor.get_action(
-                        data["next_observations"],
-                        data["positions"],
-                        batch_mask,
-                        recep_profile=batch_receptivity,
-                        influence_profile=batch_influence,
+                if critic_loss_fn is not None:
+                    # Full-step compile (SAC): target-policy action from the compiled graph.
+                    # .clone() the outputs before they cross into the separate _critic_loss
+                    # graph -- otherwise reduce-overhead may flag/overwrite the shared buffer.
+                    next_actions, next_log_pi = next_action_fn(
+                        data["next_observations"], data["positions"], batch_mask,
+                        batch_receptivity, batch_influence,
                     )
+                    next_actions = next_actions.clone()
+                    next_log_pi = next_log_pi.clone()
+                else:
+                    with torch.no_grad(), amp_ctx:
+                        # Get next actions from current policy
+                        next_actions, next_log_pi, _, _ = actor.get_action(
+                            data["next_observations"],
+                            data["positions"],
+                            batch_mask,
+                            recep_profile=batch_receptivity,
+                            influence_profile=batch_influence,
+                        )
 
                 if args.algorithm == "tqc":
                     # --- TQC critic update ---
@@ -1430,51 +1507,79 @@ def main():
                     loss_accumulator['qf_loss'] += qf_loss.detach()
                     n_critic_updates += 1
                 else:
-                    # --- SAC critic update ---
-                    with torch.no_grad(), amp_ctx:
-                        # .clone() each critic output: under reduce-overhead the compiled
-                        # critics share one CUDA-graph buffer pool, so a held output is
-                        # overwritten by the next critic call before it is consumed.
-                        qf1_next = qf1_target(
-                            data["next_observations"], next_actions,
-                            data["positions"], batch_mask,
-                            recep_profile=batch_receptivity,
-                            influence_profile=batch_influence,
-                        ).clone()
-                        qf2_next = qf2_target(
-                            data["next_observations"], next_actions,
-                            data["positions"], batch_mask,
-                            recep_profile=batch_receptivity,
-                            influence_profile=batch_influence,
-                        ).clone()
-                        min_qf_next = torch.min(qf1_next, qf2_next) - alpha * next_log_pi
-                        target_q = data["rewards"] + (1 - data["dones"]) * args.gamma * min_qf_next
-
-                    with amp_ctx:
-                        # .clone(): see target-critic note above (shared CUDA-graph pool).
-                        qf1_value = qf1(data["observations"], data["actions"],
-                                        data["positions"], batch_mask,
-                                        recep_profile=batch_receptivity,
-                                        influence_profile=batch_influence).clone()
-                        qf2_value = qf2(data["observations"], data["actions"],
-                                        data["positions"], batch_mask,
-                                        recep_profile=batch_receptivity,
-                                        influence_profile=batch_influence).clone()
-
+                    # --- SAC critic update --- (compiled and eager paths share the
+                    #     optimizer tail below; both must produce qf_loss/qf1_loss/qf2_loss.)
+                    if critic_loss_fn is not None:
+                        # Full-step compiled: one graphed call does targets (no_grad) +
+                        # online forwards + loss; AOTAutograd graphs the matching backward
+                        # when qf_loss.backward() runs in the shared tail.
+                        (qf_loss, qf1_loss, qf2_loss,
+                         qf1_value, qf2_value, target_q) = critic_loss_fn(
+                            data["observations"], data["actions"], data["next_observations"],
+                            data["positions"], batch_mask, batch_receptivity, batch_influence,
+                            data["rewards"], data["dones"], alpha, next_actions, next_log_pi,
+                        )
+                        # qf{1,2}_loss are folded into loss_accumulator AFTER qf_loss.backward()
+                        # in the shared tail -> clone off the static buffer first. qf_loss itself
+                        # is NOT cloned (it must stay graph-connected for backward).
+                        qf1_loss = qf1_loss.clone()
+                        qf2_loss = qf2_loss.clone()
                         if debug_logger.should_log_q_values(total_gradient_steps):
+                            # Returned tensors alias reduce-overhead static buffers -> clone
+                            # before the next compiled call can overwrite them.
                             debug_logger.log_q_value_stats(
-                                qf1_values=qf1_value,
-                                qf2_values=qf2_value,
-                                target_q=target_q,
+                                qf1_values=qf1_value.clone(),
+                                qf2_values=qf2_value.clone(),
+                                target_q=target_q.clone(),
                                 writer=writer,
                                 global_step=global_step,
                             )
+                    else:
+                        with torch.no_grad(), amp_ctx:
+                            # .clone() each critic output: under reduce-overhead the compiled
+                            # critics share one CUDA-graph buffer pool, so a held output is
+                            # overwritten by the next critic call before it is consumed.
+                            qf1_next = qf1_target(
+                                data["next_observations"], next_actions,
+                                data["positions"], batch_mask,
+                                recep_profile=batch_receptivity,
+                                influence_profile=batch_influence,
+                            ).clone()
+                            qf2_next = qf2_target(
+                                data["next_observations"], next_actions,
+                                data["positions"], batch_mask,
+                                recep_profile=batch_receptivity,
+                                influence_profile=batch_influence,
+                            ).clone()
+                            min_qf_next = torch.min(qf1_next, qf2_next) - alpha * next_log_pi
+                            target_q = data["rewards"] + (1 - data["dones"]) * args.gamma * min_qf_next
 
-                        # Losses in fp32 for stability
-                        qf1_loss = F.mse_loss(qf1_value.float(), target_q)
-                        qf2_loss = F.mse_loss(qf2_value.float(), target_q)
-                        qf_loss = qf1_loss + qf2_loss
+                        with amp_ctx:
+                            # .clone(): see target-critic note above (shared CUDA-graph pool).
+                            qf1_value = qf1(data["observations"], data["actions"],
+                                            data["positions"], batch_mask,
+                                            recep_profile=batch_receptivity,
+                                            influence_profile=batch_influence).clone()
+                            qf2_value = qf2(data["observations"], data["actions"],
+                                            data["positions"], batch_mask,
+                                            recep_profile=batch_receptivity,
+                                            influence_profile=batch_influence).clone()
 
+                            if debug_logger.should_log_q_values(total_gradient_steps):
+                                debug_logger.log_q_value_stats(
+                                    qf1_values=qf1_value,
+                                    qf2_values=qf2_value,
+                                    target_q=target_q,
+                                    writer=writer,
+                                    global_step=global_step,
+                                )
+
+                            # Losses in fp32 for stability
+                            qf1_loss = F.mse_loss(qf1_value.float(), target_q)
+                            qf2_loss = F.mse_loss(qf2_value.float(), target_q)
+                            qf_loss = qf1_loss + qf2_loss
+
+                    # Shared SAC critic optimizer step (compiled & eager).
                     q_optimizer.zero_grad(set_to_none=True)
                     qf_loss.backward()
                     if args.grad_clip:
@@ -1499,41 +1604,50 @@ def main():
                 # -----------------------------------------------------------------
                 if total_gradient_steps % args.policy_frequency == 0:
                     _t_actor = _sync_timer()
-                    # Get actions from current policy + Q-values (under AMP autocast)
-                    with amp_ctx:
-                        actions_pi, log_pi, _, _ = actor.get_action(
+                    if actor_loss_fn is not None:
+                        # Full-step compiled (SAC): get_action + qf forwards + policy loss in
+                        # one graph; AOTAutograd graphs the actor backward. log_pi/min_qf_pi
+                        # come back detached (only used by the diagnostics/alpha blocks below).
+                        actor_loss, log_pi, min_qf_pi = actor_loss_fn(
                             data["observations"], data["positions"], batch_mask,
-                            recep_profile=batch_receptivity,
-                            influence_profile=batch_influence,
+                            batch_receptivity, batch_influence, alpha,
                         )
-
-                        # Q-values for policy actions
-                        if args.algorithm == "tqc":
-                            all_q = tqc_critic(
-                                data["observations"], actions_pi,
-                                data["positions"], batch_mask,
+                    else:
+                        # Get actions from current policy + Q-values (under AMP autocast)
+                        with amp_ctx:
+                            actions_pi, log_pi, _, _ = actor.get_action(
+                                data["observations"], data["positions"], batch_mask,
                                 recep_profile=batch_receptivity,
                                 influence_profile=batch_influence,
-                            )  # (n_critics, batch, n_quantiles)
-                            batch_size_cur = data["rewards"].shape[0]
-                            all_q_flat = all_q.permute(1, 0, 2).reshape(batch_size_cur, -1)
-                            sorted_q, _ = all_q_flat.sort(dim=1)
-                            n_keep = args.tqc_n_critics * args.tqc_n_quantiles - args.tqc_top_quantiles_to_drop
-                            min_qf_pi = sorted_q[:, :n_keep].mean(dim=1, keepdim=True)
-                        else:
-                            # .clone(): see target-critic note above (shared CUDA-graph pool).
-                            qf1_pi = qf1(data["observations"], actions_pi, data["positions"],
-                                         batch_mask,
-                                         recep_profile=batch_receptivity,
-                                         influence_profile=batch_influence).clone()
-                            qf2_pi = qf2(data["observations"], actions_pi, data["positions"],
-                                         batch_mask,
-                                         recep_profile=batch_receptivity,
-                                         influence_profile=batch_influence).clone()
-                            min_qf_pi = torch.min(qf1_pi, qf2_pi)
+                            )
 
-                        # Policy loss (maximize Q - alpha * entropy), fp32 for stability
-                        actor_loss = (alpha * log_pi.float() - min_qf_pi.float()).mean()
+                            # Q-values for policy actions
+                            if args.algorithm == "tqc":
+                                all_q = tqc_critic(
+                                    data["observations"], actions_pi,
+                                    data["positions"], batch_mask,
+                                    recep_profile=batch_receptivity,
+                                    influence_profile=batch_influence,
+                                )  # (n_critics, batch, n_quantiles)
+                                batch_size_cur = data["rewards"].shape[0]
+                                all_q_flat = all_q.permute(1, 0, 2).reshape(batch_size_cur, -1)
+                                sorted_q, _ = all_q_flat.sort(dim=1)
+                                n_keep = args.tqc_n_critics * args.tqc_n_quantiles - args.tqc_top_quantiles_to_drop
+                                min_qf_pi = sorted_q[:, :n_keep].mean(dim=1, keepdim=True)
+                            else:
+                                # .clone(): see target-critic note above (shared CUDA-graph pool).
+                                qf1_pi = qf1(data["observations"], actions_pi, data["positions"],
+                                             batch_mask,
+                                             recep_profile=batch_receptivity,
+                                             influence_profile=batch_influence).clone()
+                                qf2_pi = qf2(data["observations"], actions_pi, data["positions"],
+                                             batch_mask,
+                                             recep_profile=batch_receptivity,
+                                             influence_profile=batch_influence).clone()
+                                min_qf_pi = torch.min(qf1_pi, qf2_pi)
+
+                            # Policy loss (maximize Q - alpha * entropy), fp32 for stability
+                            actor_loss = (alpha * log_pi.float() - min_qf_pi.float()).mean()
 
                     # Update actor
                     actor_optimizer.zero_grad(set_to_none=True)

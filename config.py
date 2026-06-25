@@ -174,6 +174,10 @@ class Args:
     # === Performance / Speed ===
     amp: bool = False        # Enable bfloat16 autocast (AMP) around the gradient updates
     compile: bool = False    # torch.compile the network forward passes (static shapes)
+    compile_update: bool = False  # (SAC only, requires --compile) compile the WHOLE update step
+                                  # (forward+loss) so AOTAutograd also graphs the backward pass --
+                                  # the dominant eager cost on the launch-bound update loop. Replaces
+                                  # per-forward compile for SAC; assumes --amp off.
     log_timing: bool = False  # Log a wall-clock breakdown (env step / sample / critic / actor) to TensorBoard
 
     # === Fine-tuning / Resume Settings ===
