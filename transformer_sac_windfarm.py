@@ -87,6 +87,7 @@ from helpers.eval_utils import PolicyEvaluator, run_evaluation
 from networks import (
     TransformerActor,
     TransformerCritic,
+    EnsembleCritic,
     TransformerTQCCritic,
     create_profile_encoding,
     quantile_huber_loss,
@@ -711,6 +712,7 @@ def main():
 
     # Initialize critic variables (some will be None depending on algorithm)
     qf1 = qf2 = qf1_target = qf2_target = None
+    qf_ens = qf_ens_target = None
     tqc_critic = tqc_critic_target = None
     taus = None
 
@@ -738,14 +740,17 @@ def main():
         print(f"Actor parameters: {actor_params:,}")
         print(f"TQC Critic parameters: {critic_params:,} ({args.tqc_n_critics} critics x {args.tqc_n_quantiles} quantiles)")
     else:
-        # SAC: standard dual-critic setup (DroQ regularization applied via critic_kwargs if enabled)
-        qf1 = TransformerCritic(**critic_kwargs).to(device)
-        qf2 = TransformerCritic(**critic_kwargs).to(device)
-        qf1_target = TransformerCritic(**critic_kwargs).to(device)
-        qf2_target = TransformerCritic(**critic_kwargs).to(device)
+        # SAC: dual critics packaged in an EnsembleCritic so both run as ONE vmapped
+        # batched forward (halves critic kernel launches; numerics-identical). qf1/qf2
+        # alias the sub-critics, so checkpoint/optimizer/soft_update/logging that
+        # reference them keep working unchanged; only the forward calls go through
+        # the ensemble. (DroQ regularization still applied via critic_kwargs.)
+        qf_ens = EnsembleCritic(2, **critic_kwargs).to(device)
+        qf_ens_target = EnsembleCritic(2, **critic_kwargs).to(device)
+        qf_ens_target.load_state_dict(qf_ens.state_dict())
 
-        qf1_target.load_state_dict(qf1.state_dict())
-        qf2_target.load_state_dict(qf2.state_dict())
+        qf1, qf2 = qf_ens.critics[0], qf_ens.critics[1]
+        qf1_target, qf2_target = qf_ens_target.critics[0], qf_ens_target.critics[1]
 
         qf1_params = get_critic_params_excluding_shared(qf1, shared_recep_encoder, shared_influence_encoder)
         qf2_params = get_critic_params_excluding_shared(qf2, shared_recep_encoder, shared_influence_encoder)
@@ -1080,23 +1085,31 @@ def main():
     if args.compile:
         print("Compiling network forward passes with torch.compile (first steps are slow)...")
 
-        def _compile_forward(module):
+        def _compile_forward(module, mode="reduce-overhead"):
             if module is not None:
                 # reduce-overhead (CUDA graphs) collapses the many tiny kernel
                 # launches of this small/short-sequence model into one replay --
                 # the dominant cost for a launch-bound update loop. Requires the
                 # hot loop to be sync-free (see GPU-side loss accumulation below).
-                module.forward = torch.compile(module.forward, mode="reduce-overhead")
+                # TODO(speed): the "CUDA Graph is empty" warnings on cluster runs
+                # suggest reduce-overhead may not actually be engaging. A/B it vs
+                # plain torch.compile (mode=None) -- if critic/actor timings match,
+                # drop reduce-overhead AND the actor .clone() guards it forced.
+                if mode is None:
+                    module.forward = torch.compile(module.forward)
+                else:
+                    module.forward = torch.compile(module.forward, mode=mode)
 
         _compile_forward(actor)
         if args.algorithm == "tqc":
             _compile_forward(tqc_critic)
             _compile_forward(tqc_critic_target)
         else:
-            _compile_forward(qf1)
-            _compile_forward(qf2)
-            _compile_forward(qf1_target)
-            _compile_forward(qf2_target)
+            # Plain compile (mode=None) for the ensemble: its vmap + functional_call
+            # path with CUDA graphs is untested, and the launch win already comes
+            # from the vmap batching itself, not from graphs.
+            _compile_forward(qf_ens, mode=None)
+            _compile_forward(qf_ens_target, mode=None)
 
     print(f"\nStarting training for {args.total_timesteps} timesteps...")
     print(f"UTD ratio: {args.utd_ratio} (gradient updates per env step)")
@@ -1131,10 +1144,8 @@ def main():
     if args.use_droq:
         if tqc_critic_target is not None:
             tqc_critic_target.eval()
-        if qf1_target is not None:
-            qf1_target.eval()
-        if qf2_target is not None:
-            qf2_target.eval()
+        if qf_ens_target is not None:
+            qf_ens_target.eval()  # eval propagates to sub-critics + functional_call base
 
     start_time = time.time()
     global_step = start_step  # Start from checkpoint step if resuming, else 0
@@ -1417,34 +1428,23 @@ def main():
                 else:
                     # --- SAC critic update ---
                     with torch.no_grad(), amp_ctx:
-                        # .clone() each critic output: under reduce-overhead the compiled
-                        # critics share one CUDA-graph buffer pool, so a held output is
-                        # overwritten by the next critic call before it is consumed.
-                        qf1_next = qf1_target(
+                        # Both target critics in ONE batched pass -> (2, B, 1).
+                        qf_next = qf_ens_target(
                             data["next_observations"], next_actions,
                             data["positions"], batch_mask,
                             recep_profile=batch_receptivity,
                             influence_profile=batch_influence,
-                        ).clone()
-                        qf2_next = qf2_target(
-                            data["next_observations"], next_actions,
-                            data["positions"], batch_mask,
-                            recep_profile=batch_receptivity,
-                            influence_profile=batch_influence,
-                        ).clone()
-                        min_qf_next = torch.min(qf1_next, qf2_next) - alpha * next_log_pi
+                        )
+                        min_qf_next = qf_next.amin(dim=0) - alpha * next_log_pi
                         target_q = data["rewards"] + (1 - data["dones"]) * args.gamma * min_qf_next
 
                     with amp_ctx:
-                        # .clone(): see target-critic note above (shared CUDA-graph pool).
-                        qf1_value = qf1(data["observations"], data["actions"],
-                                        data["positions"], batch_mask,
-                                        recep_profile=batch_receptivity,
-                                        influence_profile=batch_influence).clone()
-                        qf2_value = qf2(data["observations"], data["actions"],
-                                        data["positions"], batch_mask,
-                                        recep_profile=batch_receptivity,
-                                        influence_profile=batch_influence).clone()
+                        # Both online critics in ONE batched pass -> (2, B, 1).
+                        qf_values = qf_ens(data["observations"], data["actions"],
+                                           data["positions"], batch_mask,
+                                           recep_profile=batch_receptivity,
+                                           influence_profile=batch_influence)
+                        qf1_value, qf2_value = qf_values[0], qf_values[1]
 
                         if debug_logger.should_log_q_values(total_gradient_steps):
                             debug_logger.log_q_value_stats(
@@ -1506,16 +1506,12 @@ def main():
                             n_keep = args.tqc_n_critics * args.tqc_n_quantiles - args.tqc_top_quantiles_to_drop
                             min_qf_pi = sorted_q[:, :n_keep].mean(dim=1, keepdim=True)
                         else:
-                            # .clone(): see target-critic note above (shared CUDA-graph pool).
-                            qf1_pi = qf1(data["observations"], actions_pi, data["positions"],
-                                         batch_mask,
-                                         recep_profile=batch_receptivity,
-                                         influence_profile=batch_influence).clone()
-                            qf2_pi = qf2(data["observations"], actions_pi, data["positions"],
-                                         batch_mask,
-                                         recep_profile=batch_receptivity,
-                                         influence_profile=batch_influence).clone()
-                            min_qf_pi = torch.min(qf1_pi, qf2_pi)
+                            # Both online critics in ONE batched pass -> (2, B, 1).
+                            qf_pi = qf_ens(data["observations"], actions_pi, data["positions"],
+                                           batch_mask,
+                                           recep_profile=batch_receptivity,
+                                           influence_profile=batch_influence)
+                            min_qf_pi = qf_pi.amin(dim=0)
 
                         # Policy loss (maximize Q - alpha * entropy), fp32 for stability
                         actor_loss = (alpha * log_pi.float() - min_qf_pi.float()).mean()
@@ -1711,20 +1707,14 @@ def main():
                                 influence_profile=batch_influence[:32] if batch_influence is not None else None,
                             )
                             policy_entropy = -log_pi_diag.mean().item()
-                            # Recompute Q-values fresh: under reduce-overhead the cached
-                            # qf1_value/qf2_value buffers were overwritten by the actor update.
-                            qf1_values_diag = qf1(
+                            # Recompute Q-values fresh (one batched ensemble pass).
+                            qf_diag = qf_ens(
                                 data["observations"], data["actions"], data["positions"],
                                 data["attention_mask"],
                                 recep_profile=batch_receptivity,
                                 influence_profile=batch_influence,
-                            ).clone()
-                            qf2_values_diag = qf2(
-                                data["observations"], data["actions"], data["positions"],
-                                data["attention_mask"],
-                                recep_profile=batch_receptivity,
-                                influence_profile=batch_influence,
-                            ).clone()
+                            )
+                            qf1_values_diag, qf2_values_diag = qf_diag[0], qf_diag[1]
 
                         log_finetune_diagnostics(
                             writer=writer,
