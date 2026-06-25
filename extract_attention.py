@@ -89,8 +89,9 @@ def compute_profiles(ckpt_args, x_pos, y_pos, rotor_diameter, wind_turbine):
             rotor_diameter=rotor_diameter,
             k_wake=0.04,
             n_directions=n_dirs,
-            sigma_smooth=10.0,
+            sigma_smooth=ckpt_args.get("profile_sigma_smooth", 10.0),
             scale_factor=15.0,
+            mode=ckpt_args.get("profile_geom_mode", "wake"),
         )
     else:
         from helpers.receptivity_profiles import compute_layout_profiles

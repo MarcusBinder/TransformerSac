@@ -244,8 +244,9 @@ def main():
                     rotor_diameter=D,
                     k_wake=0.04,
                     n_directions=args.n_profile_directions,
-                    sigma_smooth=10.0,
+                    sigma_smooth=args.profile_sigma_smooth,
                     scale_factor=15.0,
+                    mode=args.profile_geom_mode,
                 )
             elif args.profile_source.lower() == "pywake":
                 if verbose:
@@ -479,6 +480,8 @@ def main():
         use_profiles=use_profiles,  # NEW: Pass profile setting
         n_profile_directions=args.n_profile_directions,  # NEW: Pass profile resolution
         profile_source=args.profile_source,
+        profile_sigma_smooth=args.profile_sigma_smooth,
+        profile_geom_mode=args.profile_geom_mode,
     )
 
 

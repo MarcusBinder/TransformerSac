@@ -78,8 +78,9 @@ def create_eval_env(layout: str, args: dict, turbbox_path: str, seed: int = 42, 
                     rotor_diameter=D,
                     k_wake=0.04,
                     n_directions=args["n_profile_directions"],
-                    sigma_smooth=10.0,
+                    sigma_smooth=args.get("profile_sigma_smooth", 10.0),
                     scale_factor=15.0,
+                    mode=args.get("profile_geom_mode", "wake"),
                 )
             elif args["profile_source"].lower() == "pywake":
                 print(f"Computing PyWake profiles for layout: {name}")

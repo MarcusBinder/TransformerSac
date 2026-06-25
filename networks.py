@@ -303,6 +303,7 @@ def create_profile_encoding(
     profile_type: Optional[str],  # Optional
     embed_dim: int,
     hidden_channels: int,
+    use_influence: bool = True,  # If False, only build the receptivity encoder (returns None for influence)
     **encoder_kwargs,  # Flexible kwargs for different encoder types (e.g. n_harmonics for Fourier, scales for MultiResolution)
 ) -> Tuple[Optional[nn.Module], Optional[nn.Module]]:
     """
@@ -364,7 +365,10 @@ def create_profile_encoding(
         raise ValueError(f"Unknown profile_type: {profile_type}")
 
     recep_encoder = cls(embed_dim=embed_dim, hidden_channels=hidden_channels, **defaults)
-    influence_encoder = cls(embed_dim=embed_dim, hidden_channels=hidden_channels, **defaults)
+    influence_encoder = (
+        cls(embed_dim=embed_dim, hidden_channels=hidden_channels, **defaults)
+        if use_influence else None
+    )
 
     return recep_encoder, influence_encoder
 
@@ -646,11 +650,14 @@ class TransformerActor(nn.Module):
             )
 
 
+        # Whether to use the (redundant) influence rose; False => single receptivity encoder
+        self.use_influence = getattr(args, "profile_use_influence", True) if args is not None else True
+
         # Receptivity profile encoder (optional)
         # Use shared encoders if provided, otherwise create new ones
-        if shared_recep_encoder is not None and shared_influence_encoder is not None:
+        if shared_recep_encoder is not None:
             self.recep_encoder = shared_recep_encoder
-            self.influence_encoder = shared_influence_encoder
+            self.influence_encoder = shared_influence_encoder if self.use_influence else None
         else:
             encoder_kwargs = json.loads(args.profile_encoder_kwargs)
             if "hidden_channels" in encoder_kwargs:  # silently popping it wasted a whole sweep once
@@ -663,12 +670,13 @@ class TransformerActor(nn.Module):
                     profile_type=profile_encoding,
                     embed_dim=embed_dim,
                     hidden_channels=profile_encoder_hidden,
+                    use_influence=self.use_influence,
                     **encoder_kwargs,
                 )
 
 
 
-        if profile_encoding is not None and profile_fusion_type == "joint":
+        if profile_encoding is not None and self.use_influence and profile_fusion_type == "joint":
             # self.profile_fusion = nn.Sequential(
             #     nn.Linear(2 * embed_dim, embed_dim),
             #     nn.LayerNorm(embed_dim),
@@ -756,17 +764,20 @@ class TransformerActor(nn.Module):
         h = self.input_proj(h)  # (batch, n_turb, embed_dim)
 
         # Profile encoding (after projection, like positional encoding in LLMs)
-        if self.recep_encoder and recep_profile is not None and influence_profile is not None:
+        if self.recep_encoder and recep_profile is not None:
             recep_embed = self.recep_encoder(recep_profile)  # (batch, n_turb, embed_dim)
-            influence_embed = self.influence_encoder(influence_profile)  # (batch, n_turb, embed_dim)
 
-            # Step 1: Fuse receptivity + influence into a single profile embedding
-            if self.profile_fusion_type == "joint":
-                profile_embed = self.profile_fusion(
-                    torch.cat([recep_embed, influence_embed], dim=-1)
-                )  # (batch, n_turb, embed_dim)
-            else:  # "add"
-                profile_embed = recep_embed + influence_embed  # (batch, n_turb, embed_dim)
+            # Step 1: profile embedding -- fuse with influence, or use receptivity alone
+            if self.use_influence and influence_profile is not None:
+                influence_embed = self.influence_encoder(influence_profile)  # (batch, n_turb, embed_dim)
+                if self.profile_fusion_type == "joint":
+                    profile_embed = self.profile_fusion(
+                        torch.cat([recep_embed, influence_embed], dim=-1)
+                    )  # (batch, n_turb, embed_dim)
+                else:  # "add"
+                    profile_embed = recep_embed + influence_embed  # (batch, n_turb, embed_dim)
+            else:  # single-rose: receptivity only
+                profile_embed = recep_embed
 
             # Step 2: Integrate profile embedding into token representation
             if self.profile_embed_mode == "concat":
@@ -949,11 +960,14 @@ class TransformerCritic(nn.Module):
                 embedding_mode=pos_embedding_mode,
             )
 
+        # Whether to use the (redundant) influence rose; False => single receptivity encoder
+        self.use_influence = getattr(args, "profile_use_influence", True) if args is not None else True
+
         # PyWake profile encoder (optional)
         # Use shared encoders if provided, otherwise create new ones
-        if shared_recep_encoder is not None and shared_influence_encoder is not None:
+        if shared_recep_encoder is not None:
             self.recep_encoder = shared_recep_encoder
-            self.influence_encoder = shared_influence_encoder
+            self.influence_encoder = shared_influence_encoder if self.use_influence else None
         else:
             encoder_kwargs = json.loads(args.profile_encoder_kwargs)
             if "hidden_channels" in encoder_kwargs:  # silently popping it wasted a whole sweep once
@@ -966,6 +980,7 @@ class TransformerCritic(nn.Module):
                     profile_type=profile_encoding,
                     embed_dim=embed_dim,
                     hidden_channels=profile_encoder_hidden,
+                    use_influence=self.use_influence,
                     **encoder_kwargs,
                 )
 
@@ -983,7 +998,7 @@ class TransformerCritic(nn.Module):
         else:
             self.input_proj = nn.Identity()
 
-        if profile_encoding is not None and profile_fusion_type == "joint":
+        if profile_encoding is not None and self.use_influence and profile_fusion_type == "joint":
             # self.profile_fusion = nn.Sequential(
             #     nn.Linear(2 * embed_dim, embed_dim),
             #     nn.LayerNorm(embed_dim),
@@ -1056,17 +1071,20 @@ class TransformerCritic(nn.Module):
         h = self.input_proj(h)
 
         # Profile encoding (after projection, like positional encoding in LLMs)
-        if self.recep_encoder and recep_profile is not None and influence_profile is not None:
+        if self.recep_encoder and recep_profile is not None:
             recep_embed = self.recep_encoder(recep_profile)  # (batch, n_turb, embed_dim)
-            influence_embed = self.influence_encoder(influence_profile)  # (batch, n_turb, embed_dim)
 
-            # Step 1: Fuse receptivity + influence
-            if self.profile_fusion_type == "joint":
-                profile_embed = self.profile_fusion(
-                    torch.cat([recep_embed, influence_embed], dim=-1)
-                )
-            else:
-                profile_embed = recep_embed + influence_embed
+            # Step 1: profile embedding -- fuse with influence, or use receptivity alone
+            if self.use_influence and influence_profile is not None:
+                influence_embed = self.influence_encoder(influence_profile)  # (batch, n_turb, embed_dim)
+                if self.profile_fusion_type == "joint":
+                    profile_embed = self.profile_fusion(
+                        torch.cat([recep_embed, influence_embed], dim=-1)
+                    )
+                else:
+                    profile_embed = recep_embed + influence_embed
+            else:  # single-rose: receptivity only
+                profile_embed = recep_embed
 
             # Step 2: Integrate into token representation
             if self.profile_embed_mode == "concat":

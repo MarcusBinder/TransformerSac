@@ -96,6 +96,10 @@ class Args:
     """Profile computation source: 'geometric' or 'pywake'"""
     n_profile_directions: int = 360
     """Number of directions in profile"""
+    profile_sigma_smooth: float = 10.0
+    """Gaussian smoothing sigma (bins) for geometric profile computation"""
+    profile_geom_mode: str = "wake"
+    """Geometric rose construction: 'wake' or 'distance'"""
     no_profiles: bool = False
     """Skip profile computation"""
 
@@ -394,6 +398,8 @@ def compute_profiles(
     x_pos, y_pos, wind_turbine,
     profile_source: str = "geometric",
     n_directions: int = 360,
+    profile_sigma_smooth: float = 10.0,
+    profile_geom_mode: str = "wake",
 ):
     """Compute receptivity and influence profiles for a layout."""
     if profile_source.lower() == "geometric":
@@ -404,8 +410,9 @@ def compute_profiles(
             rotor_diameter=D,
             k_wake=0.04,
             n_directions=n_directions,
-            sigma_smooth=10.0,
+            sigma_smooth=profile_sigma_smooth,
             scale_factor=15.0,
+            mode=profile_geom_mode,
         )
     elif profile_source.lower() == "pywake":
         from helpers.receptivity_profiles import compute_layout_profiles
@@ -432,6 +439,8 @@ def collect_layout_data(
     policy: str = "random",
     profile_source: str = "geometric",
     n_profile_directions: int = 360,
+    profile_sigma_smooth: float = 10.0,
+    profile_geom_mode: str = "wake",
     compute_profiles_flag: bool = True,
     base_seed: int = 0,
     max_steps: int = 600,
@@ -462,6 +471,8 @@ def collect_layout_data(
             x_pos, y_pos, wind_turbine,
             profile_source=profile_source,
             n_directions=n_profile_directions,
+            profile_sigma_smooth=profile_sigma_smooth,
+            profile_geom_mode=profile_geom_mode,
         )
         print(f"  Profiles shape: {receptivity.shape}")
 
@@ -647,6 +658,8 @@ def main():
             policy=args.policy,
             profile_source=args.profile_source,
             n_profile_directions=args.n_profile_directions,
+            profile_sigma_smooth=args.profile_sigma_smooth,
+            profile_geom_mode=args.profile_geom_mode,
             compute_profiles_flag=not args.no_profiles,
             base_seed=args.seed + li * 10000,
             max_steps=args.max_steps,

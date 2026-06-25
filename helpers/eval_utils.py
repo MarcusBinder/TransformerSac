@@ -116,6 +116,8 @@ class PolicyEvaluator:
         use_profiles: bool = False,
         n_profile_directions: int = 360,
         profile_source: str = "pywake",
+        profile_sigma_smooth: float = 10.0,
+        profile_geom_mode: str = "wake",
     ):
         """
         Args:
@@ -151,6 +153,8 @@ class PolicyEvaluator:
         self.use_profiles = use_profiles
         self.n_profile_directions = n_profile_directions
         self.profile_source = profile_source
+        self.profile_sigma_smooth = profile_sigma_smooth
+        self.profile_geom_mode = profile_geom_mode
         
         # Create layout configs
         self.eval_layouts = self._create_layout_configs()
@@ -176,8 +180,9 @@ class PolicyEvaluator:
                         rotor_diameter=D,
                         k_wake=0.04,
                         n_directions=self.n_profile_directions,
-                        sigma_smooth=10.0,
+                        sigma_smooth=self.profile_sigma_smooth,
                         scale_factor=15.0,
+                        mode=self.profile_geom_mode,
                     )
                 else:
                     from .receptivity_profiles import compute_layout_profiles
