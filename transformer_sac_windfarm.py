@@ -1085,31 +1085,27 @@ def main():
     if args.compile:
         print("Compiling network forward passes with torch.compile (first steps are slow)...")
 
-        def _compile_forward(module, mode="reduce-overhead"):
+        def _compile_forward(module):
             if module is not None:
-                # reduce-overhead (CUDA graphs) collapses the many tiny kernel
-                # launches of this small/short-sequence model into one replay --
-                # the dominant cost for a launch-bound update loop. Requires the
-                # hot loop to be sync-free (see GPU-side loss accumulation below).
-                # TODO(speed): the "CUDA Graph is empty" warnings on cluster runs
-                # suggest reduce-overhead may not actually be engaging. A/B it vs
-                # plain torch.compile (mode=None) -- if critic/actor timings match,
-                # drop reduce-overhead AND the actor .clone() guards it forced.
-                if mode is None:
-                    module.forward = torch.compile(module.forward)
-                else:
-                    module.forward = torch.compile(module.forward, mode=mode)
+                # Plain torch.compile -- NOT mode="reduce-overhead". reduce-overhead's
+                # CUDA-graph-trees allocator repeatedly broke on this model: empty-graph
+                # warnings (not engaging), an output-aliasing crash, and finally an
+                # allocator-checkpoint corruption ("curr_block->next == nullptr") when
+                # the reduce-overhead actor was mixed with the plain-compiled vmap
+                # ensemble. The launch-overhead win now comes from the EnsembleCritic
+                # batching the two critics into one pass, not from CUDA graphs.
+                # TODO(speed): revisit reduce-overhead only if the loop is still
+                # launch-bound AND an all-graph setup can be made to compose with the
+                # vmap ensemble (mixing modes is what corrupts the allocator).
+                module.forward = torch.compile(module.forward)
 
         _compile_forward(actor)
         if args.algorithm == "tqc":
             _compile_forward(tqc_critic)
             _compile_forward(tqc_critic_target)
         else:
-            # Plain compile (mode=None) for the ensemble: its vmap + functional_call
-            # path with CUDA graphs is untested, and the launch win already comes
-            # from the vmap batching itself, not from graphs.
-            _compile_forward(qf_ens, mode=None)
-            _compile_forward(qf_ens_target, mode=None)
+            _compile_forward(qf_ens)
+            _compile_forward(qf_ens_target)
 
     print(f"\nStarting training for {args.total_timesteps} timesteps...")
     print(f"UTD ratio: {args.utd_ratio} (gradient updates per env step)")
