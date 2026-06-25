@@ -788,10 +788,12 @@ def main():
     if args.autotune:
         # Initial target entropy (will be adapted per-batch)
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
-        alpha = log_alpha.exp().item()
+        # Keep alpha a detached GPU tensor (not a Python float) so the in-graph
+        # loss math never forces a per-step .item() sync; materialized only at logging.
+        alpha = log_alpha.exp().detach()
         alpha_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
     else:
-        alpha = args.alpha
+        alpha = torch.tensor(float(args.alpha), device=device)
         log_alpha = None
         alpha_optimizer = None
     
@@ -856,13 +858,13 @@ def main():
             if not args.finetune_reset_alpha:
                 if "log_alpha" in checkpoint:
                     log_alpha.data = checkpoint["log_alpha"].to(device)
-                    alpha = log_alpha.exp().item()
-                    print(f"✓ Loaded entropy coefficient: alpha={alpha:.4f}")
+                    alpha = log_alpha.exp().detach()
+                    print(f"✓ Loaded entropy coefficient: alpha={float(alpha):.4f}")
                 if "alpha_optimizer_state_dict" in checkpoint:
                     alpha_optimizer.load_state_dict(checkpoint["alpha_optimizer_state_dict"])
                     print(f"✓ Loaded alpha optimizer state")
             else:
-                print(f"✓ Reset entropy coefficient (alpha={alpha:.4f})")
+                print(f"✓ Reset entropy coefficient (alpha={float(alpha):.4f})")
        
         # === Resume step logic ===
         ## REMOVED FOR SIMPLICITY
@@ -1080,7 +1082,11 @@ def main():
 
         def _compile_forward(module):
             if module is not None:
-                module.forward = torch.compile(module.forward)
+                # reduce-overhead (CUDA graphs) collapses the many tiny kernel
+                # launches of this small/short-sequence model into one replay --
+                # the dominant cost for a launch-bound update loop. Requires the
+                # hot loop to be sync-free (see GPU-side loss accumulation below).
+                module.forward = torch.compile(module.forward, mode="reduce-overhead")
 
         _compile_forward(actor)
         if args.algorithm == "tqc":
@@ -1162,15 +1168,19 @@ def main():
     # Replay buffer saving
     warmup_buffer_saved = False
     next_buffer_save_step = start_step + args.buffer_save_interval
-    # For logging losses (we'll average over the UTD updates)
-    if args.algorithm == "tqc":
-        loss_accumulator = {
-            'qf_loss': [], 'actor_loss': [], 'alpha_loss': []
-        }
-    else:
-        loss_accumulator = {
-            'qf1_loss': [], 'qf2_loss': [], 'actor_loss': [], 'alpha_loss': []
-        }
+    # For logging losses: accumulate GPU-side running sums and materialize once per
+    # logging drain. Avoids a per-grad-step .item() sync that would serialize this
+    # launch-bound update loop. Counts track how many updates contributed each metric.
+    _qf_keys = ['qf_loss'] if args.algorithm == "tqc" else ['qf1_loss', 'qf2_loss']
+    _acc_keys = _qf_keys + ['actor_loss', 'alpha_loss',
+                            'logpi_per_turbine', 'ent_term', 'q_term', 'n_real_mean']
+
+    def _zero_losses():
+        return {k: torch.zeros((), device=device) for k in _acc_keys}
+
+    loss_accumulator = _zero_losses()
+    n_critic_updates = 0
+    n_actor_updates = 0
 
     # Calculate remaining updates if resuming
     remaining_timesteps = args.total_timesteps - start_step
@@ -1320,8 +1330,10 @@ def main():
             # This scales with num_envs to maintain consistent sample efficiency
             num_gradient_updates = max(1, int(args.num_envs * args.utd_ratio))
             
-            # Clear loss accumulator for this iteration
-            loss_accumulator = {k: [] for k in loss_accumulator}
+            # Clear loss accumulators for this iteration
+            loss_accumulator = _zero_losses()
+            n_critic_updates = 0
+            n_actor_updates = 0
 
 
             for grad_step in range(num_gradient_updates):
@@ -1400,7 +1412,8 @@ def main():
                             ) ** 0.5
                             writer.add_scalar(f"debug/grad_norm/tqc_critic_{i}", grad_norm, global_step)
 
-                    loss_accumulator['qf_loss'].append(qf_loss.item())
+                    loss_accumulator['qf_loss'] += qf_loss.detach()
+                    n_critic_updates += 1
                 else:
                     # --- SAC critic update ---
                     with torch.no_grad(), amp_ctx:
@@ -1455,8 +1468,9 @@ def main():
                     if debug_logger.should_log_gradients(total_gradient_steps):
                         debug_logger.log_critic_gradient_norms(qf1, qf2, writer, global_step)
 
-                    loss_accumulator['qf1_loss'].append(qf1_loss.item())
-                    loss_accumulator['qf2_loss'].append(qf2_loss.item())
+                    loss_accumulator['qf1_loss'] += qf1_loss.detach()
+                    loss_accumulator['qf2_loss'] += qf2_loss.detach()
+                    n_critic_updates += 1
 
                 if args.log_timing:
                     timing["critic"] += _sync_timer() - _t_critic
@@ -1514,7 +1528,8 @@ def main():
                     if debug_logger.should_log_gradients(total_gradient_steps):
                         debug_logger.log_actor_gradient_norms(actor, writer, global_step)
 
-                    loss_accumulator['actor_loss'].append(actor_loss.item())
+                    loss_accumulator['actor_loss'] += actor_loss.detach()
+                    n_actor_updates += 1
 
                     # Entropy-vs-Q diagnostics (the large-farm "stay diffuse" pathology):
                     # per-turbine log-prob is size-invariant so it is comparable across N,
@@ -1525,14 +1540,10 @@ def main():
                         logpi_agg = log_pi.detach().float().squeeze(-1)
                         logpi_per_turb = (logpi_agg if args.entropy_agg == "mean"
                                           else logpi_agg / n_real_b)
-                        loss_accumulator.setdefault('logpi_per_turbine', []).append(
-                            logpi_per_turb.mean().item())
-                        loss_accumulator.setdefault('ent_term', []).append(
-                            (alpha * logpi_agg).mean().item())
-                        loss_accumulator.setdefault('q_term', []).append(
-                            min_qf_pi.detach().float().mean().item())
-                        loss_accumulator.setdefault('n_real_mean', []).append(
-                            n_real_b.mean().item())
+                        loss_accumulator['logpi_per_turbine'] += logpi_per_turb.mean()
+                        loss_accumulator['ent_term'] += (alpha * logpi_agg).mean()
+                        loss_accumulator['q_term'] += min_qf_pi.detach().float().mean()
+                        loss_accumulator['n_real_mean'] += n_real_b.mean()
 
                     # -------------------------------------------------------------
                     # Update Alpha (entropy coefficient)
@@ -1553,9 +1564,9 @@ def main():
                         alpha_optimizer.zero_grad(set_to_none=True)
                         alpha_loss.backward()
                         alpha_optimizer.step()
-                        alpha = log_alpha.exp().item()
+                        alpha = log_alpha.exp().detach()
                         
-                        loss_accumulator['alpha_loss'].append(alpha_loss.item())
+                        loss_accumulator['alpha_loss'] += alpha_loss.detach()
 
                     if args.log_timing:
                         timing["actor"] += _sync_timer() - _t_actor
@@ -1619,26 +1630,30 @@ def main():
                 sps = int(global_step / (time.time() - start_time))
                 mean_reward = float(np.mean(step_reward_window)) if step_reward_window else 0.0
                 
-                # Average losses over the UTD updates
-                mean_actor_loss = np.mean(loss_accumulator['actor_loss']) if loss_accumulator['actor_loss'] else 0
+                # Average losses over the UTD updates: divide the GPU running-sums by
+                # their update counts and materialize once (a handful of syncs per 20
+                # iterations instead of thousands per step).
+                _na = max(n_actor_updates, 1)
+                _nc = max(n_critic_updates, 1)
+                alpha_val = float(alpha)
+                mean_actor_loss = (loss_accumulator['actor_loss'] / _na).item()
 
                 if args.algorithm == "tqc":
-                    mean_qf_loss = np.mean(loss_accumulator['qf_loss']) if loss_accumulator['qf_loss'] else 0
+                    mean_qf_loss = (loss_accumulator['qf_loss'] / _nc).item()
                     writer.add_scalar("losses/qf_loss", mean_qf_loss, global_step)
                 else:
-                    mean_qf1_loss = np.mean(loss_accumulator['qf1_loss']) if loss_accumulator['qf1_loss'] else 0
-                    mean_qf2_loss = np.mean(loss_accumulator['qf2_loss']) if loss_accumulator['qf2_loss'] else 0
+                    mean_qf1_loss = (loss_accumulator['qf1_loss'] / _nc).item()
+                    mean_qf2_loss = (loss_accumulator['qf2_loss'] / _nc).item()
                     mean_qf_loss = mean_qf1_loss + mean_qf2_loss
                     writer.add_scalar("losses/qf1_loss", mean_qf1_loss, global_step)
                     writer.add_scalar("losses/qf2_loss", mean_qf2_loss, global_step)
 
                 writer.add_scalar("losses/actor_loss", mean_actor_loss, global_step)
-                writer.add_scalar("losses/alpha", alpha, global_step)
+                writer.add_scalar("losses/alpha", alpha_val, global_step)
 
                 # Entropy-scaling diagnostics (see actor-update block)
                 def _acc_mean(key):
-                    vals = loss_accumulator.get(key)
-                    return float(np.mean(vals)) if vals else 0.0
+                    return (loss_accumulator[key] / _na).item()
                 _ent_term = _acc_mean('ent_term')
                 _q_term = _acc_mean('q_term')
                 writer.add_scalar("entropy/logpi_per_turbine", _acc_mean('logpi_per_turbine'), global_step)
@@ -1661,7 +1676,7 @@ def main():
                     timing = {k: 0.0 for k in timing}
 
                 print(f"Step {global_step}: SPS={sps}, qf_loss={mean_qf_loss:.4f}, "
-                      f"actor_loss={mean_actor_loss:.4f}, alpha={alpha:.4f}, "
+                      f"actor_loss={mean_actor_loss:.4f}, alpha={alpha_val:.4f}, "
                       f"reward_mean={mean_reward:.4f}, grad_steps={total_gradient_steps}")
         
 
@@ -1676,7 +1691,7 @@ def main():
                             q_optimizer=q_optimizer,
                             policy_lr=args.policy_lr,
                             q_lr=args.q_lr,
-                            alpha=alpha,
+                            alpha=float(alpha),
                         )
                     else:
                         # SAC fine-tuning diagnostics (includes Q-value stats)
@@ -1691,6 +1706,20 @@ def main():
                                 influence_profile=batch_influence[:32] if batch_influence is not None else None,
                             )
                             policy_entropy = -log_pi_diag.mean().item()
+                            # Recompute Q-values fresh: under reduce-overhead the cached
+                            # qf1_value/qf2_value buffers were overwritten by the actor update.
+                            qf1_values_diag = qf1(
+                                data["observations"], data["actions"], data["positions"],
+                                data["attention_mask"],
+                                recep_profile=batch_receptivity,
+                                influence_profile=batch_influence,
+                            )
+                            qf2_values_diag = qf2(
+                                data["observations"], data["actions"], data["positions"],
+                                data["attention_mask"],
+                                recep_profile=batch_receptivity,
+                                influence_profile=batch_influence,
+                            )
 
                         log_finetune_diagnostics(
                             writer=writer,
@@ -1699,10 +1728,10 @@ def main():
                             q_optimizer=q_optimizer,
                             policy_lr=args.policy_lr,
                             q_lr=args.q_lr,
-                            qf1_values=qf1_value,
-                            qf2_values=qf2_value,
+                            qf1_values=qf1_values_diag,
+                            qf2_values=qf2_values_diag,
                             episode_returns=recent_returns,
-                            alpha=alpha,
+                            alpha=float(alpha),
                             policy_entropy=policy_entropy,
                         )
 
