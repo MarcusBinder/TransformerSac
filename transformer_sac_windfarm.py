@@ -1417,30 +1417,34 @@ def main():
                 else:
                     # --- SAC critic update ---
                     with torch.no_grad(), amp_ctx:
+                        # .clone() each critic output: under reduce-overhead the compiled
+                        # critics share one CUDA-graph buffer pool, so a held output is
+                        # overwritten by the next critic call before it is consumed.
                         qf1_next = qf1_target(
                             data["next_observations"], next_actions,
                             data["positions"], batch_mask,
                             recep_profile=batch_receptivity,
                             influence_profile=batch_influence,
-                        )
+                        ).clone()
                         qf2_next = qf2_target(
                             data["next_observations"], next_actions,
                             data["positions"], batch_mask,
                             recep_profile=batch_receptivity,
                             influence_profile=batch_influence,
-                        )
+                        ).clone()
                         min_qf_next = torch.min(qf1_next, qf2_next) - alpha * next_log_pi
                         target_q = data["rewards"] + (1 - data["dones"]) * args.gamma * min_qf_next
 
                     with amp_ctx:
+                        # .clone(): see target-critic note above (shared CUDA-graph pool).
                         qf1_value = qf1(data["observations"], data["actions"],
                                         data["positions"], batch_mask,
                                         recep_profile=batch_receptivity,
-                                        influence_profile=batch_influence)
+                                        influence_profile=batch_influence).clone()
                         qf2_value = qf2(data["observations"], data["actions"],
                                         data["positions"], batch_mask,
                                         recep_profile=batch_receptivity,
-                                        influence_profile=batch_influence)
+                                        influence_profile=batch_influence).clone()
 
                         if debug_logger.should_log_q_values(total_gradient_steps):
                             debug_logger.log_q_value_stats(
@@ -1502,14 +1506,15 @@ def main():
                             n_keep = args.tqc_n_critics * args.tqc_n_quantiles - args.tqc_top_quantiles_to_drop
                             min_qf_pi = sorted_q[:, :n_keep].mean(dim=1, keepdim=True)
                         else:
+                            # .clone(): see target-critic note above (shared CUDA-graph pool).
                             qf1_pi = qf1(data["observations"], actions_pi, data["positions"],
                                          batch_mask,
                                          recep_profile=batch_receptivity,
-                                         influence_profile=batch_influence)
+                                         influence_profile=batch_influence).clone()
                             qf2_pi = qf2(data["observations"], actions_pi, data["positions"],
                                          batch_mask,
                                          recep_profile=batch_receptivity,
-                                         influence_profile=batch_influence)
+                                         influence_profile=batch_influence).clone()
                             min_qf_pi = torch.min(qf1_pi, qf2_pi)
 
                         # Policy loss (maximize Q - alpha * entropy), fp32 for stability
@@ -1713,13 +1718,13 @@ def main():
                                 data["attention_mask"],
                                 recep_profile=batch_receptivity,
                                 influence_profile=batch_influence,
-                            )
+                            ).clone()
                             qf2_values_diag = qf2(
                                 data["observations"], data["actions"], data["positions"],
                                 data["attention_mask"],
                                 recep_profile=batch_receptivity,
                                 influence_profile=batch_influence,
-                            )
+                            ).clone()
 
                         log_finetune_diagnostics(
                             writer=writer,
