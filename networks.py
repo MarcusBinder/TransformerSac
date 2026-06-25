@@ -5,14 +5,12 @@ Contains the actor (policy), critic (Q-function), and TQC critic networks,
 plus factory functions for positional and profile encodings.
 """
 
-import copy
 import json
 from typing import Optional, Tuple, List, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.func import functional_call
 
 from config import Args
 
@@ -858,8 +856,9 @@ class TransformerActor(nn.Module):
         if key_padding_mask is not None:
             # key_padding_mask: (batch, n_turbines), True = padding
             mask = ~key_padding_mask.unsqueeze(-1)  # (batch, n_turb, 1), True = real
-            log_prob = log_prob * mask.float()
-            n_real_dims = mask.float().sum(dim=(-2, -1)) * log_prob.shape[-1]  # (batch,) real action dims
+            mask_f = mask.float()
+            log_prob = log_prob * mask_f
+            n_real_dims = mask_f.sum(dim=(-2, -1)) * log_prob.shape[-1]  # (batch,) real action dims
         else:
             n_real_dims = log_prob.new_full(
                 (log_prob.shape[0],), float(log_prob.shape[-2] * log_prob.shape[-1])
@@ -1107,9 +1106,10 @@ class TransformerCritic(nn.Module):
             # "pool" (standard): masked-mean of turbine embeddings -> single farm-Q.
             if key_padding_mask is not None:
                 mask = ~key_padding_mask.unsqueeze(-1)  # (batch, n_turb, 1), True = real
-                h = h * mask.float()
+                mask_f = mask.float()
+                h = h * mask_f
                 h_sum = h.sum(dim=1)  # (batch, embed_dim)
-                n_real = mask.float().sum(dim=1).clamp(min=1)  # (batch, 1)
+                n_real = mask_f.sum(dim=1).clamp(min=1)  # (batch, 1)
                 h_pooled = h_sum / n_real
             else:
                 h_pooled = h.mean(dim=1)  # (batch, embed_dim)
@@ -1168,58 +1168,6 @@ class TransformerTQCCritic(nn.Module):
               recep_profile, influence_profile)
             for c in self.critics
         ], dim=0)
-
-
-class EnsembleCritic(nn.Module):
-    """Run N independent TransformerCritics as ONE vmapped batched forward.
-
-    Owns the critics in a ModuleList, so checkpointing, the optimizer, and
-    soft_update operate on the individual critics unchanged (and per-critic
-    state_dicts stay compatible). forward() stacks their parameters and vmaps a
-    single functional_call, collapsing N separate network passes into one batched
-    launch per layer -- the win on a launch-overhead-bound model. The per-call
-    torch.stack of parameters is differentiable (unlike stack_module_state), so
-    gradients flow back into each critic.
-
-    Returns: (n_critics, batch, q_out)  -- e.g. (2, B, 1) for SAC.
-    """
-
-    def __init__(self, n_critics: int = 2, **critic_kwargs):
-        super().__init__()
-        self.n_critics = n_critics
-        self.critics = nn.ModuleList(
-            [TransformerCritic(**critic_kwargs) for _ in range(n_critics)]
-        )
-        # Structural meta-device copy used as the functional_call template.
-        # Wrapped in a list so it is NOT registered as a submodule -- its meta
-        # params must stay out of .parameters()/.state_dict()/.to(device).
-        self._base = [copy.deepcopy(self.critics[0]).to("meta")]
-
-    def train(self, mode: bool = True):
-        # Keep the (unregistered) functional_call template in sync, so dropout/eval
-        # behaviour in the vmapped path matches the critics (e.g. DroQ target eval).
-        super().train(mode)
-        self._base[0].train(mode)
-        return self
-
-    def forward(self, obs, action, positions, key_padding_mask=None,
-                recep_profile=None, influence_profile=None):
-        pdicts = [dict(c.named_parameters()) for c in self.critics]
-        params = {n: torch.stack([d[n] for d in pdicts]) for n in pdicts[0]}
-        bdicts = [dict(c.named_buffers()) for c in self.critics]
-        buffers = {n: torch.stack([d[n] for d in bdicts]) for n in bdicts[0]}
-        base = self._base[0]
-
-        def fmodel(p, b, o, a, pos, m, rp, ip):
-            return functional_call(base, (p, b), (o, a, pos, m, rp, ip))
-
-        # randomness="different": each critic draws its own dropout mask (matches
-        # what independent critic modules would do; vmap errors on random ops otherwise).
-        return torch.vmap(
-            fmodel, in_dims=(0, 0, None, None, None, None, None, None),
-            randomness="different",
-        )(params, buffers, obs, action, positions, key_padding_mask,
-          recep_profile, influence_profile)
 
 
 def quantile_huber_loss(
