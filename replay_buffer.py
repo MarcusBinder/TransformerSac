@@ -52,6 +52,7 @@ class TransformerReplayBuffer:
         use_profiles: bool = False,
         rotate_profiles: bool = False,
         profile_registry: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
+        profile_registry_gpu_budget_mb: int = 256,
     ):
         """
         Args:
@@ -65,6 +66,9 @@ class TransformerReplayBuffer:
             use_profiles: Whether to store and return receptivity profiles
             rotate_profiles: Whether to rotate profiles to wind-relative frame at sample time
             profile_registry: List of (recep, influence) tuples per layout, each (n_turb, n_dirs)
+            profile_registry_gpu_budget_mb: If the padded profile registry fits under this
+                many MB (and device is CUDA), keep it GPU-resident so sample() transfers only
+                the tiny per-sample index/permutation arrays instead of the full profiles.
         """
         self.capacity = capacity
         self.device = device
@@ -105,9 +109,27 @@ class TransformerReplayBuffer:
                 self._padded_recep[li, :nt] = recep
                 self._padded_infl[li, :nt] = infl
             self._n_dirs = n_dirs
+
+            # Keep the registry GPU-resident if it fits the budget. Then sample()
+            # transfers only the (B,) layout idx + (B, T) permutation arrays and does
+            # the gather/permute/rotate on-device, avoiding the ~n_dirs-wide H2D copy
+            # of the full profile batch every call. The CPU arrays are retained
+            # regardless (save() reads their shape).
+            reg_bytes = self._padded_recep.nbytes + self._padded_infl.nbytes
+            budget_bytes = profile_registry_gpu_budget_mb * 1024 * 1024
+            self._registry_on_gpu = device.type == "cuda" and reg_bytes <= budget_bytes
+            if self._registry_on_gpu:
+                self._padded_recep_gpu = torch.from_numpy(self._padded_recep).to(device)
+                self._padded_infl_gpu = torch.from_numpy(self._padded_infl).to(device)
+            print(
+                f"[ReplayBuffer] profile registry: "
+                f"{'GPU-resident' if self._registry_on_gpu else 'CPU (per-sample transfer)'} "
+                f"({reg_bytes / 1e6:.1f} MB)"
+            )
         else:
             self._layout_indices = None
             self._permutations = None
+            self._registry_on_gpu = False
 
         alloc_mb = (
             self._obs.nbytes + self._next_obs.nbytes + self._actions.nbytes
@@ -191,7 +213,10 @@ class TransformerReplayBuffer:
             - receptivity: (batch, max_turb, n_directions) - only if use_profiles=True
             - influence: (batch, max_turb, n_directions) - only if use_profiles=True
         """
-        indices = np.random.choice(self.size, batch_size, replace=False)
+        # Sample with replacement (standard RL replay; matches SB3/CleanRL). Avoids
+        # np.random.choice(replace=False), which builds a full O(self.size) permutation
+        # every call -- a hidden cost that scales with buffer fill (up to 1e6).
+        indices = np.random.randint(0, self.size, size=batch_size)
 
         # --- Vectorized array indexing (the whole point) ---
         raw_positions = self._raw_positions[indices]            # (B, T, 2)
@@ -229,17 +254,29 @@ class TransformerReplayBuffer:
             layout_idx_batch = self._layout_indices[indices]    # (B,)
             perm_batch = self._permutations[indices]            # (B, T)
 
-            # Gather from pre-padded registry: (B, T, n_dirs)
-            recep_batch = self._padded_recep[layout_idx_batch]  # (B, T, D)
-            infl_batch = self._padded_infl[layout_idx_batch]    # (B, T, D)
+            if self._registry_on_gpu:
+                # Transfer only the tiny index/permutation arrays; gather + permute the
+                # GPU-resident registry on-device. torch.gather over axis 1 is the exact
+                # equivalent of np.take_along_axis(..., perm[:, :, None], axis=1).
+                layout_idx_t = self._to_device(layout_idx_batch).long()  # (B,)
+                perm_t = self._to_device(perm_batch)                     # (B, T) int64
+                recep_t = self._padded_recep_gpu[layout_idx_t]           # (B, T, D)
+                infl_t = self._padded_infl_gpu[layout_idx_t]
+                perm_idx = perm_t[:, :, None].expand(-1, -1, self._n_dirs)
+                recep_t = torch.gather(recep_t, 1, perm_idx)
+                infl_t = torch.gather(infl_t, 1, perm_idx)
+            else:
+                # CPU path: gather from pre-padded registry, permute, then transfer.
+                recep_batch = self._padded_recep[layout_idx_batch]  # (B, T, D)
+                infl_batch = self._padded_infl[layout_idx_batch]    # (B, T, D)
 
-            # Apply permutation via advanced indexing (vectorized, no loop)
-            # perm_batch[:, :, None] broadcasts over the n_dirs axis
-            recep_batch = np.take_along_axis(recep_batch, perm_batch[:, :, None], axis=1)
-            infl_batch = np.take_along_axis(infl_batch, perm_batch[:, :, None], axis=1)
+                # Apply permutation via advanced indexing (vectorized, no loop)
+                # perm_batch[:, :, None] broadcasts over the n_dirs axis
+                recep_batch = np.take_along_axis(recep_batch, perm_batch[:, :, None], axis=1)
+                infl_batch = np.take_along_axis(infl_batch, perm_batch[:, :, None], axis=1)
 
-            recep_t = self._to_device(recep_batch)
-            infl_t = self._to_device(infl_batch)
+                recep_t = self._to_device(recep_batch)
+                infl_t = self._to_device(infl_batch)
 
             # Rotate to wind-relative frame on-device (avoids CPU rotation + re-copy)
             if self.rotate_profiles:
@@ -255,14 +292,15 @@ class TransformerReplayBuffer:
         """
         Host->device transfer for a sampled batch array.
 
-        On CUDA we stage through pinned memory and copy asynchronously so the
-        transfer overlaps with compute; on CPU we just wrap the array. Storage
-        arrays already hold the target dtypes (float32 / bool), so no cast is
-        needed here.
+        A plain synchronous copy: the result is consumed immediately by the
+        critic forward, so there is no concurrent GPU work to overlap with --
+        pinning + non_blocking would only add page-lock allocation overhead
+        for zero benefit (revisit only if a prefetch pipeline is added).
+        Storage arrays already hold the target dtypes (float32 / bool), so no
+        cast is needed here. ascontiguousarray is kept: fancy-indexed sources are
+        contiguous, but normalized positions / permuted profiles may not be.
         """
         t = torch.from_numpy(np.ascontiguousarray(arr))
-        if self.device.type == "cuda":
-            return t.pin_memory().to(self.device, non_blocking=True)
         return t.to(self.device)
 
     def _rotate_profiles_batch(
