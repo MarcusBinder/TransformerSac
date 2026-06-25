@@ -88,6 +88,7 @@ class Args:
     dr_min_dist_D: float = 3.0       # minimum turbine spacing in rotor diameters
     dr_screen_headroom: bool = True  # reject generated layouts with no wake-steering headroom
     dr_min_involved_frac: float = 0.5  # min fraction of turbines in a wake interaction to keep a layout
+    dr_generator: str = "irregular"  # {"irregular","cluster"}: procedural pool generator (cluster = PLayGen Poisson-disc)
 
     # === Observation Settings ===
     history_length: int = 15            # Number of timesteps of history per feature
@@ -146,6 +147,7 @@ class Args:
     gamma: float = 0.99           # Discount factor
     tau: float = 0.005            # Target network update rate
     batch_size: int = 256
+    profile_registry_gpu_budget_mb: int = 256  # Keep profile registry GPU-resident if it fits
     learning_starts: int = 5000   # Steps before training starts
     policy_lr: float = 3e-4
     q_lr: float = 3e-4

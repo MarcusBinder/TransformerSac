@@ -261,7 +261,8 @@ def main():
         # different seeds draw different layout sets. See helpers/layout_gen.py.
         from helpers.layout_gen import generate_layout_pool
         print(f"Domain randomization: generating {args.dr_pool_size} layouts "
-              f"with n in [{args.dr_n_lo}, {args.dr_n_hi}] (seed={args.seed})...")
+              f"with n in [{args.dr_n_lo}, {args.dr_n_hi}] (seed={args.seed}, "
+              f"generator={args.dr_generator})...")
         pool = generate_layout_pool(
             pool_size=args.dr_pool_size,
             n_lo=args.dr_n_lo,
@@ -271,6 +272,7 @@ def main():
             min_dist_D=args.dr_min_dist_D,
             screen_headroom=args.dr_screen_headroom,
             min_involved_frac=args.dr_min_involved_frac,
+            generator=args.dr_generator,
         )
         for name, x_pos, y_pos in pool:
             layouts.append(build_layout_config(name, x_pos, y_pos, verbose=False))
@@ -1020,6 +1022,7 @@ def main():
         use_profiles=use_profiles,
         rotate_profiles=args.rotate_profiles,
         profile_registry=profile_registry,
+        profile_registry_gpu_budget_mb=args.profile_registry_gpu_budget_mb,
     )
 
     # Shared metadata stored alongside every buffer save (also validated on load)
@@ -1147,6 +1150,8 @@ def main():
     amp_ctx = torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=args.amp)
     if args.amp:
         print(f"AMP enabled: bfloat16 autocast on {device.type}")
+        print("  NOTE: on Sophia (Quadro RTX 4000 / Turing) the --amp flag is "
+              "strictly slower -- Turing has no bf16 tensor cores. Disable it here.")
     # Reset environments
     obs, infos = envs.reset(seed=args.seed)
     

@@ -8,6 +8,7 @@ import pytest
 from layout_gen import (
     generate_layout_pool,
     make_irregular,
+    make_cluster,
     has_wake_headroom,
     turbine_wake_involvement,
 )
@@ -66,6 +67,58 @@ def test_spread_out_layout_has_no_headroom():
 def test_invalid_range_raises():
     with pytest.raises(ValueError):
         generate_layout_pool(4, n_lo=10, n_hi=5, D=D, seed=0)
+
+
+def test_invalid_generator_raises():
+    with pytest.raises(ValueError):
+        generate_layout_pool(4, n_lo=9, n_hi=25, D=D, seed=0, generator="spiral")
+
+
+# ============================ cluster generator (PLayGen) ============================
+def test_make_cluster_exact_count():
+    for n in (6, 9, 16, 25):
+        x, y = make_cluster(n, seed=0, D=D)
+        assert len(x) == n and len(y) == n
+
+
+def test_make_cluster_seed_deterministic():
+    a = make_cluster(16, seed=7, D=D)
+    b = make_cluster(16, seed=7, D=D)
+    c = make_cluster(16, seed=8, D=D)
+    assert np.allclose(a[0], b[0]) and np.allclose(a[1], b[1])
+    assert not (np.array_equal(a[0], c[0]) and np.array_equal(a[1], c[1]))
+
+
+def test_make_cluster_restores_global_rng():
+    np.random.seed(123)
+    before = np.random.get_state()
+    make_cluster(20, seed=999, D=D)
+    after = np.random.get_state()
+    # PLayGen uses the global RNG; make_cluster must leave it untouched.
+    assert before[0] == after[0]
+    assert np.array_equal(before[1], after[1])
+    assert before[2:] == after[2:]
+
+
+def test_cluster_pool_counts_names_and_determinism():
+    pool = generate_layout_pool(32, n_lo=9, n_hi=25, D=D, seed=1, generator="cluster")
+    assert len(pool) == 32
+    names = [p[0] for p in pool]
+    assert len(set(names)) == 32
+    assert all(nm.startswith("drc_n") for nm in names)  # cluster prefix, not v8 "dr_"
+    for name, x, y in pool:
+        assert 9 <= len(x) <= 25
+        assert len(x) == len(y)
+    again = generate_layout_pool(32, n_lo=9, n_hi=25, D=D, seed=1, generator="cluster")
+    assert all(np.allclose(ax, bx) and np.allclose(ay, by)
+               for (_, ax, ay), (_, bx, by) in zip(pool, again))
+
+
+def test_cluster_pool_passes_headroom_screen():
+    pool = generate_layout_pool(24, n_lo=9, n_hi=25, D=D, seed=2,
+                                generator="cluster", screen_headroom=True, min_involved_frac=0.5)
+    for _, x, y in pool:
+        assert has_wake_headroom(x, y, D, min_involved_frac=0.5)
 
 
 if __name__ == "__main__":

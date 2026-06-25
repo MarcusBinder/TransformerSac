@@ -40,6 +40,31 @@ def make_irregular(n_turbines, seed, spread_x, spread_y, D, min_dist_D=3.0):
     return np.array(xs), np.array(ys)
 
 
+def make_cluster(n_turbines, seed, D):
+    """One PLayGen ``cluster`` layout with exactly ``n_turbines`` turbines.
+
+    Poisson-disc archetype from NREL's PLayGen (helpers/playgen.py). Unlike
+    ``make_irregular`` (a uniform-random cloud), cluster headroom grows with farm size,
+    giving the difficulty diversity the v8 irregular pool lacks (see compare_layouts.py).
+    PLayGen sets its own native spacing (2.5-7 D), so ``min_dist_D``/spread do not apply.
+
+    PLayGen draws from the GLOBAL numpy RNG, so we seed it for reproducibility and
+    restore the caller's RNG state afterwards (never perturb training's global stream).
+    Returns ``(x_array, y_array)`` to mirror ``make_irregular``.
+    """
+    try:
+        from . import playgen          # imported as helpers.layout_gen (training)
+    except ImportError:
+        import playgen                  # imported with helpers/ on sys.path (tests, layout_tools)
+    state = np.random.get_state()
+    try:
+        np.random.seed(seed)
+        xy = playgen.PLayGen(layout_style="cluster", N_turbs=int(n_turbines), D=D)()
+    finally:
+        np.random.set_state(state)
+    return xy[:, 0].astype(float), xy[:, 1].astype(float)
+
+
 # Operating wind rose for these experiments (matches layout_tools.WDIRS = 225..315),
 # sampled coarsely for the cheap geometric headroom screen.
 HEADROOM_WD = np.arange(225.0, 316.0, 15.0)
@@ -107,20 +132,29 @@ def generate_layout_pool(
     min_dist_D: float = 3.0,
     screen_headroom: bool = True,
     min_involved_frac: float = 0.5,
+    generator: str = "irregular",
 ) -> List[Tuple[str, np.ndarray, np.ndarray]]:
-    """Build a pool of ``pool_size`` irregular layouts for DR training.
+    """Build a pool of ``pool_size`` procedural layouts for DR training.
 
-    Each layout draws ``n ~ Uniform[n_lo, n_hi]`` turbines. The spread heuristic
-    (``sx = 6 + 1.6 n``, ``sy = 4 + 1.0 n``, in D) matches ``layout_tools.build_pool``
-    so generated farms have v4-comparable density. The pool RNG is derived from
+    Each layout draws ``n ~ Uniform[n_lo, n_hi]`` turbines. The pool RNG is derived from
     ``seed`` so different training seeds draw different layout sets.
 
-    Returns a list of ``(name, x_pos, y_pos)`` tuples; names are unique
-    (``dr_n{n}_k{k}``). Profiles are intentionally NOT computed here — the caller
-    attaches them (geometric or pywake) exactly as for the fixed named layouts.
+    ``generator`` selects the archetype:
+      * ``"irregular"`` (default) — uniform-random cloud via ``make_irregular`` with the
+        spread heuristic (``sx = 6 + 1.6 n``, ``sy = 4 + 1.0 n``, in D) that matches
+        ``layout_tools.build_pool``. Names ``dr_n{n}_k{k}`` (unchanged for v8 back-compat).
+      * ``"cluster"`` — PLayGen Poisson-disc clusters via ``make_cluster`` (own native
+        spacing; ``min_dist_D``/spread ignored). Names ``drc_n{n}_k{k}``.
+
+    Returns a list of ``(name, x_pos, y_pos)`` tuples with unique names. Profiles are
+    intentionally NOT computed here — the caller attaches them (geometric or pywake)
+    exactly as for the fixed named layouts.
     """
     if n_lo > n_hi:
         raise ValueError(f"dr_n_lo ({n_lo}) must be <= dr_n_hi ({n_hi})")
+    if generator not in ("irregular", "cluster"):
+        raise ValueError(f"unknown generator '{generator}' (expected 'irregular' or 'cluster')")
+    name_prefix = "drc" if generator == "cluster" else "dr"
     rng = np.random.default_rng(seed)
     pool: List[Tuple[str, np.ndarray, np.ndarray]] = []
     rejected = 0
@@ -129,16 +163,19 @@ def generate_layout_pool(
     while len(pool) < pool_size and attempts < max_attempts:
         attempts += 1
         n = int(rng.integers(n_lo, n_hi + 1))
-        sx, sy = 6.0 + 1.6 * n, 4.0 + 1.0 * n
         # Per-layout seed from the pool RNG keeps generation reproducible per (seed, k).
         layout_seed = int(rng.integers(0, 2**31 - 1))
-        x, y = make_irregular(n, layout_seed, sx, sy, D, min_dist_D=min_dist_D)
+        if generator == "cluster":
+            x, y = make_cluster(n, layout_seed, D)
+        else:
+            sx, sy = 6.0 + 1.6 * n, 4.0 + 1.0 * n
+            x, y = make_irregular(n, layout_seed, sx, sy, D, min_dist_D=min_dist_D)
         # Reject layouts with no wake-steering headroom (no overlap = no potential gain).
         if screen_headroom and not has_wake_headroom(x, y, D, min_involved_frac=min_involved_frac):
             rejected += 1
             continue
         k = len(pool)
-        pool.append((f"dr_n{n}_k{k}", x, y))
+        pool.append((f"{name_prefix}_n{n}_k{k}", x, y))
     if len(pool) < pool_size:
         raise RuntimeError(
             f"only generated {len(pool)}/{pool_size} headroom-positive layouts in "
