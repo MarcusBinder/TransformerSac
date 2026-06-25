@@ -183,6 +183,16 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     print(f"Using device: {device}")
 
+    # Fused Adam: collapses Adam's per-parameter foreach kernels into a single
+    # fused launch. On this small/short-sequence model the update loop is
+    # launch-bound (esp. utd>1, which runs num_envs*utd updates/iter), so this is
+    # a direct, math-equivalent speedup. CUDA-only; falls back to default on CPU.
+    _adam_fused = device.type == "cuda"
+    def make_adam(params, lr):
+        return optim.Adam(params, lr=lr, fused=_adam_fused)
+    if _adam_fused:
+        print("Optimizers: fused Adam enabled (CUDA)")
+
     # Force math SDPA backend (avoids ROCm Flash/MemEfficient kernel bugs)
     # ONLY RELEVANT FOR LUMI. TODO make it such this only works on lumi
     # if device.type == "cuda":
@@ -731,7 +741,7 @@ def main():
         taus = (torch.arange(args.tqc_n_quantiles, device=device).float() + 0.5) / args.tqc_n_quantiles
 
         tqc_params = get_critic_params_excluding_shared(tqc_critic, shared_recep_encoder, shared_influence_encoder)
-        q_optimizer = optim.Adam(tqc_params + shared_encoder_params, lr=args.q_lr)
+        q_optimizer = make_adam(tqc_params + shared_encoder_params, lr=args.q_lr)
 
         actor_params = sum(p.numel() for p in actor.parameters())
         critic_params = sum(p.numel() for p in tqc_critic.parameters())
@@ -750,7 +760,7 @@ def main():
         qf1_params = get_critic_params_excluding_shared(qf1, shared_recep_encoder, shared_influence_encoder)
         qf2_params = get_critic_params_excluding_shared(qf2, shared_recep_encoder, shared_influence_encoder)
 
-        q_optimizer = optim.Adam(
+        q_optimizer = make_adam(
             qf1_params + qf2_params + shared_encoder_params,
             lr=args.q_lr,
         )
@@ -761,7 +771,7 @@ def main():
         print(f"Critic parameters: {critic_params:,} (x2)")
 
     # Optimizers (exclude shared encoder params — handled by q_optimizer only)
-    actor_optimizer = optim.Adam(
+    actor_optimizer = make_adam(
         [p for p in actor.parameters() if id(p) not in shared_param_ids],
         lr=args.policy_lr,
     )
@@ -791,7 +801,7 @@ def main():
         # Keep alpha a detached GPU tensor (not a Python float) so the in-graph
         # loss math never forces a per-step .item() sync; materialized only at logging.
         alpha = log_alpha.exp().detach()
-        alpha_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
+        alpha_optimizer = make_adam([log_alpha], lr=args.q_lr)
     else:
         alpha = torch.tensor(float(args.alpha), device=device)
         log_alpha = None
@@ -996,7 +1006,7 @@ def main():
                 if "fc_mean" not in name and "fc_logstd" not in name:
                     param.requires_grad = False
                     frozen.append(name)
-            actor_optimizer = optim.Adam(
+            actor_optimizer = make_adam(
                 [p for p in actor.parameters() if p.requires_grad and id(p) not in shared_param_ids],
                 lr=args.policy_lr,
             )
@@ -1205,7 +1215,7 @@ def main():
             and global_step - args.num_envs < args.pretrain_freeze_steps):
             for name, param in actor.named_parameters():
                 param.requires_grad = True
-            actor_optimizer = optim.Adam(
+            actor_optimizer = make_adam(
                 [p for p in actor.parameters() if id(p) not in shared_param_ids],
                 lr=args.policy_lr,
             )
