@@ -1104,7 +1104,9 @@ def main():
                 # reduce-overhead with a plain-compiled module corrupts the
                 # CUDA-graph-trees allocator. (A vmap-ensembled critic was tried and
                 # was ~2x SLOWER here, so we keep separate critics.)
-                module.forward = torch.compile(module.forward, mode="reduce-overhead")
+                # mode is args.compile_mode for ALL forwards (consistent within a run);
+                # "default" disables cudagraphs (single-rose arms; see config.compile_mode).
+                module.forward = torch.compile(module.forward, mode=args.compile_mode)
 
         _compile_forward(actor)
         if args.algorithm == "tqc":
@@ -1368,6 +1370,10 @@ def main():
                 # Get profiles from batch (will be None if not using profiles)
                 batch_receptivity = data.get("receptivity", None)
                 batch_influence = data.get("influence", None)
+                # Single-rose mode: drop the unused influence tensor so it is never a live
+                # input to the compiled critic/actor forwards (phantom cudagraph input).
+                if not actor.use_influence:
+                    batch_influence = None
 
                 # -----------------------------------------------------------------
                 # Update Critics

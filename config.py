@@ -177,6 +177,7 @@ class Args:
     # === Performance / Speed ===
     amp: bool = False        # Enable bfloat16 autocast (AMP) around the gradient updates
     compile: bool = False    # torch.compile the network forward passes (static shapes)
+    compile_mode: str = "reduce-overhead"  # torch.compile mode; "default" disables cudagraphs (needed for single-rose arms)
     log_timing: bool = False  # Log a wall-clock breakdown (env step / sample / critic / actor) to TensorBoard
 
     # === Fine-tuning / Resume Settings ===

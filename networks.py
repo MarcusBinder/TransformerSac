@@ -843,6 +843,11 @@ class TransformerActor(nn.Module):
             mean_action: (batch, n_turbines, action_dim) mean actions
             attn_weights: List of attention weights (empty if need_weights=False)
         """
+        # Single-rose mode: never pass the (unused) influence tensor into the compiled
+        # forward -- a phantom static input corrupts the reduce-overhead cudagraph-trees
+        # allocator on eval-time recapture. None is not a graph input.
+        if not self.use_influence:
+            influence_profile = None
         mean, log_std, attn_weights = self.forward(obs, positions, key_padding_mask,
                                                    recep_profile, influence_profile,
                                                    need_weights=need_weights)
