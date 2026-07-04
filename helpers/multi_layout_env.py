@@ -71,7 +71,8 @@ class MultiLayoutEnv(gym.Env):
         pad_value: float = 0.0,
         shuffle: bool = False,
         max_turbines: Optional[int] = None,
-        max_episode_steps: Optional[int] = None,  
+        max_episode_steps: Optional[int] = None,
+        warmup_episode_steps: Optional[int] = None,
     ):
         """
         Args:
@@ -98,7 +99,11 @@ class MultiLayoutEnv(gym.Env):
         self.env_factory = env_factory
         self.per_turbine_wrapper = per_turbine_wrapper
         self.seed_value = seed
-        self.rng = np.random.default_rng(seed)
+        # Separate RNGs so that enabling shuffle doesn't change the
+        # layout selection sequence (the permutation generation would
+        # otherwise advance a shared RNG, causing different layouts).
+        self.layout_rng = np.random.default_rng(seed)
+        self.shuffle_rng = np.random.default_rng(seed + 1_000_000)
         self.pad_value = pad_value
         self.shuffle = shuffle
 
@@ -116,6 +121,7 @@ class MultiLayoutEnv(gym.Env):
         
         # Initialize with first layout to get observation dimensions
         self.current_layout: LayoutConfig = layouts[0]
+        self._current_layout_index: int = 0  # cached; kept in sync by reset()
         self._current_env: Optional[gym.Env] = None
         self._create_env(self.current_layout)
         
@@ -151,6 +157,14 @@ class MultiLayoutEnv(gym.Env):
         self._attention_mask = self._compute_attention_mask()
 
         self.max_episode_steps = max_episode_steps
+        # One-time warm-up: the first episode uses warmup_episode_steps (if set),
+        # then every subsequent episode uses max_episode_steps. This phase-offsets
+        # resets across envs without changing the canonical episode length.
+        self.warmup_episode_steps = warmup_episode_steps
+        self._episodes_started = 0
+        # Active limit for the current episode; updated in reset(). Initialized
+        # here so a step() before any reset() still has a valid limit.
+        self._active_max_steps = max_episode_steps
         self._elapsed_steps = 0
     
     def _create_env(self, layout: LayoutConfig) -> None:
@@ -348,11 +362,8 @@ class MultiLayoutEnv(gym.Env):
     
     @property
     def current_layout_index(self) -> int:
-        """Index of current layout in self.layouts list."""
-        for i, layout in enumerate(self.layouts):
-            if layout.name == self.current_layout.name:
-                return i
-        raise ValueError(f"Current layout '{self.current_layout.name}' not found in layouts list")
+        """Index of current layout in self.layouts list (O(1), cached by reset())."""
+        return self._current_layout_index
 
     @property
     def n_turbines(self) -> int:
@@ -575,8 +586,9 @@ class MultiLayoutEnv(gym.Env):
             info: Dict containing layout information (with padded arrays)
         """
         if seed is not None:
-            self.rng = np.random.default_rng(seed)
-        
+            self.layout_rng = np.random.default_rng(seed)
+            self.shuffle_rng = np.random.default_rng(seed + 1_000_000)
+
         # Determine which layout to use
         if options is not None and 'layout_name' in options:
             # Use specified layout by name
@@ -591,18 +603,21 @@ class MultiLayoutEnv(gym.Env):
             layout_idx = options['layout_index']
             new_layout = self.layouts[layout_idx]
         else:
-            # Randomly sample a layout
-            new_layout = self.rng.choice(self.layouts)
-        
+            # Randomly sample a layout (sample the index so we can cache it O(1) —
+            # current_layout_index is read every step and the DR pool can be large)
+            layout_idx = int(self.layout_rng.integers(len(self.layouts)))
+            new_layout = self.layouts[layout_idx]
+        self._current_layout_index = layout_idx
+
         # Only reinitialize if layout changed (optimization for single-layout case)
         if new_layout.name != self.current_layout.name:
             # print(f"Resetting environment with layout: {new_layout.name}")
             self._create_env(new_layout)
-        
+
         # Generate new shuffle permutation if shuffle is enabled
         if self.shuffle:
             # print("Shuffling turbine indices on reset")
-            self._perm = self.rng.permutation(self.n_turbines)
+            self._perm = self.shuffle_rng.permutation(self.n_turbines)
             self._inv_perm = np.argsort(self._perm)
         else:
             self._perm = np.arange(self.n_turbines)
@@ -637,6 +652,14 @@ class MultiLayoutEnv(gym.Env):
             info['turbine_permutation'] = padded_perm
         
         self._elapsed_steps = 0
+
+        # Select the episode-length limit for the episode being started.
+        # Only the very first episode uses the warm-up length (if provided).
+        if self._episodes_started == 0 and self.warmup_episode_steps is not None:
+            self._active_max_steps = self.warmup_episode_steps
+        else:
+            self._active_max_steps = self.max_episode_steps
+        self._episodes_started += 1
 
         return padded_obs, info
     
@@ -680,7 +703,7 @@ class MultiLayoutEnv(gym.Env):
         info['attention_mask'] = self._attention_mask.copy()
 
         self._elapsed_steps += 1
-        if self.max_episode_steps is not None and self._elapsed_steps >= self.max_episode_steps:
+        if self._active_max_steps is not None and self._elapsed_steps >= self._active_max_steps:
             truncated = True
 
         return padded_obs, reward, terminated, truncated, info

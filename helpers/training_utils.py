@@ -31,26 +31,37 @@ def clear_gpu_memory():
 
 def compute_adaptive_target_entropy(
     attention_mask: torch.Tensor,
-    action_dim_per_turbine: int = 1
+    action_dim_per_turbine: int = 1,
+    agg: str = "sum",
 ) -> torch.Tensor:
     """
-    Compute target entropy adapted to actual turbine count per sample.
+    Compute the SAC target entropy, matched to how the actor aggregates log-prob.
 
-    This fixes a bug where using max_turbines for all samples causes
-    incorrect entropy targeting when training on variable-size farms.
+    With agg="sum" (standard SAC) the actor's log_pi is summed over turbines, so the
+    target scales with turbine count: -1 per action dimension -> -action_dim * N. This
+    fixes a bug where using max_turbines for all samples mis-targets variable-size farms.
+
+    With agg="mean" the actor's log_pi is the per-(turbine,action) MEAN, so the target is
+    a size-invariant -1 per action dimension regardless of N. This keeps the entropy
+    regularization from scaling with farm size (the large-farm "stay diffuse" pathology).
 
     Args:
         attention_mask: (batch, max_turbines) where True = padding
         action_dim_per_turbine: Actions per turbine (typically 1 for yaw)
+        agg: "sum" or "mean" — must match TransformerActor.entropy_agg
 
     Returns:
         target_entropy: (batch, 1) tensor of per-sample target entropies
     """
-    # Count real turbines per sample
-    n_real_turbines = (~attention_mask).sum(dim=1, keepdim=True).float()
+    batch = attention_mask.shape[0]
+    if agg == "mean":
+        # Size-invariant: -1 per action dimension.
+        return attention_mask.new_full(
+            (batch, 1), -float(action_dim_per_turbine), dtype=torch.float32
+        )
 
-    # Target entropy scales with turbine count
-    # Convention: -1 per action dimension
+    # agg == "sum": scales with the actual turbine count per sample.
+    n_real_turbines = (~attention_mask).sum(dim=1, keepdim=True).float()
     target_entropy = -action_dim_per_turbine * n_real_turbines
 
     return target_entropy

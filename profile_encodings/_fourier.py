@@ -98,8 +98,8 @@ class FourierProfileEncoder(nn.Module):
             )
             fft = torch.cat([fft, padding], dim=-1)
 
-        # Apply learnable harmonic weights
-        fft = fft * self.harmonic_weights.to(fft.device)
+        # Apply learnable harmonic weights (already on the model's device)
+        fft = fft * self.harmonic_weights
 
         if self.use_phase:
             # Magnitude and phase representation
@@ -234,8 +234,8 @@ class FourierProfileEncoderWithContext(nn.Module):
             )
             fft = torch.cat([fft, padding], dim=-1)
 
-        # Apply learnable harmonic weights
-        fft = fft * self.harmonic_weights.to(fft.device)
+        # Apply learnable harmonic weights (already on the model's device)
+        fft = fft * self.harmonic_weights
 
         fourier_features = torch.cat([
             fft[:, 0:1].real,

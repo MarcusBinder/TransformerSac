@@ -5,11 +5,14 @@ Wind-relative transformation is applied at sample time. Profiles are looked up
 via vectorized gather on a pre-padded registry.
 """
 
+import json
+import os
+
 import numpy as np
 import torch
 from typing import Optional, List, Tuple, Dict
 
-from helpers.helper_funcs import transform_to_wind_relative
+from helpers.helper_funcs import transform_to_wind_relative, rotate_profiles_tensor
 
 
 class TransformerReplayBuffer:
@@ -49,6 +52,7 @@ class TransformerReplayBuffer:
         use_profiles: bool = False,
         rotate_profiles: bool = False,
         profile_registry: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
+        profile_registry_gpu_budget_mb: int = 256,
     ):
         """
         Args:
@@ -62,6 +66,9 @@ class TransformerReplayBuffer:
             use_profiles: Whether to store and return receptivity profiles
             rotate_profiles: Whether to rotate profiles to wind-relative frame at sample time
             profile_registry: List of (recep, influence) tuples per layout, each (n_turb, n_dirs)
+            profile_registry_gpu_budget_mb: If the padded profile registry fits under this
+                many MB (and device is CUDA), keep it GPU-resident so sample() transfers only
+                the tiny per-sample index/permutation arrays instead of the full profiles.
         """
         self.capacity = capacity
         self.device = device
@@ -102,9 +109,27 @@ class TransformerReplayBuffer:
                 self._padded_recep[li, :nt] = recep
                 self._padded_infl[li, :nt] = infl
             self._n_dirs = n_dirs
+
+            # Keep the registry GPU-resident if it fits the budget. Then sample()
+            # transfers only the (B,) layout idx + (B, T) permutation arrays and does
+            # the gather/permute/rotate on-device, avoiding the ~n_dirs-wide H2D copy
+            # of the full profile batch every call. The CPU arrays are retained
+            # regardless (save() reads their shape).
+            reg_bytes = self._padded_recep.nbytes + self._padded_infl.nbytes
+            budget_bytes = profile_registry_gpu_budget_mb * 1024 * 1024
+            self._registry_on_gpu = device.type == "cuda" and reg_bytes <= budget_bytes
+            if self._registry_on_gpu:
+                self._padded_recep_gpu = torch.from_numpy(self._padded_recep).to(device)
+                self._padded_infl_gpu = torch.from_numpy(self._padded_infl).to(device)
+            print(
+                f"[ReplayBuffer] profile registry: "
+                f"{'GPU-resident' if self._registry_on_gpu else 'CPU (per-sample transfer)'} "
+                f"({reg_bytes / 1e6:.1f} MB)"
+            )
         else:
             self._layout_indices = None
             self._permutations = None
+            self._registry_on_gpu = False
 
         alloc_mb = (
             self._obs.nbytes + self._next_obs.nbytes + self._actions.nbytes
@@ -188,33 +213,40 @@ class TransformerReplayBuffer:
             - receptivity: (batch, max_turb, n_directions) - only if use_profiles=True
             - influence: (batch, max_turb, n_directions) - only if use_profiles=True
         """
-        indices = np.random.choice(self.size, batch_size, replace=False)
+        # Sample with replacement (standard RL replay; matches SB3/CleanRL). Avoids
+        # np.random.choice(replace=False), which builds a full O(self.size) permutation
+        # every call -- a hidden cost that scales with buffer fill (up to 1e6).
+        indices = np.random.randint(0, self.size, size=batch_size)
 
         # --- Vectorized array indexing (the whole point) ---
         raw_positions = self._raw_positions[indices]            # (B, T, 2)
         wind_directions = self._wind_directions[indices]        # (B,)
 
-        # Normalize positions by rotor diameter
-        positions_norm = raw_positions / self.rotor_diameter
+        # Normalize positions by rotor diameter. Force float32: float32 / python-float
+        # upcasts to float64 under numpy's legacy (pre-NEP50) promotion, which then
+        # crashes the float32 positional-bias MLP. The eval/agent path already casts.
+        positions_norm = (raw_positions / self.rotor_diameter).astype(np.float32)
 
-        # Convert to tensors
-        positions_tensor = torch.tensor(positions_norm, device=self.device, dtype=torch.float32)
+        # Move wind directions to device once (reused by the wind-relative
+        # transform and GPU-side profile rotation below).
+        need_wind = self.use_wind_relative or (self.use_profiles and self.rotate_profiles)
+        wind_dir_tensor = self._to_device(wind_directions) if need_wind else None
 
-        # Conditionally apply wind-relative transformation
+        # Positions: normalize on CPU (cheap), transfer, rotate to wind-relative on GPU.
+        positions_tensor = self._to_device(positions_norm)
         if self.use_wind_relative:
-            wind_dir_tensor = torch.tensor(wind_directions, device=self.device, dtype=torch.float32)
             positions_final = transform_to_wind_relative(positions_tensor, wind_dir_tensor)
         else:
             positions_final = positions_tensor
 
         result = {
-            "observations": torch.tensor(self._obs[indices], device=self.device, dtype=torch.float32),
-            "next_observations": torch.tensor(self._next_obs[indices], device=self.device, dtype=torch.float32),
-            "actions": torch.tensor(self._actions[indices], device=self.device, dtype=torch.float32),
+            "observations": self._to_device(self._obs[indices]),
+            "next_observations": self._to_device(self._next_obs[indices]),
+            "actions": self._to_device(self._actions[indices]),
             "positions": positions_final,
-            "attention_mask": torch.tensor(self._attention_mask[indices], device=self.device, dtype=torch.bool),
-            "rewards": torch.tensor(self._rewards[indices], device=self.device, dtype=torch.float32).unsqueeze(-1),
-            "dones": torch.tensor(self._dones[indices], device=self.device, dtype=torch.float32).unsqueeze(-1),
+            "attention_mask": self._to_device(self._attention_mask[indices]),
+            "rewards": self._to_device(self._rewards[indices]).unsqueeze(-1),
+            "dones": self._to_device(self._dones[indices]).unsqueeze(-1),
         }
 
         # --- Vectorized profile lookup + permutation ---
@@ -222,24 +254,54 @@ class TransformerReplayBuffer:
             layout_idx_batch = self._layout_indices[indices]    # (B,)
             perm_batch = self._permutations[indices]            # (B, T)
 
-            # Gather from pre-padded registry: (B, T, n_dirs)
-            recep_batch = self._padded_recep[layout_idx_batch]  # (B, T, D)
-            infl_batch = self._padded_infl[layout_idx_batch]    # (B, T, D)
+            if self._registry_on_gpu:
+                # Transfer only the tiny index/permutation arrays; gather + permute the
+                # GPU-resident registry on-device. torch.gather over axis 1 is the exact
+                # equivalent of np.take_along_axis(..., perm[:, :, None], axis=1).
+                layout_idx_t = self._to_device(layout_idx_batch).long()  # (B,)
+                perm_t = self._to_device(perm_batch)                     # (B, T) int64
+                recep_t = self._padded_recep_gpu[layout_idx_t]           # (B, T, D)
+                infl_t = self._padded_infl_gpu[layout_idx_t]
+                perm_idx = perm_t[:, :, None].expand(-1, -1, self._n_dirs)
+                recep_t = torch.gather(recep_t, 1, perm_idx)
+                infl_t = torch.gather(infl_t, 1, perm_idx)
+            else:
+                # CPU path: gather from pre-padded registry, permute, then transfer.
+                recep_batch = self._padded_recep[layout_idx_batch]  # (B, T, D)
+                infl_batch = self._padded_infl[layout_idx_batch]    # (B, T, D)
 
-            # Apply permutation via advanced indexing (vectorized, no loop)
-            # perm_batch[:, :, None] broadcasts over the n_dirs axis
-            recep_batch = np.take_along_axis(recep_batch, perm_batch[:, :, None], axis=1)
-            infl_batch = np.take_along_axis(infl_batch, perm_batch[:, :, None], axis=1)
+                # Apply permutation via advanced indexing (vectorized, no loop)
+                # perm_batch[:, :, None] broadcasts over the n_dirs axis
+                recep_batch = np.take_along_axis(recep_batch, perm_batch[:, :, None], axis=1)
+                infl_batch = np.take_along_axis(infl_batch, perm_batch[:, :, None], axis=1)
 
-            # Optionally rotate profiles to wind-relative frame
+                recep_t = self._to_device(recep_batch)
+                infl_t = self._to_device(infl_batch)
+
+            # Rotate to wind-relative frame on-device (avoids CPU rotation + re-copy)
             if self.rotate_profiles:
-                recep_batch = self._rotate_profiles_batch(recep_batch, wind_directions)
-                infl_batch = self._rotate_profiles_batch(infl_batch, wind_directions)
+                recep_t = rotate_profiles_tensor(recep_t, wind_dir_tensor)
+                infl_t = rotate_profiles_tensor(infl_t, wind_dir_tensor)
 
-            result["receptivity"] = torch.tensor(recep_batch, device=self.device, dtype=torch.float32)
-            result["influence"] = torch.tensor(infl_batch, device=self.device, dtype=torch.float32)
+            result["receptivity"] = recep_t
+            result["influence"] = infl_t
 
         return result
+
+    def _to_device(self, arr: np.ndarray) -> torch.Tensor:
+        """
+        Host->device transfer for a sampled batch array.
+
+        A plain synchronous copy: the result is consumed immediately by the
+        critic forward, so there is no concurrent GPU work to overlap with --
+        pinning + non_blocking would only add page-lock allocation overhead
+        for zero benefit (revisit only if a prefetch pipeline is added).
+        Storage arrays already hold the target dtypes (float32 / bool), so no
+        cast is needed here. ascontiguousarray is kept: fancy-indexed sources are
+        contiguous, but normalized positions / permuted profiles may not be.
+        """
+        t = torch.from_numpy(np.ascontiguousarray(arr))
+        return t.to(self.device)
 
     def _rotate_profiles_batch(
         self,
@@ -263,6 +325,116 @@ class TransformerReplayBuffer:
         # Build shifted index array: (batch, 1, n_directions)
         indices = (np.arange(n_directions)[None, None, :] + shifts[:, None, None]) % n_directions
         return np.take_along_axis(profiles, indices, axis=-1)
+
+    def save(self, path: str, extra_meta: Optional[dict] = None) -> None:
+        """
+        Save the filled portion of the buffer to an uncompressed .npz file.
+
+        Only the first `size` transitions are written (circular order does not
+        matter for uniform sampling). The write is atomic: data goes to a temp
+        file which is then renamed, so a killed job never leaves a truncated
+        buffer at `path`.
+
+        Args:
+            path: Destination .npz path
+            extra_meta: Optional JSON-serializable dict stored alongside the
+                data (e.g. layouts, seed, global_step) and returned by load()
+        """
+        n = self.size
+        payload = {
+            "obs": self._obs[:n],
+            "next_obs": self._next_obs[:n],
+            "actions": self._actions[:n],
+            "rewards": self._rewards[:n],
+            "dones": self._dones[:n],
+            "raw_positions": self._raw_positions[:n],
+            "attention_mask": self._attention_mask[:n],
+            "wind_directions": self._wind_directions[:n],
+            "size": np.int64(n),
+            "max_turbines": np.int64(self.max_turbines),
+            "obs_dim": np.int64(self._obs.shape[2]),
+            "action_dim": np.int64(self._actions.shape[2]),
+            "use_profiles": np.bool_(self.use_profiles),
+            "meta_json": np.str_(json.dumps(extra_meta or {})),
+        }
+        if self.use_profiles:
+            payload["layout_indices"] = self._layout_indices[:n]
+            payload["permutations"] = self._permutations[:n]
+            payload["n_layouts"] = np.int64(self._padded_recep.shape[0])
+            payload["n_dirs"] = np.int64(self._n_dirs)
+
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "wb") as f:
+            np.savez(f, **payload)
+        os.replace(tmp_path, path)
+
+        size_mb = os.path.getsize(path) / 1e6
+        print(f"[ReplayBuffer] Saved {n} transitions to {path} ({size_mb:.1f} MB)")
+
+    def load(self, path: str) -> dict:
+        """
+        Load transitions from a .npz file (created by save()) into this buffer.
+
+        The buffer must already be constructed with a compatible configuration
+        (same max_turbines/obs_dim/action_dim/use_profiles, and for profiles
+        the same registry layout count and direction resolution). Existing
+        contents are overwritten.
+
+        Args:
+            path: Source .npz path
+
+        Returns:
+            The extra_meta dict that was passed to save()
+        """
+        with np.load(path, allow_pickle=False) as data:
+            n = int(data["size"])
+
+            def _check(name: str, expected: int) -> None:
+                actual = int(data[name])
+                if actual != expected:
+                    raise ValueError(
+                        f"Replay buffer mismatch on '{name}': saved buffer has "
+                        f"{actual}, current buffer expects {expected} ({path})"
+                    )
+
+            _check("max_turbines", self.max_turbines)
+            _check("obs_dim", self._obs.shape[2])
+            _check("action_dim", self._actions.shape[2])
+            if bool(data["use_profiles"]) != self.use_profiles:
+                raise ValueError(
+                    f"Replay buffer mismatch on 'use_profiles': saved buffer has "
+                    f"{bool(data['use_profiles'])}, current buffer expects "
+                    f"{self.use_profiles} ({path})"
+                )
+            if n > self.capacity:
+                raise ValueError(
+                    f"Saved buffer holds {n} transitions but capacity is only "
+                    f"{self.capacity}. Increase --buffer_size."
+                )
+
+            self._obs[:n] = data["obs"]
+            self._next_obs[:n] = data["next_obs"]
+            self._actions[:n] = data["actions"]
+            self._rewards[:n] = data["rewards"]
+            self._dones[:n] = data["dones"]
+            self._raw_positions[:n] = data["raw_positions"]
+            self._attention_mask[:n] = data["attention_mask"]
+            self._wind_directions[:n] = data["wind_directions"]
+
+            if self.use_profiles:
+                _check("n_layouts", self._padded_recep.shape[0])
+                _check("n_dirs", self._n_dirs)
+                self._layout_indices[:n] = data["layout_indices"]
+                self._permutations[:n] = data["permutations"]
+
+            meta = json.loads(str(data["meta_json"]))
+
+        self.size = n
+        self.position = n % self.capacity
+
+        print(f"[ReplayBuffer] Loaded {n} transitions from {path}")
+        return meta
 
     def __len__(self) -> int:
         return self.size

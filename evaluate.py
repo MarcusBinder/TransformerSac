@@ -78,8 +78,9 @@ def create_eval_env(layout: str, args: dict, seed: int = 42):
                     rotor_diameter=D,
                     k_wake=0.04,
                     n_directions=n_dirs,
-                    sigma_smooth=10.0,
+                    sigma_smooth=args.get("profile_sigma_smooth", 10.0),
                     scale_factor=15.0,
+                    mode=args.get("profile_geom_mode", "wake"),
                 )
             elif profile_source == "pywake":
                 from helpers.receptivity_profiles import compute_layout_profiles

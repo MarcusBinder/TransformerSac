@@ -14,6 +14,7 @@ import torch.nn.functional as F
 
 from config import Args
 
+from positional_encodings._attn import MaskedScaledAttention, neighbour_allow_mask
 from positional_encodings import (
     AbsolutePositionalEncoding,
     RelativePositionalBias,
@@ -302,6 +303,7 @@ def create_profile_encoding(
     profile_type: Optional[str],  # Optional
     embed_dim: int,
     hidden_channels: int,
+    use_influence: bool = True,  # If False, only build the receptivity encoder (returns None for influence)
     **encoder_kwargs,  # Flexible kwargs for different encoder types (e.g. n_harmonics for Fourier, scales for MultiResolution)
 ) -> Tuple[Optional[nn.Module], Optional[nn.Module]]:
     """
@@ -363,7 +365,10 @@ def create_profile_encoding(
         raise ValueError(f"Unknown profile_type: {profile_type}")
 
     recep_encoder = cls(embed_dim=embed_dim, hidden_channels=hidden_channels, **defaults)
-    influence_encoder = cls(embed_dim=embed_dim, hidden_channels=hidden_channels, **defaults)
+    influence_encoder = (
+        cls(embed_dim=embed_dim, hidden_channels=hidden_channels, **defaults)
+        if use_influence else None
+    )
 
     return recep_encoder, influence_encoder
 
@@ -392,7 +397,9 @@ class TransformerEncoderLayer(nn.Module):
         embed_dim: int,
         num_heads: int,
         mlp_ratio: float = 2.0,
-        dropout: float = 0.0
+        dropout: float = 0.0,
+        attn_logit_scale: str = "none",   # v5: "none" | "logn"
+        attn_softmax: str = "softmax",    # v5: "softmax" | "entmax15"
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -402,12 +409,14 @@ class TransformerEncoderLayer(nn.Module):
         self.norm1 = nn.LayerNorm(embed_dim)
         self.norm2 = nn.LayerNorm(embed_dim)
 
-        # Multi-head attention
-        self.attn = nn.MultiheadAttention(
+        # Multi-head attention (custom: supports log-N scaling + local masking;
+        # identical to nn.MultiheadAttention when flags are off)
+        self.attn = MaskedScaledAttention(
             embed_dim,
             num_heads,
             dropout=dropout,
-            batch_first=True
+            logit_scale=attn_logit_scale,
+            softmax_type=attn_softmax,
         )
 
         # Feed-forward network
@@ -425,38 +434,30 @@ class TransformerEncoderLayer(nn.Module):
         x: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
         attn_bias: Optional[torch.Tensor] = None,
-        need_weights: bool = False,  # NEW
+        local_allow: Optional[torch.Tensor] = None,  # v5: (batch, n, n) bool, True = allowed
+        need_weights: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             x: (batch, n_tokens, embed_dim)
             key_padding_mask: (batch, n_tokens) where True = ignore this position
-            attention: (batch, n_heads, n_tokens, n_tokens) optional bias to add
+            attn_bias: (batch, n_heads, n_tokens, n_tokens) optional bias added
                        to attention logits (for relative positional encoding)
+            local_allow: (batch, n, n) optional bool mask; True = query may attend key
 
         Returns:
             x: Transformed tensor, same shape as input
-            attn_weights: (batch, n_heads, n_tokens, n_tokens) attention weights
+            attn_weights: (batch, n_heads, n_tokens, n_tokens) attention weights (or None)
         """
-        # Self-attention with pre-norm
+        # Self-attention with pre-norm. The custom attention takes the (B,H,N,N) bias
+        # directly (no reshape) and applies optional log-N scaling + local masking.
         x_norm = self.norm1(x)
-
-        # If we have attention bias, we need to use it as attn_mask
-        # PyTorch's MultiheadAttention adds attn_mask to attention logits
-        if attn_bias is not None:
-            # attn_mask in PyTorch MHA: (batch * num_heads, tgt_len, src_len) or (tgt_len, src_len)
-            # We need to reshape our bias: (batch, num_heads, n, n) → (batch * num_heads, n, n)
-            batch_size, num_heads, n, _ = attn_bias.shape
-            attn_mask = attn_bias.reshape(batch_size * num_heads, n, n)
-        else:
-            attn_mask = None
-
         attn_out, attn_weights = self.attn(
-            x_norm, x_norm, x_norm,
+            x_norm,
             key_padding_mask=key_padding_mask,
-            attn_mask=attn_mask,
-            average_attn_weights=False,  # Return per-head weights
-            need_weights=need_weights,  # Only compute if needed!
+            attn_bias=attn_bias,
+            local_allow=local_allow,
+            need_weights=need_weights,
         )
         x = x + attn_out
 
@@ -486,11 +487,14 @@ class TransformerEncoder(nn.Module):
         num_heads: int,
         num_layers: int,
         mlp_ratio: float = 2.0,
-        dropout: float = 0.0
+        dropout: float = 0.0,
+        attn_logit_scale: str = "none",   # v5
+        attn_softmax: str = "softmax",    # v5
     ):
         super().__init__()
         self.layers = nn.ModuleList([
-            TransformerEncoderLayer(embed_dim, num_heads, mlp_ratio, dropout)
+            TransformerEncoderLayer(embed_dim, num_heads, mlp_ratio, dropout,
+                                    attn_logit_scale=attn_logit_scale, attn_softmax=attn_softmax)
             for _ in range(num_layers)
         ])
         self.norm = nn.LayerNorm(embed_dim)  # Final layer norm
@@ -500,6 +504,7 @@ class TransformerEncoder(nn.Module):
         x: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
         attn_bias: Optional[torch.Tensor] = None,
+        local_allow: Optional[torch.Tensor] = None,  # v5
         need_weights: bool = False,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
@@ -507,6 +512,7 @@ class TransformerEncoder(nn.Module):
             x: (batch, n_tokens, embed_dim)
             key_padding_mask: (batch, n_tokens) where True = padding
             attn_bias: (batch, n_heads, n_tokens, n_tokens) optional attention bias
+            local_allow: (batch, n, n) optional bool local-attention mask (same for all layers)
             need_weights: If True, return attention weights (expensive). Default False.
 
         Returns:
@@ -516,7 +522,8 @@ class TransformerEncoder(nn.Module):
         all_attn_weights = []
 
         for layer in self.layers:
-            x, attn_weights = layer(x, key_padding_mask, attn_bias, need_weights=need_weights)
+            x, attn_weights = layer(x, key_padding_mask, attn_bias,
+                                    local_allow=local_allow, need_weights=need_weights)
             if need_weights:
                 all_attn_weights.append(attn_weights)
 
@@ -528,6 +535,20 @@ class TransformerEncoder(nn.Module):
 # =============================================================================
 # ACTOR NETWORK
 # =============================================================================
+
+def _read_attn_cfg(args):
+    """v5 attention flags from args, with backward-compatible defaults."""
+    if args is None:
+        return "none", "softmax", "none", 10.0, 5, 40.0
+    return (
+        getattr(args, "attn_logit_scale", "none"),
+        getattr(args, "attn_softmax", "softmax"),
+        getattr(args, "attn_local", "none"),
+        float(getattr(args, "attn_local_radius_D", 10.0)),
+        int(getattr(args, "attn_local_k", 5)),
+        float(getattr(args, "attn_local_cone_deg", 40.0)),
+    )
+
 
 LOG_STD_MAX = 2
 LOG_STD_MIN = -5
@@ -601,6 +622,9 @@ class TransformerActor(nn.Module):
 
         self.obs_dim_per_turbine = obs_dim_per_turbine
         self.action_dim_per_turbine = action_dim_per_turbine
+        # Entropy aggregation over turbines for the SAC log-prob ("sum" | "mean").
+        # "mean" keeps per-turbine entropy pressure size-invariant (see config.entropy_agg).
+        self.entropy_agg = getattr(args, "entropy_agg", "sum") if args is not None else "sum"
         self.embed_dim = embed_dim
         self.pos_encoding_type = pos_encoding_type
 
@@ -626,24 +650,33 @@ class TransformerActor(nn.Module):
             )
 
 
+        # Whether to use the (redundant) influence rose; False => single receptivity encoder
+        self.use_influence = getattr(args, "profile_use_influence", True) if args is not None else True
+
         # Receptivity profile encoder (optional)
         # Use shared encoders if provided, otherwise create new ones
-        if shared_recep_encoder is not None and shared_influence_encoder is not None:
+        if shared_recep_encoder is not None:
             self.recep_encoder = shared_recep_encoder
-            self.influence_encoder = shared_influence_encoder
+            self.influence_encoder = shared_influence_encoder if self.use_influence else None
         else:
             encoder_kwargs = json.loads(args.profile_encoder_kwargs)
+            if "hidden_channels" in encoder_kwargs:  # silently popping it wasted a whole sweep once
+                raise ValueError(
+                    "hidden_channels in --profile_encoder_kwargs is ignored; "
+                    "use the --profile_encoder_hidden flag instead."
+                )
             self.recep_encoder, self.influence_encoder = \
                 create_profile_encoding(
                     profile_type=profile_encoding,
                     embed_dim=embed_dim,
                     hidden_channels=profile_encoder_hidden,
+                    use_influence=self.use_influence,
                     **encoder_kwargs,
                 )
 
 
 
-        if profile_encoding is not None and profile_fusion_type == "joint":
+        if profile_encoding is not None and self.use_influence and profile_fusion_type == "joint":
             # self.profile_fusion = nn.Sequential(
             #     nn.Linear(2 * embed_dim, embed_dim),
             #     nn.LayerNorm(embed_dim),
@@ -670,9 +703,12 @@ class TransformerActor(nn.Module):
             self.input_proj = nn.Identity()
 
 
-        # Standard transformer (with optional attention bias)
+        # Standard transformer (with optional attention bias + v5 log-N scaling / local attention)
+        (_ls, _sm, self.attn_local, self.attn_local_radius_D,
+         self.attn_local_k, self.attn_local_cone_deg) = _read_attn_cfg(args)
         self.transformer = TransformerEncoder(
-            embed_dim, num_heads, num_layers, mlp_ratio, dropout
+            embed_dim, num_heads, num_layers, mlp_ratio, dropout,
+            attn_logit_scale=_ls, attn_softmax=_sm,
         )
 
         # Action heads (shared across turbines)
@@ -728,17 +764,20 @@ class TransformerActor(nn.Module):
         h = self.input_proj(h)  # (batch, n_turb, embed_dim)
 
         # Profile encoding (after projection, like positional encoding in LLMs)
-        if self.recep_encoder and recep_profile is not None and influence_profile is not None:
+        if self.recep_encoder and recep_profile is not None:
             recep_embed = self.recep_encoder(recep_profile)  # (batch, n_turb, embed_dim)
-            influence_embed = self.influence_encoder(influence_profile)  # (batch, n_turb, embed_dim)
 
-            # Step 1: Fuse receptivity + influence into a single profile embedding
-            if self.profile_fusion_type == "joint":
-                profile_embed = self.profile_fusion(
-                    torch.cat([recep_embed, influence_embed], dim=-1)
-                )  # (batch, n_turb, embed_dim)
-            else:  # "add"
-                profile_embed = recep_embed + influence_embed  # (batch, n_turb, embed_dim)
+            # Step 1: profile embedding -- fuse with influence, or use receptivity alone
+            if self.use_influence and influence_profile is not None:
+                influence_embed = self.influence_encoder(influence_profile)  # (batch, n_turb, embed_dim)
+                if self.profile_fusion_type == "joint":
+                    profile_embed = self.profile_fusion(
+                        torch.cat([recep_embed, influence_embed], dim=-1)
+                    )  # (batch, n_turb, embed_dim)
+                else:  # "add"
+                    profile_embed = recep_embed + influence_embed  # (batch, n_turb, embed_dim)
+            else:  # single-rose: receptivity only
+                profile_embed = recep_embed
 
             # Step 2: Integrate profile embedding into token representation
             if self.profile_embed_mode == "concat":
@@ -755,8 +794,16 @@ class TransformerActor(nn.Module):
         if self.rel_pos_bias is not None:
             attn_bias = self.rel_pos_bias(positions, key_padding_mask)
 
+        # v5: local-attention mask from (rotor-diameter) positions
+        local_allow = None
+        if self.attn_local != "none":
+            local_allow = neighbour_allow_mask(
+                positions, key_padding_mask, self.attn_local,
+                radius_D=self.attn_local_radius_D, k=self.attn_local_k,
+                cone_deg=self.attn_local_cone_deg)
 
-        h, attn_weights = self.transformer(h, key_padding_mask, attn_bias, need_weights=need_weights)
+        h, attn_weights = self.transformer(h, key_padding_mask, attn_bias,
+                                           local_allow=local_allow, need_weights=need_weights)
 
         # Action distribution parameters
         mean = self.fc_mean(h)
@@ -796,6 +843,11 @@ class TransformerActor(nn.Module):
             mean_action: (batch, n_turbines, action_dim) mean actions
             attn_weights: List of attention weights (empty if need_weights=False)
         """
+        # Single-rose mode: never pass the (unused) influence tensor into the compiled
+        # forward -- a phantom static input corrupts the reduce-overhead cudagraph-trees
+        # allocator on eval-time recapture. None is not a graph input.
+        if not self.use_influence:
+            influence_profile = None
         mean, log_std, attn_weights = self.forward(obs, positions, key_padding_mask,
                                                    recep_profile, influence_profile,
                                                    need_weights=need_weights)
@@ -816,14 +868,24 @@ class TransformerActor(nn.Module):
         log_prob = normal.log_prob(x_t)
         log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
 
-        # Mask out padded positions before summing
+        # Mask out padded positions before aggregating
         if key_padding_mask is not None:
             # key_padding_mask: (batch, n_turbines), True = padding
             mask = ~key_padding_mask.unsqueeze(-1)  # (batch, n_turb, 1), True = real
-            log_prob = log_prob * mask.float()
+            mask_f = mask.float()
+            log_prob = log_prob * mask_f
+            n_real_dims = mask_f.sum(dim=(-2, -1)) * log_prob.shape[-1]  # (batch,) real action dims
+        else:
+            n_real_dims = log_prob.new_full(
+                (log_prob.shape[0],), float(log_prob.shape[-2] * log_prob.shape[-1])
+            )
 
-        # Sum over turbines and action dims -> (batch, 1)
-        log_prob = log_prob.sum(dim=(-2, -1), keepdim=False).unsqueeze(-1)
+        # Aggregate over turbines and action dims -> (batch, 1)
+        log_prob = log_prob.sum(dim=(-2, -1), keepdim=False)
+        if self.entropy_agg == "mean":
+            # Per-(turbine,action) MEAN: keeps entropy O(1) regardless of farm size N.
+            log_prob = log_prob / n_real_dims.clamp(min=1.0)
+        log_prob = log_prob.unsqueeze(-1)
 
         # Mean action (for logging)
         mean_action = torch.tanh(mean) * self.action_scale + self.action_bias_val
@@ -888,6 +950,8 @@ class TransformerCritic(nn.Module):
         self.profile_encoding = profile_encoding
         self.profile_fusion_type = profile_fusion_type
         self.profile_embed_mode = profile_embed_mode
+        # v9: "pool" (masked-mean embeddings -> farm-Q) or "vdn" (per-turbine q_head -> masked-sum).
+        self.critic_agg = getattr(args, "critic_agg", "pool") if args is not None else "pool"
 
         # Create positional encoding modules based on type
         self.pos_encoder, self.rel_pos_bias, self.embedding_mode = \
@@ -901,18 +965,27 @@ class TransformerCritic(nn.Module):
                 embedding_mode=pos_embedding_mode,
             )
 
+        # Whether to use the (redundant) influence rose; False => single receptivity encoder
+        self.use_influence = getattr(args, "profile_use_influence", True) if args is not None else True
+
         # PyWake profile encoder (optional)
         # Use shared encoders if provided, otherwise create new ones
-        if shared_recep_encoder is not None and shared_influence_encoder is not None:
+        if shared_recep_encoder is not None:
             self.recep_encoder = shared_recep_encoder
-            self.influence_encoder = shared_influence_encoder
+            self.influence_encoder = shared_influence_encoder if self.use_influence else None
         else:
             encoder_kwargs = json.loads(args.profile_encoder_kwargs)
+            if "hidden_channels" in encoder_kwargs:  # silently popping it wasted a whole sweep once
+                raise ValueError(
+                    "hidden_channels in --profile_encoder_kwargs is ignored; "
+                    "use the --profile_encoder_hidden flag instead."
+                )
             self.recep_encoder, self.influence_encoder = \
                 create_profile_encoding(
                     profile_type=profile_encoding,
                     embed_dim=embed_dim,
                     hidden_channels=profile_encoder_hidden,
+                    use_influence=self.use_influence,
                     **encoder_kwargs,
                 )
 
@@ -930,7 +1003,7 @@ class TransformerCritic(nn.Module):
         else:
             self.input_proj = nn.Identity()
 
-        if profile_encoding is not None and profile_fusion_type == "joint":
+        if profile_encoding is not None and self.use_influence and profile_fusion_type == "joint":
             # self.profile_fusion = nn.Sequential(
             #     nn.Linear(2 * embed_dim, embed_dim),
             #     nn.LayerNorm(embed_dim),
@@ -942,9 +1015,12 @@ class TransformerCritic(nn.Module):
         if profile_encoding is not None and profile_embed_mode == "concat":
             self.profile_proj = nn.Linear(2 * embed_dim, embed_dim)
 
-        # Transformer encoder (choose based on encoding type)
+        # Transformer encoder (+ v5 log-N scaling / local attention)
+        (_ls, _sm, self.attn_local, self.attn_local_radius_D,
+         self.attn_local_k, self.attn_local_cone_deg) = _read_attn_cfg(args)
         self.transformer = TransformerEncoder(
-            embed_dim, num_heads, num_layers, mlp_ratio, dropout
+            embed_dim, num_heads, num_layers, mlp_ratio, dropout,
+            attn_logit_scale=_ls, attn_softmax=_sm,
         )
 
         # Q-value head (after pooling)
@@ -1000,17 +1076,20 @@ class TransformerCritic(nn.Module):
         h = self.input_proj(h)
 
         # Profile encoding (after projection, like positional encoding in LLMs)
-        if self.recep_encoder and recep_profile is not None and influence_profile is not None:
+        if self.recep_encoder and recep_profile is not None:
             recep_embed = self.recep_encoder(recep_profile)  # (batch, n_turb, embed_dim)
-            influence_embed = self.influence_encoder(influence_profile)  # (batch, n_turb, embed_dim)
 
-            # Step 1: Fuse receptivity + influence
-            if self.profile_fusion_type == "joint":
-                profile_embed = self.profile_fusion(
-                    torch.cat([recep_embed, influence_embed], dim=-1)
-                )
-            else:
-                profile_embed = recep_embed + influence_embed
+            # Step 1: profile embedding -- fuse with influence, or use receptivity alone
+            if self.use_influence and influence_profile is not None:
+                influence_embed = self.influence_encoder(influence_profile)  # (batch, n_turb, embed_dim)
+                if self.profile_fusion_type == "joint":
+                    profile_embed = self.profile_fusion(
+                        torch.cat([recep_embed, influence_embed], dim=-1)
+                    )
+                else:
+                    profile_embed = recep_embed + influence_embed
+            else:  # single-rose: receptivity only
+                profile_embed = recep_embed
 
             # Step 2: Integrate into token representation
             if self.profile_embed_mode == "concat":
@@ -1024,22 +1103,40 @@ class TransformerCritic(nn.Module):
         if self.rel_pos_bias is not None:
             attn_bias = self.rel_pos_bias(positions, key_padding_mask)
 
+        # v5: local-attention mask from (rotor-diameter) positions
+        local_allow = None
+        if self.attn_local != "none":
+            local_allow = neighbour_allow_mask(
+                positions, key_padding_mask, self.attn_local,
+                radius_D=self.attn_local_radius_D, k=self.attn_local_k,
+                cone_deg=self.attn_local_cone_deg)
+
         # Transformer (no need for attention weights in critic)
-        h, _ = self.transformer(h, key_padding_mask, attn_bias, need_weights=False)
+        h, _ = self.transformer(h, key_padding_mask, attn_bias,
+                                local_allow=local_allow, need_weights=False)
 
 
-        # Masked mean pooling over turbines
-        if key_padding_mask is not None:
-            mask = ~key_padding_mask.unsqueeze(-1)  # (batch, n_turb, 1), True = real
-            h = h * mask.float()
-            h_sum = h.sum(dim=1)  # (batch, embed_dim)
-            n_real = mask.float().sum(dim=1).clamp(min=1)  # (batch, 1)
-            h_pooled = h_sum / n_real
+        if self.critic_agg == "vdn":
+            # v9 value decomposition: per-turbine Q-head, then masked-SUM over turbines.
+            # q_head applies to the last dim, so it broadcasts over (batch, n_turb, embed).
+            # Padded turbines' embeddings are non-zero, so zero their per-turbine Q before summing.
+            q_per = self.q_head(h)  # (batch, n_turb, q_out)  [q_out=1 for SAC, n_quantiles for TQC]
+            if key_padding_mask is not None:
+                valid = (~key_padding_mask).unsqueeze(-1).float()  # (batch, n_turb, 1)
+                q_per = q_per * valid
+            q = q_per.sum(dim=1)  # (batch, q_out) — un-diluted per-turbine credit
         else:
-            h_pooled = h.mean(dim=1)  # (batch, embed_dim)
-
-        # Q-value
-        q = self.q_head(h_pooled)  # (batch, 1)
+            # "pool" (standard): masked-mean of turbine embeddings -> single farm-Q.
+            if key_padding_mask is not None:
+                mask = ~key_padding_mask.unsqueeze(-1)  # (batch, n_turb, 1), True = real
+                mask_f = mask.float()
+                h = h * mask_f
+                h_sum = h.sum(dim=1)  # (batch, embed_dim)
+                n_real = mask_f.sum(dim=1).clamp(min=1)  # (batch, 1)
+                h_pooled = h_sum / n_real
+            else:
+                h_pooled = h.mean(dim=1)  # (batch, embed_dim)
+            q = self.q_head(h_pooled)  # (batch, 1)
 
         return q
 

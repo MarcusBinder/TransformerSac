@@ -188,6 +188,8 @@ def compute_layout_profiles_vectorized(
     n_directions: int = 360,
     sigma_smooth: float = 10.0,
     scale_factor: float = 15.0,
+    mode: str = "wake",
+    sigma_ang_deg: float = 10.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     print("Calling vectorized geometric profile computation...")
     """
@@ -195,7 +197,15 @@ def compute_layout_profiles_vectorized(
 
     Much faster for large farms (no Python loops over directions).
 
-    Args / Returns: Same as compute_layout_profiles().
+    mode="wake" (default): the original up/downstream wake-deficit roses — receptivity
+        (sum over UPSTREAM neighbours) and influence (sum over DOWNSTREAM neighbours).
+    mode="distance": a single bearing-keyed rose where every neighbour j deposits an
+        inverse-distance amplitude (D / r_ij) at its compass bearing, spread by a FIXED
+        angular Gaussian (sigma_ang_deg). Full 360°, all neighbours, no up/down folding
+        (preserves asymmetry) — "how close is a neighbour in each direction". Returned in
+        both slots; pair with profile_use_influence=False so only one encoder consumes it.
+
+    Args / Returns: otherwise same as compute_layout_profiles().
     """
     D = rotor_diameter
     n_turbines = len(x_pos)
@@ -222,6 +232,27 @@ def compute_layout_profiles_vectorized(
 
     # Self-mask: (n_turbines, n_turbines)
     self_mask = ~np.eye(n_turbines, dtype=bool)
+
+    if mode == "distance":
+        # Bearing rose: deposit (D / r_ij) at neighbour j's bearing, fixed angular Gaussian.
+        # phi = angle between the upwind axis (direction d) and the bearing to j; the rose
+        # for turbine i peaks at the direction aligned with each neighbour's bearing.
+        r = np.sqrt(x_stream ** 2 + y_lat ** 2)            # (d, i, j) — direction-invariant per pair
+        phi = np.arctan2(y_lat, -x_stream)                 # 0 when j is directly upwind
+        sigma_ang = np.deg2rad(sigma_ang_deg)
+        ang_kernel = np.exp(-0.5 * (phi / sigma_ang) ** 2)
+        amp = np.where(self_mask[np.newaxis, :, :], D / np.maximum(r, 1e-6), 0.0)
+        dist_raw = np.sum(amp * ang_kernel, axis=2).T      # → (n_turbines, n_directions)
+
+        dist_rose = np.zeros_like(dist_raw)
+        for t in range(n_turbines):
+            dist_rose[t] = gaussian_filter1d(dist_raw[t], sigma=sigma_smooth, mode='wrap')
+        dist_rose *= scale_factor
+        dist_rose = dist_rose.astype(np.float32)
+        return dist_rose, dist_rose
+
+    if mode != "wake":
+        raise ValueError(f"mode must be 'wake' or 'distance', got '{mode}'")
 
     min_dist = 1.0 * D  # minimum streamwise distance
 
