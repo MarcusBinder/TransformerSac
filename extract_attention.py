@@ -274,7 +274,7 @@ def main():
 
     # Warmup with agent's own policy
     for _ in range(args.warmup):
-        obs_t, pos_t, mask_t, rec_t, inf_t = prepare_batch(obs, **batch_kwargs)
+        obs_t, pos_t, mask_t, rec_t, inf_t = prepare_batch(obs=obs, **batch_kwargs)
         with torch.no_grad():
             action_t, _, _, _ = actor.get_action(
                 obs_t, pos_t, mask_t, deterministic=True,
@@ -283,7 +283,7 @@ def main():
         obs, _, _, _, _ = env.step(action_t.squeeze(-1).squeeze(0).cpu().numpy())
 
     # Final snapshot
-    obs_t, pos_t, mask_t, rec_t, inf_t = prepare_batch(obs, **batch_kwargs)
+    obs_t, pos_t, mask_t, rec_t, inf_t = prepare_batch(obs=obs, **batch_kwargs)
     with torch.no_grad():
         actions, log_prob, mean_action, attn_weights = actor.get_action(
             obs_t, pos_t, mask_t, deterministic=True,
