@@ -94,7 +94,9 @@ class Args:
     dr_generator: str = "irregular"  # {"irregular","cluster"}: procedural pool generator (cluster = PLayGen Poisson-disc)
 
     # === Observation Settings ===
-    history_length: int = 15            # Number of timesteps of history per feature
+    history_length: int = 15            # Raw measurements buffered per feature (deque size; sets warm-up length)
+    history_N: Optional[int] = None     # Rolling means per feature in the obs (drives obs dim); None = history_length (legacy coupled behavior)
+    window_length: int = 1              # Raw samples averaged per rolling mean
     use_wd_deviation: bool = False      # If True, convert WD to deviation from mean
     use_wind_relative_pos: bool = True  # Transform positions to wind-relative frame
     wd_scale_range: float = 90.0        # Only used if use_wd_deviation=True. Wind direction deviation range for scaling (±degrees → [-1,1])

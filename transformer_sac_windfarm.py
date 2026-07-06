@@ -351,7 +351,36 @@ def main():
             else:
                 print(f"  [pre-scan] history_length already matches checkpoint: {args.history_length}")
 
+        # --- history_N / window_length ---
+        # Old checkpoints predate these args: their networks were built with
+        # history_N == history_length and window_length == 1, so those values
+        # win here just like the explicit ones (obs shape must match the
+        # pretrained weights either way).
+        ckpt_history_N = _prescan_args.get("history_N")
+        if ckpt_history_N is None and "history_length" in _prescan_args:
+            ckpt_history_N = _prescan_args["history_length"]
+        if ckpt_history_N is not None and ckpt_history_N != args.history_N:
+            print(f"  [pre-scan] Overriding history_N: {args.history_N} → {ckpt_history_N} (from checkpoint)")
+            args.history_N = ckpt_history_N
+        ckpt_window = _prescan_args.get("window_length", 1 if _prescan_args else None)
+        if ckpt_window is not None and ckpt_window != args.window_length:
+            print(f"  [pre-scan] Overriding window_length: {args.window_length} → {ckpt_window} (from checkpoint)")
+            args.window_length = ckpt_window
+
         del _prescan  # free memory; full load happens later
+
+    # Resolve the legacy coupling BEFORE the config writes and checkpoint saves:
+    # vars(args) is what save_checkpoint persists, so eval scripts always see a
+    # concrete history_N.
+    if args.history_N is None:
+        args.history_N = args.history_length
+    if args.history_N < 1:
+        raise ValueError(f"history_N must be >= 1, got {args.history_N}")
+    if args.window_length > args.history_length:
+        raise ValueError(
+            f"window_length ({args.window_length}) > history_length ({args.history_length}): "
+            f"every rolling window would silently collapse to the full-buffer mean."
+        )
 
     # Environment configuration
     print(f"using the config: {args.config}")
@@ -369,8 +398,9 @@ def main():
     }
 
     for mes_type, prefix in mes_prefixes.items():
-        config[mes_type][f"{prefix}_history_N"] = args.history_length
+        config[mes_type][f"{prefix}_history_N"] = args.history_N
         config[mes_type][f"{prefix}_history_length"] = args.history_length
+        config[mes_type][f"{prefix}_window_length"] = args.window_length
 
     
     base_env_kwargs = {
@@ -1103,6 +1133,8 @@ def main():
             "seed": args.seed,
             "global_step": step,
             "history_length": args.history_length,
+            "history_N": args.history_N,
+            "window_length": args.window_length,
         }
 
     if args.load_buffer is not None:
@@ -1122,6 +1154,23 @@ def main():
                 f"Replay buffer was generated with history_length="
                 f"{buffer_meta_loaded.get('history_length')} but this run uses "
                 f"{args.history_length}. Observation contents would be inconsistent."
+            )
+        # Old buffers predate the decoupled args: history_N was implicitly
+        # history_length and window_length implicitly 1.
+        _buf_history_N = buffer_meta_loaded.get(
+            "history_N", buffer_meta_loaded.get("history_length")
+        )
+        if _buf_history_N != args.history_N:
+            raise ValueError(
+                f"Replay buffer was generated with history_N={_buf_history_N} "
+                f"but this run uses {args.history_N}. Observation dims would be "
+                f"inconsistent."
+            )
+        if buffer_meta_loaded.get("window_length", 1) != args.window_length:
+            raise ValueError(
+                f"Replay buffer was generated with window_length="
+                f"{buffer_meta_loaded.get('window_length', 1)} but this run uses "
+                f"{args.window_length}. Observation contents would be inconsistent."
             )
         if buffer_meta_loaded.get("seed") != args.seed:
             print(f"NOTE: buffer was generated with seed={buffer_meta_loaded.get('seed')}, "

@@ -208,17 +208,18 @@ def make_env_config(name: str = "default") -> Dict[str, Any]:
     return _deep_update(config, deepcopy(ENV_CONFIGS[name]))
 
 
-def obs_dim_per_turbine(config: Dict[str, Any], history_length: int) -> int:
+def obs_dim_per_turbine(config: Dict[str, Any], history_N: int) -> int:
     """Per-turbine observation size produced by WindGym's FarmMes for this config.
 
     Mirrors TurbMes.observed_variables(): the ws/wd/power channels are gated by
     the mes_level turb_* flags (FarmMes ANDs them into the per-channel
     current/rolling settings), yaw is never gated, and turb_TI adds one value.
-    history_length is the history_N the caller writes into every channel dict
-    (both the training script and the eval scripts override it from args/ckpt).
+    history_N is the number of rolling means per channel (the *_history_N the
+    caller writes into every channel dict) — obs width does NOT depend on
+    history_length (deque size) or window_length (samples per mean).
     """
     mes = config["mes_level"]
-    H = int(history_length)
+    H = int(history_N)
 
     def n(prefix: str, enabled: bool = True) -> int:
         c = config[f"{prefix}_mes"]
