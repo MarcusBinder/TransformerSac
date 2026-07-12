@@ -143,12 +143,18 @@ class MultiLayoutEnv(gym.Env):
             dtype=np.float32
         )
         
-        # Define padded action space (1 action per turbine for yaw)
-        # Get action bounds from the wrapped env
+        # Define padded action space (1 action per turbine).
+        # The wrapped env's action space may be 1-D (max_turbines,) or 2-D
+        # (n_turbines, action_dim_per_turbine) depending on the wrapper version;
+        # the per-turbine bounds are uniform, so extract a scalar bound in a
+        # shape-agnostic way rather than indexing row 0 (which is a (act_dim,)
+        # vector under the 2-D wrapper, breaking the Box shape check).
         base_action_space = self._current_env.action_space
+        low = float(np.asarray(base_action_space.low).reshape(-1)[0])
+        high = float(np.asarray(base_action_space.high).reshape(-1)[0])
         self.action_space = spaces.Box(
-            low=base_action_space.low[0],
-            high=base_action_space.high[0],
+            low=low,
+            high=high,
             shape=(self.max_turbines,),
             dtype=np.float32
         )
@@ -201,12 +207,25 @@ class MultiLayoutEnv(gym.Env):
     def _get_obs_dim_from_env(self) -> int:
         """Get observation dimension per turbine without calling reset().
 
-        Traverses wrapper chain to find _obs_dim_per_turbine (from
-        PerTurbineObservationWrapper) or get_obs_dim_per_turbine() (from
-        WindFarmEnv). This enables lazy initialization.
+        Prefers the wrapped env's emitted per-token width, which INCLUDES any
+        broadcast farm-level tail (farm_* sensors and/or the power-tracking
+        [setpoint, error] tail). Falls back to traversing the wrapper chain for
+        _obs_dim_per_turbine (from PerTurbineObservationWrapper) or
+        get_obs_dim_per_turbine() (from WindFarmEnv). This enables lazy
+        initialization.
+
+        NOTE: the sensor-only _obs_dim_per_turbine attribute is width n_sensors
+        (e.g. 6); the emitted token is n_sensors + n_farm. Reading the emitted
+        width keeps _pad_observation's allocation consistent with the obs it
+        assigns. For a purely per-turbine env (n_farm == 0) both agree, so the
+        existing yaw path is unaffected.
         """
         env = self._current_env
-        # Check wrapper first (PerTurbineObservationWrapper stores it)
+        # Emitted per-token width INCLUDES the broadcast farm/tracking tail.
+        if getattr(env, "observation_space", None) is not None \
+                and len(env.observation_space.shape) == 2:
+            return int(env.observation_space.shape[-1])
+        # Fallback: traverse the wrapper chain for the sensor-only attribute.
         while hasattr(env, 'env'):
             if hasattr(env, '_obs_dim_per_turbine'):
                 return env._obs_dim_per_turbine

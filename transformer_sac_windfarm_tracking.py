@@ -1,0 +1,1905 @@
+"""
+Transformer-based SAC for Wind Farm Control -- POWER-TRACKING / DERATE-ONLY variant.
+
+This is a fork of transformer_sac_windfarm.py with ONLY the ENV SETUP block
+changed to train a derate-only agent that tracks a farm-power reference on a
+fixed 3-turbine row with the steady-state pywake backend (see
+windgym/examples/Example 7 Power tracking RL setup.ipynb). The network and
+training loop are byte-for-byte identical to the yaw trainer.
+
+Differences from transformer_sac_windfarm.py (all in ENV SETUP):
+  - turbine: a derating-capable DTU10MW surrogate (make_derating_dtu10mw).
+  - layout: a single hardcoded "track3" row, x = [0, 6D, 12D], y = 0.
+  - config: "power_tracking" (Track_power, derate_action, yaw_action=False).
+  - per-sensor history from the config (NOW_AND_T2) is kept -- the uniform
+    history_N/history_length override loop is dropped.
+  - power reference: a stepwise 80/60/70/100 %-of-greedy schedule supplied via
+    WindFarmEnv(power_ref_function=...); greedy is measured once by a probe env.
+
+Recommended smoke-run args:
+  --config power_tracking --backend pywake --action_type wind --num_envs 1
+  --dt_sim 1 --dt_env 1 --max_episode_steps 400 --history_length 3
+  --profile_encoding_type None --pos_encoding_type None --use_wd_deviation False
+  --compile False --amp False --eval_initial False --eval_interval 100000000
+  --track False --total_timesteps 30000 --learning_starts 1000
+
+Trains a Soft Actor-Critic agent with a transformer backbone to learn
+control policies that generalize across wind farm layouts.
+
+Design principles:
+    1. Per-turbine tokenization: Each turbine is a token with local observations
+    2. Wind-relative positional encoding: Positions rotated so wind comes from 270°
+    3. Wind direction as deviation from mean (rotation invariant)
+    4. Shared actor/critic heads across turbines (permutation equivariant)
+    5. Adaptive target entropy based on actual turbine count
+    6. Modular positional encoding with absolute and relative options
+
+Positional encoding options (--pos_encoding_type):
+    absolute_mlp, sinusoidal_2d, polar_mlp, relative_mlp, relative_mlp_shared,
+    relative_polar, alibi, alibi_directional, absolute_plus_relative,
+    RelativePositionalBiasAdvanced, RelativePositionalBiasFactorized,
+    RelativePositionalBiasWithWind
+
+Author: Marcus Binder Nilsen (DTU Wind Energy)
+"""
+
+import os
+import random
+import time
+from typing import Optional, Tuple, List, Dict, Any, Union
+from collections import deque
+import json
+
+from config import Args
+from replay_buffer import TransformerReplayBuffer
+from helpers.training_utils import (
+    clear_gpu_memory, compute_adaptive_target_entropy,
+    get_env_current_layout, log_optimizer_effective_lr,
+    compute_optimizer_diagnostics, log_finetune_diagnostics,
+)
+
+# Set memory allocation config BEFORE importing torch
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
+
+import gymnasium as gym
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import tyro
+from torch.utils.tensorboard import SummaryWriter
+
+# WindGym imports (adjust path as needed for your setup)
+from WindGym import WindFarmEnv
+from WindGym.wrappers import RecordEpisodeVals, PerTurbineObservationWrapper
+from helpers.agent import WindFarmAgent
+
+# Logging utilities for multi-layout training
+from helpers.multi_layout_debug import (
+    MultiLayoutDebugLogger,
+    create_debug_logger,
+)
+
+from helpers.helper_funcs import (
+    get_env_wind_directions,
+    get_env_raw_positions,
+    get_env_attention_masks,
+    save_checkpoint,
+    load_checkpoint,
+    compute_wind_direction_deviation,
+    EnhancedPerTurbineWrapper,
+    get_env_receptivity_profiles,
+    get_env_influence_profiles,
+    rotate_profiles_tensor,
+    get_env_layout_indices,
+    get_env_permutations,
+    soft_update,
+)
+from helpers.layouts import get_layout_positions
+from helpers.env_configs import make_env_config
+
+# Power-tracking / derate-only helpers (see module docstring).
+from functools import partial
+from helpers.derating_turbine import make_derating_dtu10mw
+from helpers.power_ref import stepwise_power_ref, measure_greedy, DEFAULT_SCHEDULE
+
+# Receptivity profile computation
+from helpers.receptivity_profiles import compute_layout_profiles
+
+# Evaluation import
+from helpers.eval_utils import PolicyEvaluator, run_evaluation
+
+from networks import (
+    TransformerActor,
+    TransformerCritic,
+    TransformerTQCCritic,
+    create_profile_encoding,
+    quantile_huber_loss,
+)
+
+
+
+# =============================================================================
+# MAIN TRAINING SCRIPT
+# =============================================================================
+
+def main():
+    """Main training function."""
+    
+    # Parse arguments
+    args = tyro.cli(Args)
+    
+    # Validate initial_exploration
+    assert args.initial_exploration in ("random", "policy"), \
+        f"--initial_exploration must be 'random' or 'policy', got '{args.initial_exploration}'"
+    if args.initial_exploration == "policy" and args.resume_checkpoint is None:
+        print("WARNING: --initial_exploration=policy without --resume_checkpoint. "
+              "The actor is untrained, so 'policy' exploration will just be random Gaussian noise.")
+    if args.initial_exploration == "policy":
+        print(f"Initial exploration: using actor network for first {args.learning_starts} steps")
+
+    # Validate replay buffer save/load flags
+    assert not (args.buffer_only and args.load_buffer is not None), \
+        "--buffer_only generates a warmup buffer; combining it with --load_buffer is pointless"
+    if args.buffer_only and not args.save_buffer_at_learning_starts:
+        print("NOTE: --buffer_only implies --save_buffer_at_learning_starts, enabling it.")
+        args.save_buffer_at_learning_starts = True
+    if args.save_buffer_at_learning_starts and args.initial_exploration == "policy":
+        print("WARNING: Saving the warmup buffer with --initial_exploration=policy. "
+              "The saved transitions depend on the actor weights, not just the seed.")
+    
+    # Parse layouts
+    layout_names = [l.strip() for l in args.layouts.split(",")]
+    dr_enabled = args.dr_n_hi is not None
+    is_multi_layout = len(layout_names) > 1 or dr_enabled
+    
+    # Parse evaluation layouts
+    if args.eval_layouts.strip():
+        eval_layout_names = [l.strip() for l in args.eval_layouts.split(",")]
+    else:
+        eval_layout_names = layout_names  # Use training layouts for evaluation
+    
+    print(f"Training layouts: {layout_names}")
+    print(f"Evaluation layouts: {eval_layout_names}")
+
+
+    # Create run name
+    run_name = f"{args.exp_name}"
+    
+    print("=" * 60)
+    print(f"Transformer SAC for Wind Farm Control")
+    print("=" * 60)
+    if is_multi_layout:
+        print(f"Mode: Multi-layout training with layouts: {layout_names}")
+    else:
+        print(f"Mode: Single-layout training: {layout_names[0]}")
+    print(f"Run name: {run_name}")
+    print("=" * 60)
+    
+    # Create directories
+    os.makedirs(f"runs/{run_name}", exist_ok=True)
+    os.makedirs(f"runs/{run_name}/checkpoints", exist_ok=True)
+    os.makedirs(f"runs/{run_name}/attention_plots", exist_ok=True)
+    
+    clear_gpu_memory()
+    
+    # Seeding
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.backends.cudnn.deterministic = args.torch_deterministic
+    
+    assert args.algorithm in ("sac", "tqc"), \
+        f"--algorithm must be 'sac' or 'tqc', got '{args.algorithm}'"
+
+    if args.use_droq and args.utd_ratio < 10:
+        print(f"WARNING: DroQ is enabled but utd_ratio={args.utd_ratio}. "
+              f"DroQ typically benefits from high UTD ratios (>=10, often 20).")
+
+    if args.use_droq and args.policy_frequency > 1:
+        print(f"WARNING: DroQ is enabled but policy_frequency={args.policy_frequency}. "
+              f"DroQ typically uses policy_frequency=1 to update the actor every gradient step.")
+
+    if args.use_droq and args.algorithm == "tqc":
+        print("NOTE: DroQ dropout is active during TQC actor updates. "
+              "Dropout noise affects which quantiles are truncated, potentially "
+              "weakening TQC's pessimism. Monitor Q-value overestimation carefully.")
+
+    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    print(f"Using device: {device}")
+
+    # Fused Adam: collapses Adam's per-parameter foreach kernels into a single
+    # fused launch. On this small/short-sequence model the update loop is
+    # launch-bound (esp. utd>1, which runs num_envs*utd updates/iter), so this is
+    # a direct, math-equivalent speedup. CUDA-only; falls back to default on CPU.
+    _adam_fused = device.type == "cuda"
+    def make_adam(params, lr):
+        return optim.Adam(params, lr=lr, fused=_adam_fused)
+    if _adam_fused:
+        print("Optimizers: fused Adam enabled (CUDA)")
+
+    # Force math SDPA backend (avoids ROCm Flash/MemEfficient kernel bugs)
+    # ONLY RELEVANT FOR LUMI. TODO make it such this only works on lumi
+    # if device.type == "cuda":
+    #     torch.backends.cuda.enable_flash_sdp(False)
+    #     torch.backends.cuda.enable_mem_efficient_sdp(False)
+    #     torch.backends.cuda.enable_math_sdp(True)
+    #     print("Forced math SDPA backend")
+
+    # =========================================================================
+    # ENVIRONMENT SETUP
+    # =========================================================================
+    
+    # Import WindGym components
+    from WindGym import WindFarmEnv
+    from WindGym.wrappers import RecordEpisodeVals, PerTurbineObservationWrapper
+    from helpers.multi_layout_env import MultiLayoutEnv, LayoutConfig
+    
+    # Wind turbine -- derate-capable DTU10MW surrogate. Derating requires a
+    # turbine whose powerCtFunction accepts a `derate` input; plain DTU10MW()
+    # fails WindFarmEnv's check_turbine_supports_derating. --turbtype is kept
+    # for run-naming only (this trainer always uses the surrogate).
+    wind_turbine = make_derating_dtu10mw()
+    
+    # Create layout configurations
+    print("Setting up layouts...")
+
+    def build_layout_config(name, x_pos, y_pos, verbose=True):
+        """Build a LayoutConfig and attach receptivity/influence profiles (if enabled).
+
+        Shared by the fixed named-layout path and the domain-randomization pool so
+        generated farms get profiles computed exactly like the hand-picked ones.
+        """
+        layout = LayoutConfig(name=name, x_pos=x_pos, y_pos=y_pos)
+        if args.profile_encoding_type is not None:
+            if args.profile_source.lower() == "geometric":
+                from helpers.geometric_profiles import compute_layout_profiles_vectorized
+
+                # Get rotor diameter as a float (geometric version doesn't need the full WT object)
+                D = wind_turbine.diameter()  # or however DTU10MW exposes this
+
+                if verbose:
+                    print(f"Computing GEOMETRIC profiles for layout: {name}")
+                receptivity_profiles, influence_profiles = compute_layout_profiles_vectorized(
+                    x_pos, y_pos,
+                    rotor_diameter=D,
+                    k_wake=0.04,
+                    n_directions=args.n_profile_directions,
+                    sigma_smooth=args.profile_sigma_smooth,
+                    scale_factor=15.0,
+                    mode=args.profile_geom_mode,
+                )
+            elif args.profile_source.lower() == "pywake":
+                if verbose:
+                    print(f"Computing PyWake profiles for layout: {name}")
+                receptivity_profiles, influence_profiles = compute_layout_profiles(
+                    x_pos, y_pos, wind_turbine,
+                    n_directions=args.n_profile_directions,
+                )
+            else:
+                raise ValueError(
+                    f"Unknown profile_source: {args.profile_source}. "
+                    f"Use 'pywake' or 'geometric'."
+                )
+
+            layout.receptivity_profiles = receptivity_profiles  # (n_turbines, n_directions
+            layout.influence_profiles = influence_profiles      # (n_turbines, n_directions
+        return layout
+
+    # Single fixed 3-turbine row for the tracking run: x = [0, 6D, 12D], y = 0.
+    # The DR pool and named-layout lookup (get_layout_positions) are intentionally
+    # skipped -- this trainer always uses the one hardcoded layout, so --layouts
+    # and the dr_* args are ignored. build_layout_config still attaches profiles
+    # when profile_encoding_type is set (a no-op for the smoke run, which is None).
+    D = wind_turbine.diameter()
+    track_layout = build_layout_config(
+        "track3", x_pos=np.arange(3) * 6 * D, y_pos=np.zeros(3)
+    )
+    layouts = [track_layout]
+    layout_names = [track_layout.name]
+
+    if args.profile_encoding_type is not None:
+        use_profiles = True
+    else:
+        use_profiles = False
+
+
+
+    # Build profile registry from layouts
+    if use_profiles:
+        profile_registry = [
+            (layout.receptivity_profiles, layout.influence_profiles)
+            for layout in layouts
+        ]
+    else:
+        profile_registry = None
+
+
+    # =========================================================================
+    # PRE-SCAN CHECKPOINT FOR ENV-AFFECTING ARGS (before env creation)
+    # =========================================================================
+    # If a pretrain/BC checkpoint is provided, we need action_type and
+    # history_length BEFORE creating the environment, since they affect
+    # config["ActionMethod"] and observation shape.
+    if args.pretrain_checkpoint is not None and os.path.exists(args.pretrain_checkpoint):
+        _prescan = torch.load(args.pretrain_checkpoint, map_location="cpu", weights_only=False)
+        _prescan_args = _prescan.get("args", {})
+
+        # --- action_type ---
+        if "action_type" in _prescan_args:
+            ckpt_action_type = _prescan_args["action_type"]
+            if ckpt_action_type != args.action_type:
+                print(f"  [pre-scan] Overriding action_type: {args.action_type} → {ckpt_action_type} (from checkpoint)")
+                args.action_type = ckpt_action_type
+            else:
+                print(f"  [pre-scan] action_type already matches checkpoint: {args.action_type}")
+
+        # --- history_length ---
+        if "history_length" in _prescan_args:
+            ckpt_history = _prescan_args["history_length"]
+            if ckpt_history != args.history_length:
+                print(f"  [pre-scan] Overriding history_length: {args.history_length} → {ckpt_history} (from checkpoint)")
+                args.history_length = ckpt_history
+            else:
+                print(f"  [pre-scan] history_length already matches checkpoint: {args.history_length}")
+
+        del _prescan  # free memory; full load happens later
+
+    # Environment configuration
+    print(f"using the config: {args.config}")
+    config = make_env_config(args.config)
+
+    # Override ActionMethod from args (default "wind", or overridden by checkpoint above)
+    config["ActionMethod"] = args.action_type
+    print(f"ActionMethod set to: {config['ActionMethod']}")
+    
+    # NOTE (tracking variant): the uniform per-sensor history override from the
+    # yaw trainer is intentionally REMOVED here. The "power_tracking" config sets
+    # each sensor's history explicitly (NOW_AND_T2 = [now, t-2] for ws/yaw/power,
+    # wd off); forcing history_N/length = args.history_length would clobber that
+    # and change the per-token width. --history_length is therefore ignored for
+    # the env; it still affects nothing downstream since obs width is read from
+    # the emitted observation space.
+
+
+    base_env_kwargs = {
+        "turbine": wind_turbine,
+        "n_passthrough": args.max_eps,
+        "TurbBox": "./boxes/",  # Adjust path as needed
+        "config": config,
+        "turbtype": args.TI_type,
+        "backend": args.backend,
+        "dt_sim": args.dt_sim,
+        "dt_env": args.dt_env,
+        "yaw_step_sim": args.yaw_step,
+        # Tracking episode horizon (notebook: 4 segments x 100 steps = 400).
+        "max_time_steps": args.max_episode_steps,
+    }
+
+    # Power-reference schedule. The reference is a fraction-of-greedy step schedule
+    # (80/60/70/100 %), so we first measure GREEDY -- the settled waked farm power
+    # at the fixed inflow -- with a throwaway probe env (built from the SAME kwargs
+    # minus the reference, so it uses the default constant-setpoint sampler; the
+    # flow is what we read, not the reference). Valid only because the inflow is
+    # fixed in the "power_tracking" config; randomizing wind would require
+    # recomputing greedy per episode.
+    def _make_probe_env():
+        return WindFarmEnv(
+            x_pos=np.arange(3) * 6 * D, y_pos=np.zeros(3),
+            reset_init=False, **base_env_kwargs,
+        )
+
+    print("Measuring greedy farm power (probe env)...")
+    GREEDY = measure_greedy(_make_probe_env)
+    print(f"  GREEDY = {GREEDY / 1e6:.3f} MW; reference cycle (MW): "
+          f"{[round(f * GREEDY / 1e6, 2) for _, f in DEFAULT_SCHEDULE]}")
+
+    # partial over a module-level fn keeps this picklable for AsyncVectorEnv.
+    base_env_kwargs["power_ref_function"] = partial(
+        stepwise_power_ref, greedy=GREEDY, schedule=DEFAULT_SCHEDULE
+    )
+
+    def env_factory(x_pos: np.ndarray, y_pos: np.ndarray) -> gym.Env:
+        """Create a base WindFarmEnv with given positions."""
+        env = WindFarmEnv(x_pos=x_pos,
+                          y_pos=y_pos,
+                          reset_init=False,  # Defer reset to training loop
+                          **base_env_kwargs)
+        env.action_space.seed(args.seed)
+        return env
+    
+    def combined_wrapper(env: gym.Env) -> gym.Env:
+        """
+        Combined wrapper that:
+        1. Applies PerTurbineObservationWrapper (reshapes obs to per-turbine)
+        2. Optionally applies EnhancedPerTurbineWrapper (converts WD to deviation)
+        """
+        env = PerTurbineObservationWrapper(env)
+        if args.use_wd_deviation:
+            env = EnhancedPerTurbineWrapper(env, wd_scale_range=args.wd_scale_range)
+        # v9.1: scale the (tiny) Wake_recovery reward to probe optimization signal-to-noise.
+        if args.reward_scale != 1.0:
+            _scale = float(args.reward_scale)
+            env = gym.wrappers.TransformReward(env, lambda r: r * _scale)
+        return env
+    
+    def make_env_fn(seed, warmup_steps=None):
+        """Factory function for vectorized environments."""
+        def _init():
+            env = MultiLayoutEnv(
+                layouts=layouts,
+                env_factory=env_factory,
+                per_turbine_wrapper=combined_wrapper,  # Use combined wrapper
+                seed=seed,
+                shuffle=args.shuffle_turbs,  # Shuffle turbines within each layout
+                max_turbines=args.max_turbines,  # fixed padding/network size (DR: eval up to 25)
+                max_episode_steps=args.max_episode_steps,
+                warmup_episode_steps=warmup_steps,
+            )
+            return env
+        return _init
+
+    # Compute per-env one-time warm-up episode lengths. Staggering only the first
+    # episode permanently phase-offsets each group's resets/shuffles while keeping
+    # every subsequent episode at the standard max_episode_steps.
+    warmup_lengths = [None] * args.num_envs  # default: no stagger (current behavior)
+    if args.stagger_warmup:
+        assert args.max_episode_steps is not None, \
+            "--stagger_warmup requires --max_episode_steps to be set"
+        assert args.warmup_min_episode_steps is not None, \
+            "--stagger_warmup requires --warmup_min_episode_steps"
+        assert args.warmup_min_episode_steps <= args.max_episode_steps, \
+            "--warmup_min_episode_steps must be <= --max_episode_steps"
+
+        num_groups = -(-args.num_envs // args.warmup_group_size)  # integer ceil
+        if num_groups == 1:
+            # A single group has nothing to desync; warm-up is a no-op.
+            group_lengths = [args.max_episode_steps]
+            print("NOTE: stagger_warmup with a single group is a no-op "
+                  "(all envs use the standard episode length).")
+        else:
+            lo = max(1, args.warmup_min_episode_steps)
+            group_lengths = [int(round(v)) for v in
+                             np.linspace(lo, args.max_episode_steps, num_groups)]
+        warmup_lengths = [
+            group_lengths[min(i // args.warmup_group_size, len(group_lengths) - 1)]
+            for i in range(args.num_envs)
+        ]
+        print(f"Staggered warm-up lengths per env: {warmup_lengths}")
+
+    # Create vectorized environments
+    print(f"Creating {args.num_envs} parallel environment(s)...")
+    envs = gym.vector.AsyncVectorEnv(
+        [make_env_fn(args.seed + i, warmup_lengths[i]) for i in range(args.num_envs)],
+        autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,
+    )
+    envs = RecordEpisodeVals(envs)
+       
+
+    n_turbines_max = envs.env.get_attr('max_turbines')[0]
+    obs_dim_per_turbine = envs.single_observation_space.shape[-1]
+    action_dim_per_turbine = 1
+    rotor_diameter = envs.env.get_attr('rotor_diameter')[0]
+
+    print(f"Max turbines: {n_turbines_max}")
+    print(f"Obs dim per turbine: {obs_dim_per_turbine}")
+    print(f"Action dim per turbine: {action_dim_per_turbine}")
+    print(f"Rotor diameter: {rotor_diameter:.1f} m")
+    
+
+    # Create policy evaluator.
+    # NOTE (tracking variant): the eval path is NOT wired for this trainer yet.
+    # PolicyEvaluator resolves its eval layouts via get_layout_positions(name),
+    # which has no "track3" entry, and builds its own env that has not been
+    # validated against power tracking. So we skip constructing it for the smoke
+    # run (which disables eval: --eval_initial False and
+    # --eval_interval >> --total_timesteps) and fail loudly if eval is actually
+    # requested, rather than crashing cryptically inside get_layout_positions.
+    # Wiring eval for the fixed track3 layout is a follow-up. Every evaluator use
+    # site below is guarded with `if evaluator is not None`.
+    eval_requested = args.eval_initial or args.eval_interval <= args.total_timesteps
+    if eval_requested:
+        raise NotImplementedError(
+            "Evaluation is not wired for the power-tracking trainer yet "
+            "(track3 is not a named layout resolvable by get_layout_positions). "
+            "Run with --eval_initial False and "
+            "--eval_interval > --total_timesteps for now."
+        )
+    evaluator = None
+
+
+    # Action scaling
+    action_high = envs.single_action_space.high[0]
+    action_low = envs.single_action_space.low[0]
+    action_scale = (action_high - action_low) / 2.0
+    action_bias = (action_high + action_low) / 2.0
+    
+    # =========================================================================
+    # DEBUG LOGGER AND TRACKING SETUP
+    # =========================================================================
+
+    # Initialize debug logger with configurable frequencies.
+    # Under domain randomization the training pool is huge (e.g. 2048 layouts), so
+    # per-layout debug stats are meaningless and would bloat the logger / W&B; bucket
+    # all DR training steps under a single "dr_pool" name. Per-layout EVAL metrics
+    # (the ones we analyse) come from the evaluator on the fixed eval ladder.
+    debug_layout_names = ["dr_pool"] if dr_enabled else layout_names
+    debug_logger = create_debug_logger(
+        layout_names=debug_layout_names,
+        log_every=250000,  # Base frequency - others are multiples of this
+    )
+    # Frequencies will be:
+    #   - summary metrics: every 100 steps
+    #   - attention analysis: every 500 steps  
+    #   - gradient norms: every 100 steps
+    #   - q-value stats: every 50 steps
+    #   - diagnostic print: every 2000 steps
+
+    print(f"Debug logger initialized for layouts: {debug_layout_names}")
+    print(f"  Attention logging every {debug_logger.attention_log_frequency} steps")
+    print(f"  Gradient logging every {debug_logger.gradient_log_frequency} steps")
+    
+    if args.track:
+        import wandb
+        wandb.init(
+            project=args.wandb_project_name,
+            entity=args.wandb_entity,
+            sync_tensorboard=True,
+            config=vars(args) | {
+                # Debug/multi-layout config
+                "debug/n_layouts": len(layout_names),
+                # Under DR the pool is huge; log a compact summary instead of 2048 names.
+                "debug/layout_names": (f"dr_pool[{args.dr_n_lo}-{args.dr_n_hi}]x{len(layout_names)}"
+                                       if dr_enabled else layout_names),
+                "debug/is_multi_layout": is_multi_layout,
+                "debug/max_turbines": n_turbines_max,
+                "debug/log_frequency": debug_logger.log_frequency,
+                "debug/attention_log_frequency": debug_logger.attention_log_frequency,
+                "debug/gradient_log_frequency": debug_logger.gradient_log_frequency,
+            },
+            name=run_name,
+            group=args.exp_group,
+            monitor_gym=True,
+            save_code=True,
+        )
+
+    writer = SummaryWriter(f"runs/{run_name}")
+    writer.add_text(
+        "hyperparameters",
+        "|param|value|\n|-|-|\n" + "\n".join([f"|{k}|{v}|" for k, v in vars(args).items()])
+    )
+
+    # =========================================================================
+    # NETWORK SETUP
+    # =========================================================================
+    
+    # =========================================================================
+    # OVERRIDE ARCHITECTURE ARGS FROM PRETRAIN CHECKPOINT (if provided)
+    # =========================================================================
+
+    if args.pretrain_checkpoint is not None:
+        print(f"\n{'='*60}")
+        print(f"PRETRAIN CHECKPOINT: loading architecture config")
+        print(f"{'='*60}")
+        print(f"Checkpoint: {args.pretrain_checkpoint}")
+
+        if not os.path.exists(args.pretrain_checkpoint):
+            raise FileNotFoundError(f"Pretrain checkpoint not found: {args.pretrain_checkpoint}")
+
+        _pt_ckpt = torch.load(args.pretrain_checkpoint, map_location="cpu", weights_only=False)
+
+        if "args" not in _pt_ckpt:
+            raise ValueError("Pretrain checkpoint missing 'args' key — cannot load architecture config")
+
+        pt_args = _pt_ckpt["args"]
+
+        # Keys that MUST match between pretrain and RL for weight loading to work
+        ARCH_KEYS = [
+            "embed_dim", "num_heads", "num_layers", "mlp_ratio",
+            "pos_embed_dim", "dropout",
+            "pos_encoding_type", "rel_pos_hidden_dim", "rel_pos_per_head",
+            "pos_embedding_mode",
+            "profile_encoding_type", "profile_encoder_hidden",
+            "profile_fusion_type", "profile_embed_mode",
+            "profile_encoder_kwargs",
+            "n_profile_directions",
+        ]
+
+        overrides = []
+        for key in ARCH_KEYS:
+            if key in pt_args:
+                old_val = getattr(args, key, None)
+                new_val = pt_args[key]
+                if old_val != new_val:
+                    overrides.append((key, old_val, new_val))
+                    setattr(args, key, new_val)
+
+        if overrides:
+            print(f"\n  Overrode {len(overrides)} args from pretrain config:")
+            for key, old, new in overrides:
+                print(f"    {key}: {old} → {new}")
+        else:
+            print(f"\n  All architecture args already match pretrain config ✓")
+
+        # Store for phase 2 (weight loading after network construction)
+        _pretrain_encoder_sd = _pt_ckpt["encoder_state_dict"]
+        print(f"  Encoder state dict: {len(_pretrain_encoder_sd)} parameter tensors")
+
+        # BC checkpoints also contain the full actor (including action heads)
+        _pretrain_actor_sd = _pt_ckpt.get("actor_state_dict", None)
+        if _pretrain_actor_sd is not None:
+            print(f"  Actor state dict:   {len(_pretrain_actor_sd)} parameter tensors (BC checkpoint detected)")
+        else:
+            print(f"  No actor_state_dict found (self-supervised pretrain checkpoint)")
+        print(f"{'='*60}\n")
+
+        del _pt_ckpt  # free memory, keep only what we need
+    
+    
+    
+    print("\nCreating networks...")
+    print(f"Positional encoding type: {args.pos_encoding_type}")
+
+    # ==========================================================================
+    # Create SHARED profile encoders (if using profiles)
+    # ==========================================================================
+    if args.profile_encoding_type is not None:
+        if args.share_profile_encoder:
+            encoder_kwargs = json.loads(args.profile_encoder_kwargs)
+            print(f"Creating shared profile encoders: {args.profile_encoding_type}")
+            shared_recep_encoder, shared_influence_encoder = create_profile_encoding(
+                profile_type=args.profile_encoding_type,
+                embed_dim=args.embed_dim,
+                hidden_channels=args.profile_encoder_hidden,
+                **encoder_kwargs,
+            )
+            # Move to device
+            shared_recep_encoder = shared_recep_encoder.to(device)
+            shared_influence_encoder = shared_influence_encoder.to(device)
+        
+            # Count shared encoder parameters
+            recep_params = sum(p.numel() for p in shared_recep_encoder.parameters())
+            influence_params = sum(p.numel() for p in shared_influence_encoder.parameters())
+            print(f"Shared receptivity encoder parameters: {recep_params:,}")
+            print(f"Shared influence encoder parameters: {influence_params:,}")
+        else:
+            print(f"Using separate profile encoders for each network, handled internally in the critic and actor classes")
+            shared_recep_encoder = None  # 
+            shared_influence_encoder = None  # 
+    else:
+        shared_recep_encoder = None
+        shared_influence_encoder = None
+
+
+    # Common profile args (to avoid repetition)
+    common_kwargs = {
+        # Architecture
+        "obs_dim_per_turbine": obs_dim_per_turbine,
+        "action_dim_per_turbine": action_dim_per_turbine,
+        "embed_dim": args.embed_dim,
+        "pos_embed_dim": args.pos_embed_dim,
+        "num_heads": args.num_heads,
+        "num_layers": args.num_layers,
+        "mlp_ratio": args.mlp_ratio,
+        "dropout": args.dropout,
+        # Positional encoding
+        "pos_encoding_type": args.pos_encoding_type,
+        "rel_pos_hidden_dim": args.rel_pos_hidden_dim,
+        "rel_pos_per_head": args.rel_pos_per_head,
+        "pos_embedding_mode": args.pos_embedding_mode,
+        # PyWake profiles
+        "profile_encoding": args.profile_encoding_type,
+        "profile_encoder_hidden": args.profile_encoder_hidden,
+        "n_profile_directions": args.n_profile_directions,
+        "profile_fusion_type": args.profile_fusion_type,
+        "profile_embed_mode": args.profile_embed_mode,
+        # SHARED encoders
+        "shared_recep_encoder": shared_recep_encoder,
+        "shared_influence_encoder": shared_influence_encoder,
+        "args": args,  # Pass full args for any additional config needs
+    }
+
+    # Actor has additional action scaling params
+    actor = TransformerActor(
+        action_scale=action_scale,
+        action_bias=action_bias,
+        **common_kwargs,
+    ).to(device)
+    
+
+    agent = WindFarmAgent(
+        actor=actor,
+        device=device,
+        rotor_diameter=rotor_diameter,
+        use_wind_relative=args.use_wind_relative_pos,
+        use_profiles=use_profiles,
+        rotate_profiles=args.rotate_profiles,
+    )
+
+    # Update evaluator with actor reference (eval disabled in the tracking run).
+    if evaluator is not None:
+        evaluator.agent = agent
+
+    # Build critic-specific kwargs (DroQ params only go to critics, not actor)
+    critic_kwargs = {**common_kwargs}
+    if args.use_droq:
+        critic_kwargs["droq_dropout"] = args.droq_dropout
+        critic_kwargs["droq_layer_norm"] = args.droq_layer_norm
+
+    # Get critic parameters, excluding shared profile encoders
+    def get_critic_params_excluding_shared(critic, shared_recep, shared_influence):
+        '''Get critic parameters, excluding shared modules.'''
+        shared_param_ids = set()
+        if shared_recep is not None:
+            shared_param_ids.update(id(p) for p in shared_recep.parameters())
+        if shared_influence is not None:
+            shared_param_ids.update(id(p) for p in shared_influence.parameters())
+        return [p for p in critic.parameters() if id(p) not in shared_param_ids]
+
+    # Collect shared encoder params so they receive gradients from critic loss.
+    # These are excluded from actor_optimizer to avoid double updates with
+    # conflicting Adam states — q_optimizer is the sole owner.
+    shared_encoder_params = []
+    if shared_recep_encoder is not None:
+        shared_encoder_params += list(shared_recep_encoder.parameters())
+    if shared_influence_encoder is not None:
+        shared_encoder_params += list(shared_influence_encoder.parameters())
+    shared_param_ids = {id(p) for p in shared_encoder_params}
+
+    # Initialize critic variables (some will be None depending on algorithm)
+    qf1 = qf2 = qf1_target = qf2_target = None
+    tqc_critic = tqc_critic_target = None
+    taus = None
+
+    if args.algorithm == "tqc":
+        tqc_critic = TransformerTQCCritic(
+            n_critics=args.tqc_n_critics,
+            n_quantiles=args.tqc_n_quantiles,
+            **critic_kwargs,
+        ).to(device)
+        tqc_critic_target = TransformerTQCCritic(
+            n_critics=args.tqc_n_critics,
+            n_quantiles=args.tqc_n_quantiles,
+            **critic_kwargs,
+        ).to(device)
+        tqc_critic_target.load_state_dict(tqc_critic.state_dict())
+
+        # Precompute quantile midpoints: tau_i = (i + 0.5) / N
+        taus = (torch.arange(args.tqc_n_quantiles, device=device).float() + 0.5) / args.tqc_n_quantiles
+
+        tqc_params = get_critic_params_excluding_shared(tqc_critic, shared_recep_encoder, shared_influence_encoder)
+        q_optimizer = make_adam(tqc_params + shared_encoder_params, lr=args.q_lr)
+
+        actor_params = sum(p.numel() for p in actor.parameters())
+        critic_params = sum(p.numel() for p in tqc_critic.parameters())
+        print(f"Actor parameters: {actor_params:,}")
+        print(f"TQC Critic parameters: {critic_params:,} ({args.tqc_n_critics} critics x {args.tqc_n_quantiles} quantiles)")
+    else:
+        # SAC: standard dual-critic setup (DroQ regularization applied via critic_kwargs if enabled)
+        qf1 = TransformerCritic(**critic_kwargs).to(device)
+        qf2 = TransformerCritic(**critic_kwargs).to(device)
+        qf1_target = TransformerCritic(**critic_kwargs).to(device)
+        qf2_target = TransformerCritic(**critic_kwargs).to(device)
+
+        qf1_target.load_state_dict(qf1.state_dict())
+        qf2_target.load_state_dict(qf2.state_dict())
+
+        qf1_params = get_critic_params_excluding_shared(qf1, shared_recep_encoder, shared_influence_encoder)
+        qf2_params = get_critic_params_excluding_shared(qf2, shared_recep_encoder, shared_influence_encoder)
+
+        q_optimizer = make_adam(
+            qf1_params + qf2_params + shared_encoder_params,
+            lr=args.q_lr,
+        )
+
+        actor_params = sum(p.numel() for p in actor.parameters())
+        critic_params = sum(p.numel() for p in qf1.parameters())
+        print(f"Actor parameters: {actor_params:,}")
+        print(f"Critic parameters: {critic_params:,} (x2)")
+
+    # Optimizers (exclude shared encoder params — handled by q_optimizer only)
+    actor_optimizer = make_adam(
+        [p for p in actor.parameters() if id(p) not in shared_param_ids],
+        lr=args.policy_lr,
+    )
+
+    # Verify parameter counts
+    if shared_recep_encoder is not None:
+        actor_unique = sum(p.numel() for p in actor.parameters())
+        if args.algorithm == "tqc":
+            critic_unique = sum(p.numel() for p in tqc_params)
+        else:
+            critic_unique = sum(p.numel() for p in qf1_params)
+        shared_total = sum(p.numel() for p in shared_encoder_params)
+        print(f"Actor parameters (includes shared): {actor_unique:,}")
+        print(f"Critic parameters (excluding shared): {critic_unique:,}")
+        print(f"Shared encoder parameters (in both optimizers): {shared_total:,}")
+
+    algo_str = args.algorithm.upper()
+    if args.use_droq:
+        algo_str += " + DroQ"
+    print(f"Algorithm: {algo_str}")
+
+
+    # Entropy tuning
+    if args.autotune:
+        # Initial target entropy (will be adapted per-batch)
+        log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        # Keep alpha a detached GPU tensor (not a Python float) so the in-graph
+        # loss math never forces a per-step .item() sync; materialized only at logging.
+        alpha = log_alpha.exp().detach()
+        alpha_optimizer = make_adam([log_alpha], lr=args.q_lr)
+    else:
+        alpha = torch.tensor(float(args.alpha), device=device)
+        log_alpha = None
+        alpha_optimizer = None
+    
+    # =========================================================================
+    # LOAD CHECKPOINT (for fine-tuning or resuming)
+    # =========================================================================
+    
+    start_step = 0
+    if args.resume_checkpoint is not None:
+        print(f"\n{'='*60}")
+        print(f"LOADING CHECKPOINT FOR FINE-TUNING")
+        print(f"{'='*60}")
+        print(f"Checkpoint path: {args.resume_checkpoint}")
+        
+        if not os.path.exists(args.resume_checkpoint):
+            raise FileNotFoundError(f"Checkpoint not found: {args.resume_checkpoint}")
+        
+        checkpoint = torch.load(args.resume_checkpoint, map_location=device, weights_only=False)
+
+        # Validate checkpoint matches current algorithm
+        ckpt_is_tqc = "tqc_critic_state_dict" in checkpoint
+        if args.algorithm == "tqc" and not ckpt_is_tqc:
+            raise ValueError(
+                f"--algorithm=tqc but checkpoint has no TQC critic weights. "
+                f"Checkpoint was saved with algorithm={checkpoint.get('args', {}).get('algorithm', 'sac')}."
+            )
+        if args.algorithm != "tqc" and ckpt_is_tqc:
+            raise ValueError(
+                f"--algorithm={args.algorithm} but checkpoint contains TQC critic weights. "
+                f"Use --algorithm=tqc to resume this checkpoint."
+            )
+
+        # Load network weights
+        actor.load_state_dict(checkpoint["actor_state_dict"])
+        if args.algorithm == "tqc":
+            tqc_critic.load_state_dict(checkpoint["tqc_critic_state_dict"])
+            tqc_critic_target.load_state_dict(checkpoint["tqc_critic_state_dict"])
+        else:
+            qf1.load_state_dict(checkpoint["qf1_state_dict"])
+            qf2.load_state_dict(checkpoint["qf2_state_dict"])
+            qf1_target.load_state_dict(checkpoint["qf1_state_dict"])
+            qf2_target.load_state_dict(checkpoint["qf2_state_dict"])
+        
+        print(f"✓ Loaded network weights from step {checkpoint['step']}")
+        
+        # === Actor optimizer ===
+        if not args.finetune_reset_actor_optimizer:
+            actor_optimizer.load_state_dict(checkpoint["actor_optimizer_state_dict"])
+            print(f"✓ Loaded actor optimizer state")
+        else:
+            print(f"✓ Reset actor optimizer (fresh)")
+
+        # === Critic optimizer ===
+        if not args.finetune_reset_critic_optimizer:
+            q_optimizer.load_state_dict(checkpoint["q_optimizer_state_dict"])
+            print(f"✓ Loaded critic optimizer state")
+        else:
+            print(f"✓ Reset critic optimizer (fresh)")
+        
+        # === Alpha (entropy coefficient) ===
+        if args.autotune:
+            if not args.finetune_reset_alpha:
+                if "log_alpha" in checkpoint:
+                    log_alpha.data = checkpoint["log_alpha"].to(device)
+                    alpha = log_alpha.exp().detach()
+                    print(f"✓ Loaded entropy coefficient: alpha={float(alpha):.4f}")
+                if "alpha_optimizer_state_dict" in checkpoint:
+                    alpha_optimizer.load_state_dict(checkpoint["alpha_optimizer_state_dict"])
+                    print(f"✓ Loaded alpha optimizer state")
+            else:
+                print(f"✓ Reset entropy coefficient (alpha={float(alpha):.4f})")
+       
+        # === Resume step logic ===
+        ## REMOVED FOR SIMPLICITY
+        # Only resume from checkpoint step if keeping ALL optimizer states
+        # if (not args.finetune_reset_actor_optimizer and 
+        #     not args.finetune_reset_critic_optimizer and
+        #     not args.finetune_reset_alpha):
+        #     start_step = checkpoint["step"]
+        #     print(f"✓ Resuming from step {start_step}")
+        # else:
+        #     print(f"✓ Starting from step 0 (fine-tuning mode)")
+
+        # === Diagnostic: Check effective learning rates ===
+        print(f"\n--- Optimizer State Diagnostics ---")
+        log_optimizer_effective_lr(actor_optimizer, "Actor", args.policy_lr)
+        log_optimizer_effective_lr(q_optimizer, "Critic", args.q_lr)
+        
+        # Log checkpoint info
+        if "args" in checkpoint:
+            ckpt_args = checkpoint["args"]
+            print(f"\nOriginal training config:")
+            print(f"  - Layouts: {ckpt_args.get('layouts', 'unknown')}")
+            print(f"  - Total timesteps: {ckpt_args.get('total_timesteps', 'unknown')}")
+            print(f"  - Pos encoding: {ckpt_args.get('pos_encoding_type', 'unknown')}")
+        
+        print(f"\nFine-tuning config:")
+        print(f"  - Target layouts: {args.layouts}")
+        print(f"  - Reset actor optimizer: {args.finetune_reset_actor_optimizer}")
+        print(f"  - Reset critic optimizer: {args.finetune_reset_critic_optimizer}")
+        print(f"  - Reset alpha: {args.finetune_reset_alpha}")
+        print(f"{'='*60}\n")
+    
+    # =========================================================================
+    # LOAD PRETRAINED ENCODER (from pretrain_power.py)
+    # =========================================================================
+
+    if args.pretrain_checkpoint is not None and args.resume_checkpoint is None:
+        print(f"\n{'='*60}")
+        print(f"LOADING PRETRAINED ENCODER")
+        print(f"{'='*60}")
+
+        def load_pretrained_into(network, network_name, encoder_sd):
+            """Load matching encoder weights into an actor or critic."""
+            net_sd = network.state_dict()
+            matched_keys = []
+            skipped_keys = []
+
+            for key, value in encoder_sd.items():
+                if key in net_sd:
+                    if net_sd[key].shape == value.shape:
+                        net_sd[key] = value
+                        matched_keys.append(key)
+                    else:
+                        skipped_keys.append(
+                            f"{key} (shape: {list(value.shape)} vs {list(net_sd[key].shape)})"
+                        )
+                else:
+                    skipped_keys.append(f"{key} (not in {network_name})")
+
+            network.load_state_dict(net_sd)
+            print(f"\n  {network_name}: loaded {len(matched_keys)}/{len(encoder_sd)} params")
+            if matched_keys:
+                print(f"    Matched: {matched_keys[:5]}{'...' if len(matched_keys) > 5 else ''}")
+            if skipped_keys:
+                print(f"    Skipped: {skipped_keys}")
+            return len(matched_keys)
+
+
+        # =================================================================
+        # Actor loading: full state dict (BC) or encoder-only (pretrain)
+        # =================================================================
+        if _pretrain_actor_sd is not None:
+            # BC checkpoint → load full actor including fc_mean/fc_logstd
+            # BUT preserve action_scale and action_bias_val from the env
+            # (they should match, but this is defensive)
+            env_action_scale = actor.action_scale.clone()
+            env_action_bias = actor.action_bias_val.clone()
+
+            # Flexible load: match what we can, skip shape mismatches
+            net_sd = actor.state_dict()
+            matched_keys = []
+            skipped_keys = []
+            for key, value in _pretrain_actor_sd.items():
+                if key in net_sd:
+                    if net_sd[key].shape == value.shape:
+                        net_sd[key] = value
+                        matched_keys.append(key)
+                    else:
+                        skipped_keys.append(
+                            f"{key} (shape: {list(value.shape)} vs {list(net_sd[key].shape)})"
+                        )
+                else:
+                    skipped_keys.append(f"{key} (not in Actor)")
+            actor.load_state_dict(net_sd)
+
+            # Restore env-derived action scaling (in case BC used different defaults)
+            actor.action_scale.copy_(env_action_scale)
+            actor.action_bias_val.copy_(env_action_bias)
+
+            print(f"\n  Actor (BC full load): loaded {len(matched_keys)}/{len(_pretrain_actor_sd)} params")
+            if matched_keys:
+                print(f"    Matched: {matched_keys[:8]}{'...' if len(matched_keys) > 8 else ''}")
+            if skipped_keys:
+                print(f"    Skipped: {skipped_keys}")
+            n_actor = len(matched_keys)
+        else:
+            # Self-supervised pretrain → encoder-only loading
+            n_actor = load_pretrained_into(actor, "Actor", _pretrain_encoder_sd)
+
+        # Critics always get encoder-only loading (obs_action_encoder input dim differs)
+        if args.algorithm == "tqc":
+            for i, critic in enumerate(tqc_critic.critics):
+                load_pretrained_into(critic, f"TQC Critic {i}", _pretrain_encoder_sd)
+            tqc_critic_target.load_state_dict(tqc_critic.state_dict())
+        else:
+            n_qf1 = load_pretrained_into(qf1, "Critic qf1", _pretrain_encoder_sd)
+            n_qf2 = load_pretrained_into(qf2, "Critic qf2", _pretrain_encoder_sd)
+            qf1_target.load_state_dict(qf1.state_dict())
+            qf2_target.load_state_dict(qf2.state_dict())
+        print(f"\n  Target networks synced ✓")
+
+        if n_actor == 0:
+            print(f"\n  ⚠ WARNING: No weights matched! Something is wrong.")
+
+        # Optional: freeze encoder initially
+        if args.pretrain_freeze_steps > 0:
+            frozen = []
+            for name, param in actor.named_parameters():
+                if "fc_mean" not in name and "fc_logstd" not in name:
+                    param.requires_grad = False
+                    frozen.append(name)
+            actor_optimizer = make_adam(
+                [p for p in actor.parameters() if p.requires_grad and id(p) not in shared_param_ids],
+                lr=args.policy_lr,
+            )
+            print(f"\n  Froze {len(frozen)} encoder params for {args.pretrain_freeze_steps} steps")
+
+        del _pretrain_encoder_sd  # clean up
+        if _pretrain_actor_sd is not None:
+            del _pretrain_actor_sd
+        print(f"{'='*60}\n")
+    
+    
+    
+    # =========================================================================
+    # REPLAY BUFFER
+    # =========================================================================
+
+    rb = TransformerReplayBuffer(
+        capacity=args.buffer_size,
+        device=device,
+        rotor_diameter=rotor_diameter,
+        max_turbines=n_turbines_max,
+        obs_dim=obs_dim_per_turbine,
+        action_dim=action_dim_per_turbine,
+        use_wind_relative=args.use_wind_relative_pos,
+        use_profiles=use_profiles,
+        rotate_profiles=args.rotate_profiles,
+        profile_registry=profile_registry,
+        profile_registry_gpu_budget_mb=args.profile_registry_gpu_budget_mb,
+    )
+
+    # Shared metadata stored alongside every buffer save (also validated on load)
+    def buffer_meta(step: int) -> dict:
+        return {
+            "layouts": args.layouts,
+            "seed": args.seed,
+            "global_step": step,
+            "history_length": args.history_length,
+        }
+
+    if args.load_buffer is not None:
+        print(f"\n{'='*60}")
+        print(f"LOADING REPLAY BUFFER")
+        print(f"{'='*60}")
+        buffer_meta_loaded = rb.load(args.load_buffer)
+
+        if buffer_meta_loaded.get("layouts") != args.layouts:
+            raise ValueError(
+                f"Replay buffer was generated with layouts='{buffer_meta_loaded.get('layouts')}' "
+                f"but this run uses layouts='{args.layouts}'. Stored positions and "
+                f"layout indices would be inconsistent."
+            )
+        if buffer_meta_loaded.get("history_length") != args.history_length:
+            raise ValueError(
+                f"Replay buffer was generated with history_length="
+                f"{buffer_meta_loaded.get('history_length')} but this run uses "
+                f"{args.history_length}. Observation contents would be inconsistent."
+            )
+        if buffer_meta_loaded.get("seed") != args.seed:
+            print(f"NOTE: buffer was generated with seed={buffer_meta_loaded.get('seed')}, "
+                  f"this run uses seed={args.seed}.")
+
+        if args.learning_starts > 0:
+            print(f"Loaded {len(rb)} transitions; skipping exploration phase "
+                  f"(learning_starts: {args.learning_starts} -> 0)")
+            args.learning_starts = 0
+        print(f"{'='*60}\n")
+
+
+    # =========================================================================
+    # TRAINING LOOP
+    # =========================================================================
+    
+    # =========================================================================
+    # torch.compile (optional) — compile the network forward passes.
+    # We replace each module's .forward (not the module object) so state_dict
+    # keys are unchanged (checkpoints stay compatible) and the actor's
+    # get_action(self.forward(...)) hot path also hits the compiled graph.
+    # Shapes are static (padded max_turbines, fixed batch_size); the rare
+    # logging/eval calls with other batch sizes just trigger a one-time recompile.
+    # =========================================================================
+    if args.compile:
+        print("Compiling network forward passes with torch.compile (first steps are slow)...")
+
+        def _compile_forward(module):
+            if module is not None:
+                # reduce-overhead (CUDA graphs) collapses the many tiny kernel launches
+                # of this small/short-sequence model into one replay -- the dominant
+                # cost for a launch-bound update loop. Requires the hot loop to be
+                # sync-free (see GPU-side loss accumulation) and the held critic
+                # outputs to be .clone()'d (shared CUDA-graph buffer pool).
+                # NOTE: must be consistent across ALL compiled forwards -- mixing
+                # reduce-overhead with a plain-compiled module corrupts the
+                # CUDA-graph-trees allocator. (A vmap-ensembled critic was tried and
+                # was ~2x SLOWER here, so we keep separate critics.)
+                # mode is args.compile_mode for ALL forwards (consistent within a run);
+                # "default" disables cudagraphs (single-rose arms; see config.compile_mode).
+                module.forward = torch.compile(module.forward, mode=args.compile_mode)
+
+        _compile_forward(actor)
+        if args.algorithm == "tqc":
+            _compile_forward(tqc_critic)
+            _compile_forward(tqc_critic_target)
+        else:
+            _compile_forward(qf1)
+            _compile_forward(qf2)
+            _compile_forward(qf1_target)
+            _compile_forward(qf2_target)
+
+    print(f"\nStarting training for {args.total_timesteps} timesteps...")
+    print(f"UTD ratio: {args.utd_ratio} (gradient updates per env step)")
+    print(f"With {args.num_envs} envs: {int(args.num_envs * args.utd_ratio)} gradient updates per iteration")
+    print("=" * 60)
+    
+
+    save_checkpoint(
+        actor, qf1, qf2, actor_optimizer, q_optimizer,
+        0, run_name, args, log_alpha, alpha_optimizer,
+        tqc_critic=tqc_critic,
+    )
+
+
+    # Track evaluation timing
+    next_eval_step = args.eval_interval
+    
+    # Initial evaluation
+    if args.eval_initial:
+        print("\nRunning initial evaluation before training...")
+        eval_metrics = evaluator.evaluate()
+        eval_dict = eval_metrics.to_dict()
+        
+        for name, value in eval_dict.items():
+            writer.add_scalar(name, value, 0)
+        
+        print(f"Initial eval - Mean reward: {eval_metrics.mean_reward:.4f}, "
+              f"Power ratio: {eval_metrics.power_ratio:.4f}")
+
+
+    # DroQ: target networks must be in eval mode to disable dropout
+    if args.use_droq:
+        if tqc_critic_target is not None:
+            tqc_critic_target.eval()
+        if qf1_target is not None:
+            qf1_target.eval()
+        if qf2_target is not None:
+            qf2_target.eval()
+
+    start_time = time.time()
+    global_step = start_step  # Start from checkpoint step if resuming, else 0
+    total_gradient_steps = 0  # Track total gradient updates for logging
+
+    # Wall-clock breakdown (only populated when --log_timing). Accumulated over a
+    # logging window and reset on each flush. Syncs are gated so they add no
+    # overhead when timing is off.
+    timing = {"env": 0.0, "sample": 0.0, "critic": 0.0, "actor": 0.0}
+
+    def _sync_timer():
+        """Return perf_counter, syncing CUDA first so GPU work is included."""
+        if args.log_timing and device.type == "cuda":
+            torch.cuda.synchronize()
+        return time.perf_counter()
+
+    # AMP autocast context (bf16). Reused across all update forward passes; a
+    # no-op when --amp is off. bf16 keeps fp32 range so no GradScaler is needed.
+    amp_ctx = torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=args.amp)
+    if args.amp:
+        print(f"AMP enabled: bfloat16 autocast on {device.type}")
+        print("  NOTE: on Sophia (Quadro RTX 4000 / Turing) the --amp flag is "
+              "strictly slower -- Turing has no bf16 tensor cores. Disable it here.")
+    # Reset environments
+    obs, infos = envs.reset(seed=args.seed)
+    
+    # Tracking
+    step_reward_window = deque(maxlen=1000)
+    # next_save_step = ((start_step // args.save_interval) + 1) * args.save_interval  # Account for resumed step
+    next_save_step = start_step + args.save_interval
+    # Replay buffer saving
+    warmup_buffer_saved = False
+    next_buffer_save_step = start_step + args.buffer_save_interval
+    # For logging losses: accumulate GPU-side running sums and materialize once per
+    # logging drain. Avoids a per-grad-step .item() sync that would serialize this
+    # launch-bound update loop. Counts track how many updates contributed each metric.
+    _qf_keys = ['qf_loss'] if args.algorithm == "tqc" else ['qf1_loss', 'qf2_loss']
+    _acc_keys = _qf_keys + ['actor_loss', 'alpha_loss',
+                            'logpi_per_turbine', 'ent_term', 'q_term', 'n_real_mean']
+
+    def _zero_losses():
+        return {k: torch.zeros((), device=device) for k in _acc_keys}
+
+    loss_accumulator = _zero_losses()
+    n_critic_updates = 0
+    n_actor_updates = 0
+
+    # Calculate remaining updates if resuming
+    remaining_timesteps = args.total_timesteps - start_step
+    num_updates = max(0, remaining_timesteps // args.num_envs)
+    
+    if start_step > 0:
+        print(f"Resuming from step {start_step}, {remaining_timesteps} timesteps remaining")
+        print(f"Will run {num_updates} more updates")
+    
+    for update in range(num_updates + 2):
+        global_step += args.num_envs
+        
+        # Unfreeze pretrained encoder after warmup
+        if (args.pretrain_checkpoint is not None 
+            and args.pretrain_freeze_steps > 0 
+            and global_step >= args.pretrain_freeze_steps
+            and global_step - args.num_envs < args.pretrain_freeze_steps):
+            for name, param in actor.named_parameters():
+                param.requires_grad = True
+            actor_optimizer = make_adam(
+                [p for p in actor.parameters() if id(p) not in shared_param_ids],
+                lr=args.policy_lr,
+            )
+            print(f"\n[Step {global_step}] Unfroze pretrained encoder parameters")
+        
+        # Get environment info (needed for replay buffer)
+        wind_dirs = get_env_wind_directions(envs)
+        raw_positions = get_env_raw_positions(envs)
+        current_masks = get_env_attention_masks(envs)
+
+        # Get layout identifiers for replay buffer (lightweight)
+        if args.profile_encoding_type is not None:
+            current_layout_indices = get_env_layout_indices(envs)
+            current_permutations = get_env_permutations(envs)
+        else:
+            current_layout_indices = None
+            current_permutations = None
+
+
+        # Select action
+        # Reuse the env state already fetched above to avoid duplicate get_attr IPC
+        act_state = dict(wind_dirs=wind_dirs, raw_positions=raw_positions, masks=current_masks)
+        if global_step < args.learning_starts:
+            if args.initial_exploration == "policy":
+                # Use the actor network (useful when resuming from checkpoint)
+                with torch.no_grad():
+                    actions = agent.act(envs, obs, **act_state)
+            else:
+                # Random exploration (default for training from scratch)
+                actions = envs.action_space.sample()
+        else:
+            with torch.no_grad():
+                actions = agent.act(envs, obs, **act_state)
+        
+        # Step environment
+        _t0 = _sync_timer()
+        next_obs, rewards, terminations, truncations, infos = envs.step(actions)
+        if args.log_timing:
+            timing["env"] += time.perf_counter() - _t0
+
+
+        # Get current layout names for each env. Under domain randomization the pool
+        # is huge, so bucket every training layout under "dr_pool" for debug stats.
+        if dr_enabled:
+            current_layouts = ["dr_pool"] * args.num_envs
+        else:
+            current_layouts = get_env_current_layout(envs)
+
+        # Log per-step data to debug tracker (always - internal deques handle storage)
+        for i in range(args.num_envs):
+            debug_logger.log_layout_step(
+                layout_name=current_layouts[i],
+                reward=float(rewards[i]),
+                power=float(infos.get("Power agent", [0.0] * args.num_envs)[i]) if "Power agent" in infos else None,
+                actions=actions[i] if isinstance(actions, np.ndarray) else np.array(actions[i]),
+            )
+            debug_logger.log_wind_direction(float(wind_dirs[i]))
+
+
+        # Track rewards
+        step_reward_window.extend(np.array(rewards).flatten().tolist())
+        
+        # Log episode stats
+        if "final_info" in infos:
+            ep_return = np.mean(envs.return_queue)
+            ep_length = np.mean(envs.length_queue)
+            ep_power = np.mean(envs.mean_power_queue)
+            
+            print(f"Step {global_step}: Episode return={ep_return:.2f}, power={ep_power:.2f}")
+            writer.add_scalar("charts/episodic_return", ep_return, global_step)
+            writer.add_scalar("charts/episodic_length", ep_length, global_step)
+            # NOTE (tracking): for power tracking, higher episodic_power is NOT
+            # better -- overshooting a sub-greedy setpoint is a failure. The real
+            # objective is the tracking error below; episodic_power is kept only
+            # as a raw diagnostic.
+            writer.add_scalar("charts/episodic_power", ep_power, global_step)
+
+            # Tracking-specific metrics. RecordEpisodeVals already accumulates the
+            # per-episode mean |P_farm - P_ref| and mean reference (both watts);
+            # surface them (and a greedy-normalized error, which mirrors the
+            # reward's -|err|/rated scaling) as the primary signs-of-life signals.
+            if getattr(envs, "track_mae_queue", None) and len(envs.track_mae_queue) > 0:
+                track_mae = float(np.mean(envs.track_mae_queue))
+                writer.add_scalar("charts/episodic_track_mae", track_mae, global_step)
+                writer.add_scalar("charts/episodic_track_mae_frac_greedy",
+                                  track_mae / GREEDY, global_step)
+                print(f"           tracking MAE={track_mae/1e6:.3f} MW "
+                      f"({100*track_mae/GREEDY:.1f}% of greedy)")
+            if getattr(envs, "mean_power_ref_queue", None) and len(envs.mean_power_ref_queue) > 0:
+                writer.add_scalar("charts/episodic_power_ref",
+                                  float(np.mean(envs.mean_power_ref_queue)), global_step)
+
+
+        # Handle final observations
+        real_next_obs = next_obs.copy()
+        for idx, trunc in enumerate(truncations):
+            if trunc:
+                real_next_obs[idx] = infos["final_obs"][idx]
+        
+        # Store in replay buffer
+        for i in range(args.num_envs):
+            done = terminations[i] or truncations[i]
+            action_reshaped = actions[i].reshape(-1, action_dim_per_turbine)
+        
+            layout_idx_i = current_layout_indices[i] if current_layout_indices is not None else None
+            perm_i = current_permutations[i] if current_permutations is not None else None
+
+            rb.add(
+                obs[i],
+                real_next_obs[i],
+                action_reshaped,
+                rewards[i],
+                done,
+                raw_positions[i],
+                current_masks[i],
+                wind_dirs[i],
+                layout_index=layout_idx_i,
+                permutation=perm_i,
+            )
+
+        # One-shot warmup buffer save (buffer pre-generation for ablation runs)
+        if (args.save_buffer_at_learning_starts
+                and not warmup_buffer_saved
+                and global_step >= args.learning_starts):
+            rb.save(
+                f"runs/{run_name}/replay_buffer_warmup_{args.learning_starts}.npz",
+                extra_meta=buffer_meta(global_step),
+            )
+            warmup_buffer_saved = True
+            if args.buffer_only:
+                print("\n--buffer_only set: warmup buffer saved, exiting before training.")
+                if evaluator is not None:
+                    evaluator.close()
+                envs.close()
+                writer.close()
+                return
+
+        obs = next_obs
+        
+        # =====================================================================
+        # TRAINING
+        # =====================================================================
+        
+        if global_step > args.learning_starts and len(rb) >= args.batch_size:
+
+            # Calculate number of gradient updates for this iteration
+            # This scales with num_envs to maintain consistent sample efficiency
+            num_gradient_updates = max(1, int(args.num_envs * args.utd_ratio))
+            
+            # Clear loss accumulators for this iteration
+            loss_accumulator = _zero_losses()
+            n_critic_updates = 0
+            n_actor_updates = 0
+
+
+            for grad_step in range(num_gradient_updates):
+                # Sample a fresh batch for each gradient update
+                _t0 = _sync_timer()
+                data = rb.sample(args.batch_size)
+                if args.log_timing:
+                    timing["sample"] += _sync_timer() - _t0
+
+                _t_critic = _sync_timer()
+
+                batch_mask = data["attention_mask"]
+                
+                # Get profiles from batch (will be None if not using profiles)
+                batch_receptivity = data.get("receptivity", None)
+                batch_influence = data.get("influence", None)
+                # Single-rose mode: drop the unused influence tensor so it is never a live
+                # input to the compiled critic/actor forwards (phantom cudagraph input).
+                if not actor.use_influence:
+                    batch_influence = None
+
+                # -----------------------------------------------------------------
+                # Update Critics
+                # -----------------------------------------------------------------
+                with torch.no_grad(), amp_ctx:
+                    # Get next actions from current policy
+                    next_actions, next_log_pi, _, _ = actor.get_action(
+                        data["next_observations"],
+                        data["positions"],
+                        batch_mask,
+                        recep_profile=batch_receptivity,
+                        influence_profile=batch_influence,
+                    )
+
+                if args.algorithm == "tqc":
+                    # --- TQC critic update ---
+                    with torch.no_grad(), amp_ctx:
+                        # Target quantiles: (n_critics, batch, n_quantiles)
+                        target_quantiles = tqc_critic_target(
+                            data["next_observations"], next_actions,
+                            data["positions"], batch_mask,
+                            recep_profile=batch_receptivity,
+                            influence_profile=batch_influence,
+                        )
+                        batch_size_cur = data["rewards"].shape[0]
+                        # Flatten across critics, sort, truncate top-d (fp32 for the target math)
+                        all_target_q = target_quantiles.float().permute(1, 0, 2).reshape(batch_size_cur, -1)
+                        sorted_q, _ = all_target_q.sort(dim=1)
+                        n_keep = args.tqc_n_critics * args.tqc_n_quantiles - args.tqc_top_quantiles_to_drop
+                        truncated_mean = sorted_q[:, :n_keep].mean(dim=1, keepdim=True)
+                        target_q = data["rewards"] + (1 - data["dones"]) * args.gamma * (truncated_mean - alpha * next_log_pi)
+
+                    # Current quantiles: (n_critics, batch, n_quantiles)
+                    with amp_ctx:
+                        current_q = tqc_critic(
+                            data["observations"], data["actions"],
+                            data["positions"], batch_mask,
+                            recep_profile=batch_receptivity,
+                            influence_profile=batch_influence,
+                        )
+                        qf_loss = sum(
+                            quantile_huber_loss(current_q[i].float(), target_q, taus)
+                            for i in range(args.tqc_n_critics)
+                        )
+
+                    q_optimizer.zero_grad(set_to_none=True)
+                    qf_loss.backward()
+                    if args.grad_clip:
+                        torch.nn.utils.clip_grad_norm_(
+                            tqc_critic.parameters(),
+                            max_norm=args.grad_clip_max_norm,
+                        )
+                    q_optimizer.step()
+
+                    if debug_logger.should_log_gradients(total_gradient_steps):
+                        for i, critic in enumerate(tqc_critic.critics):
+                            grad_norm = sum(
+                                p.grad.norm().item() ** 2
+                                for p in critic.parameters() if p.grad is not None
+                            ) ** 0.5
+                            writer.add_scalar(f"debug/grad_norm/tqc_critic_{i}", grad_norm, global_step)
+
+                    loss_accumulator['qf_loss'] += qf_loss.detach()
+                    n_critic_updates += 1
+                else:
+                    # --- SAC critic update ---
+                    with torch.no_grad(), amp_ctx:
+                        # .clone() each critic output: under reduce-overhead the compiled
+                        # critics share one CUDA-graph buffer pool, so a held output is
+                        # overwritten by the next critic call before it is consumed.
+                        qf1_next = qf1_target(
+                            data["next_observations"], next_actions,
+                            data["positions"], batch_mask,
+                            recep_profile=batch_receptivity,
+                            influence_profile=batch_influence,
+                        ).clone()
+                        qf2_next = qf2_target(
+                            data["next_observations"], next_actions,
+                            data["positions"], batch_mask,
+                            recep_profile=batch_receptivity,
+                            influence_profile=batch_influence,
+                        ).clone()
+                        min_qf_next = torch.min(qf1_next, qf2_next) - alpha * next_log_pi
+                        target_q = data["rewards"] + (1 - data["dones"]) * args.gamma * min_qf_next
+
+                    with amp_ctx:
+                        # .clone(): see target-critic note above (shared CUDA-graph pool).
+                        qf1_value = qf1(data["observations"], data["actions"],
+                                        data["positions"], batch_mask,
+                                        recep_profile=batch_receptivity,
+                                        influence_profile=batch_influence).clone()
+                        qf2_value = qf2(data["observations"], data["actions"],
+                                        data["positions"], batch_mask,
+                                        recep_profile=batch_receptivity,
+                                        influence_profile=batch_influence).clone()
+
+                        if debug_logger.should_log_q_values(total_gradient_steps):
+                            debug_logger.log_q_value_stats(
+                                qf1_values=qf1_value,
+                                qf2_values=qf2_value,
+                                target_q=target_q,
+                                writer=writer,
+                                global_step=global_step,
+                            )
+
+                        # Losses in fp32 for stability
+                        qf1_loss = F.mse_loss(qf1_value.float(), target_q)
+                        qf2_loss = F.mse_loss(qf2_value.float(), target_q)
+                        qf_loss = qf1_loss + qf2_loss
+
+                    q_optimizer.zero_grad(set_to_none=True)
+                    qf_loss.backward()
+                    if args.grad_clip:
+                        torch.nn.utils.clip_grad_norm_(
+                            qf1_params + qf2_params + shared_encoder_params,
+                            max_norm=args.grad_clip_max_norm,
+                        )
+                    q_optimizer.step()
+
+                    if debug_logger.should_log_gradients(total_gradient_steps):
+                        debug_logger.log_critic_gradient_norms(qf1, qf2, writer, global_step)
+
+                    loss_accumulator['qf1_loss'] += qf1_loss.detach()
+                    loss_accumulator['qf2_loss'] += qf2_loss.detach()
+                    n_critic_updates += 1
+
+                if args.log_timing:
+                    timing["critic"] += _sync_timer() - _t_critic
+
+                # -----------------------------------------------------------------
+                # Update Actor (delayed based on total gradient steps)
+                # -----------------------------------------------------------------
+                if total_gradient_steps % args.policy_frequency == 0:
+                    _t_actor = _sync_timer()
+                    # Get actions from current policy + Q-values (under AMP autocast)
+                    with amp_ctx:
+                        actions_pi, log_pi, _, _ = actor.get_action(
+                            data["observations"], data["positions"], batch_mask,
+                            recep_profile=batch_receptivity,
+                            influence_profile=batch_influence,
+                        )
+
+                        # Q-values for policy actions
+                        if args.algorithm == "tqc":
+                            all_q = tqc_critic(
+                                data["observations"], actions_pi,
+                                data["positions"], batch_mask,
+                                recep_profile=batch_receptivity,
+                                influence_profile=batch_influence,
+                            )  # (n_critics, batch, n_quantiles)
+                            batch_size_cur = data["rewards"].shape[0]
+                            all_q_flat = all_q.permute(1, 0, 2).reshape(batch_size_cur, -1)
+                            sorted_q, _ = all_q_flat.sort(dim=1)
+                            n_keep = args.tqc_n_critics * args.tqc_n_quantiles - args.tqc_top_quantiles_to_drop
+                            min_qf_pi = sorted_q[:, :n_keep].mean(dim=1, keepdim=True)
+                        else:
+                            # .clone(): see target-critic note above (shared CUDA-graph pool).
+                            qf1_pi = qf1(data["observations"], actions_pi, data["positions"],
+                                         batch_mask,
+                                         recep_profile=batch_receptivity,
+                                         influence_profile=batch_influence).clone()
+                            qf2_pi = qf2(data["observations"], actions_pi, data["positions"],
+                                         batch_mask,
+                                         recep_profile=batch_receptivity,
+                                         influence_profile=batch_influence).clone()
+                            min_qf_pi = torch.min(qf1_pi, qf2_pi)
+
+                        # Policy loss (maximize Q - alpha * entropy), fp32 for stability
+                        actor_loss = (alpha * log_pi.float() - min_qf_pi.float()).mean()
+
+                    # Update actor
+                    actor_optimizer.zero_grad(set_to_none=True)
+                    actor_loss.backward()
+                    if args.grad_clip:
+                        torch.nn.utils.clip_grad_norm_(
+                            actor.parameters(),
+                            max_norm=args.grad_clip_max_norm
+                        )
+                    actor_optimizer.step()
+
+                    if debug_logger.should_log_gradients(total_gradient_steps):
+                        debug_logger.log_actor_gradient_norms(actor, writer, global_step)
+
+                    loss_accumulator['actor_loss'] += actor_loss.detach()
+                    n_actor_updates += 1
+
+                    # Entropy-vs-Q diagnostics (the large-farm "stay diffuse" pathology):
+                    # per-turbine log-prob is size-invariant so it is comparable across N,
+                    # and entropy_to_q_ratio shows whether the entropy term swamps the Q
+                    # term in the actor loss as farm size grows.
+                    with torch.no_grad():
+                        n_real_b = (~data["attention_mask"]).sum(dim=1).float().clamp(min=1.0)
+                        logpi_agg = log_pi.detach().float().squeeze(-1)
+                        logpi_per_turb = (logpi_agg if args.entropy_agg == "mean"
+                                          else logpi_agg / n_real_b)
+                        loss_accumulator['logpi_per_turbine'] += logpi_per_turb.mean()
+                        loss_accumulator['ent_term'] += (alpha * logpi_agg).mean()
+                        loss_accumulator['q_term'] += min_qf_pi.detach().float().mean()
+                        loss_accumulator['n_real_mean'] += n_real_b.mean()
+
+                    # -------------------------------------------------------------
+                    # Update Alpha (entropy coefficient)
+                    # -------------------------------------------------------------
+                    if args.autotune:
+                        log_pi_detached = log_pi.detach()
+                        
+                        # Adaptive target entropy per sample (matched to actor.entropy_agg)
+                        target_entropy_batch = compute_adaptive_target_entropy(
+                            data["attention_mask"],
+                            action_dim_per_turbine,
+                            agg=args.entropy_agg,
+                        )
+                        
+                        # Alpha loss
+                        alpha_loss = (-log_alpha.exp() * (log_pi_detached + target_entropy_batch)).mean()
+                        
+                        alpha_optimizer.zero_grad(set_to_none=True)
+                        alpha_loss.backward()
+                        alpha_optimizer.step()
+                        alpha = log_alpha.exp().detach()
+                        
+                        loss_accumulator['alpha_loss'] += alpha_loss.detach()
+
+                    if args.log_timing:
+                        timing["actor"] += _sync_timer() - _t_actor
+
+                # -----------------------------------------------------------------
+                # Update Target Networks
+                # -----------------------------------------------------------------
+                if total_gradient_steps % args.target_network_frequency == 0:
+                    if args.algorithm == "tqc":
+                        soft_update(tqc_critic, tqc_critic_target, args.tau)
+                    else:
+                        soft_update(qf1, qf1_target, args.tau)
+                        soft_update(qf2, qf2_target, args.tau)
+                
+                # Attention physics analysis (frequency controlled by logger)
+                if debug_logger.should_log_attention(total_gradient_steps):
+                    with torch.no_grad():
+                        # Get fresh attention weights from a small batch
+                        sample_size = min(8, args.batch_size)
+                        _, _, _, attn_weights = actor.get_action(
+                            data["observations"][:sample_size],
+                            data["positions"][:sample_size],
+                            batch_mask[:sample_size] if batch_mask is not None else None,
+                            recep_profile=batch_receptivity[:sample_size] if batch_receptivity is not None else None,
+                            influence_profile=batch_influence[:sample_size] if batch_influence is not None else None,
+                            need_weights=True, # Need this if we actually want attention
+                        )
+                        
+                        # This logs both scalar metrics AND a visualization image!
+                        debug_logger.log_attention_metrics(
+                            attention_weights=attn_weights,
+                            positions=data["positions"][:sample_size],
+                            attention_mask=batch_mask[:sample_size] if batch_mask is not None else None,
+                            writer=writer,
+                            global_step=global_step,
+                            log_image=args.log_image,  # Set False to disable image (faster)
+                        )
+                        
+                        # Optional: Log per-head attention figure (more expensive)
+                        if args.log_image:
+                            # Useful for understanding what each head specializes in
+                            if debug_logger.should_log_histograms(total_gradient_steps):  # Less frequent
+                                fig = debug_logger.create_multi_head_attention_figure(
+                                    attention_weights=attn_weights,
+                                    positions=data["positions"][:1],  # Single sample
+                                    attention_mask=batch_mask[:1] if batch_mask is not None else None,
+                                    title=f"Step {global_step}",
+                                )
+                                if fig is not None:
+                                    writer.add_figure("debug/attention/per_head", fig, global_step)
+                                    import matplotlib.pyplot as plt
+                                    plt.close(fig)
+
+
+                total_gradient_steps += 1
+
+            # -----------------------------------------------------------------
+            # Logging
+            # -----------------------------------------------------------------
+            if update % 20 == 0:
+                sps = int(global_step / (time.time() - start_time))
+                mean_reward = float(np.mean(step_reward_window)) if step_reward_window else 0.0
+                
+                # Average losses over the UTD updates: divide the GPU running-sums by
+                # their update counts and materialize once (a handful of syncs per 20
+                # iterations instead of thousands per step).
+                _na = max(n_actor_updates, 1)
+                _nc = max(n_critic_updates, 1)
+                alpha_val = float(alpha)
+                mean_actor_loss = (loss_accumulator['actor_loss'] / _na).item()
+
+                if args.algorithm == "tqc":
+                    mean_qf_loss = (loss_accumulator['qf_loss'] / _nc).item()
+                    writer.add_scalar("losses/qf_loss", mean_qf_loss, global_step)
+                else:
+                    mean_qf1_loss = (loss_accumulator['qf1_loss'] / _nc).item()
+                    mean_qf2_loss = (loss_accumulator['qf2_loss'] / _nc).item()
+                    mean_qf_loss = mean_qf1_loss + mean_qf2_loss
+                    writer.add_scalar("losses/qf1_loss", mean_qf1_loss, global_step)
+                    writer.add_scalar("losses/qf2_loss", mean_qf2_loss, global_step)
+
+                writer.add_scalar("losses/actor_loss", mean_actor_loss, global_step)
+                writer.add_scalar("losses/alpha", alpha_val, global_step)
+
+                # Entropy-scaling diagnostics (see actor-update block)
+                def _acc_mean(key):
+                    return (loss_accumulator[key] / _na).item()
+                _ent_term = _acc_mean('ent_term')
+                _q_term = _acc_mean('q_term')
+                writer.add_scalar("entropy/logpi_per_turbine", _acc_mean('logpi_per_turbine'), global_step)
+                writer.add_scalar("entropy/actor_entropy_term", _ent_term, global_step)
+                writer.add_scalar("entropy/actor_q_term", _q_term, global_step)
+                writer.add_scalar("entropy/entropy_to_q_abs_ratio", abs(_ent_term) / (abs(_q_term) + 1e-8), global_step)
+                writer.add_scalar("entropy/n_real_mean", _acc_mean('n_real_mean'), global_step)
+                writer.add_scalar("charts/SPS", sps, global_step)
+                writer.add_scalar("charts/step_reward_mean_1000", mean_reward, global_step)
+                writer.add_scalar("debug/mean_wind_direction", float(np.mean(wind_dirs)), global_step)
+                writer.add_scalar("debug/total_gradient_steps", total_gradient_steps, global_step)
+                writer.add_scalar("debug/gradient_updates_per_iter", num_gradient_updates, global_step)
+
+                if args.log_timing:
+                    total_t = sum(timing.values()) or 1.0
+                    for k, v in timing.items():
+                        writer.add_scalar(f"timing/{k}_sec", v, global_step)
+                        writer.add_scalar(f"timing/{k}_frac", v / total_t, global_step)
+                    print(f"  timing(s): " + ", ".join(f"{k}={v:.2f}" for k, v in timing.items()))
+                    timing = {k: 0.0 for k in timing}
+
+                print(f"Step {global_step}: SPS={sps}, qf_loss={mean_qf_loss:.4f}, "
+                      f"actor_loss={mean_actor_loss:.4f}, alpha={alpha_val:.4f}, "
+                      f"reward_mean={mean_reward:.4f}, grad_steps={total_gradient_steps}")
+        
+
+                # === Fine-tuning diagnostics (when resuming from checkpoint) ===
+                if args.resume_checkpoint is not None and update % 100 == 0:
+                    if args.algorithm == "tqc":
+                        # TQC fine-tuning diagnostics (optimizer state only — no qf1/qf2 available)
+                        log_finetune_diagnostics(
+                            writer=writer,
+                            global_step=global_step,
+                            actor_optimizer=actor_optimizer,
+                            q_optimizer=q_optimizer,
+                            policy_lr=args.policy_lr,
+                            q_lr=args.q_lr,
+                            alpha=float(alpha),
+                        )
+                    else:
+                        # SAC fine-tuning diagnostics (includes Q-value stats)
+                        recent_returns = list(envs.return_queue)[-10:] if hasattr(envs, 'return_queue') else []
+
+                        with torch.no_grad():
+                            _, log_pi_diag, _, _ = actor.get_action(
+                                data["observations"][:32],
+                                data["positions"][:32],
+                                data["attention_mask"][:32],
+                                recep_profile=batch_receptivity[:32] if batch_receptivity is not None else None,
+                                influence_profile=batch_influence[:32] if batch_influence is not None else None,
+                            )
+                            policy_entropy = -log_pi_diag.mean().item()
+                            # Recompute Q-values fresh: under reduce-overhead the cached
+                            # qf1_value/qf2_value buffers were overwritten by the actor update.
+                            qf1_values_diag = qf1(
+                                data["observations"], data["actions"], data["positions"],
+                                data["attention_mask"],
+                                recep_profile=batch_receptivity,
+                                influence_profile=batch_influence,
+                            ).clone()
+                            qf2_values_diag = qf2(
+                                data["observations"], data["actions"], data["positions"],
+                                data["attention_mask"],
+                                recep_profile=batch_receptivity,
+                                influence_profile=batch_influence,
+                            ).clone()
+
+                        log_finetune_diagnostics(
+                            writer=writer,
+                            global_step=global_step,
+                            actor_optimizer=actor_optimizer,
+                            q_optimizer=q_optimizer,
+                            policy_lr=args.policy_lr,
+                            q_lr=args.q_lr,
+                            qf1_values=qf1_values_diag,
+                            qf2_values=qf2_values_diag,
+                            episode_returns=recent_returns,
+                            alpha=float(alpha),
+                            policy_entropy=policy_entropy,
+                        )
+
+
+            # Log summary metrics (frequency controlled by logger)
+            if debug_logger.should_log(global_step):
+                debug_logger.log_summary_metrics(
+                    writer=writer,
+                    global_step=global_step,
+                )
+
+                # Print diagnostic summary to console (frequency controlled by logger)
+                if debug_logger.should_print_diagnostics(global_step):
+                    debug_logger.print_diagnostics(global_step)
+
+
+
+        # =====================================================================
+        # CHECKPOINTING
+        # =====================================================================
+        
+        if args.save_model and global_step >= next_save_step:
+            save_checkpoint(
+                actor, qf1, qf2, actor_optimizer, q_optimizer,
+                global_step, run_name, args, log_alpha, alpha_optimizer,
+                tqc_critic=tqc_critic,
+            )
+            next_save_step += args.save_interval
+
+        # Periodic replay buffer save (overwrites a single file; atomic rename
+        # keeps the previous copy intact if the job is killed mid-write)
+        if args.buffer_save_interval > 0 and global_step >= next_buffer_save_step:
+            rb.save(
+                f"runs/{run_name}/replay_buffer.npz",
+                extra_meta=buffer_meta(global_step),
+            )
+            next_buffer_save_step += args.buffer_save_interval
+
+        # =====================================================================
+        # PERIODIC EVALUATION
+        # =====================================================================
+        
+        if global_step >= next_eval_step:
+            print(f"\nRunning evaluation at step {global_step}...")
+            eval_metrics = evaluator.evaluate()
+            eval_dict = eval_metrics.to_dict()
+            
+            # Log to tensorboard/wandb
+            for name, value in eval_dict.items():
+                writer.add_scalar(name, value, global_step)
+            
+            print(f"Eval step {global_step} - Mean reward: {eval_metrics.mean_reward:.4f}, "
+                  f"Power ratio: {eval_metrics.power_ratio:.4f}")
+            
+            # Per-layout summary
+            if len(eval_metrics.per_layout_rewards) > 1:
+                print("  Per-layout power ratios:")
+                for layout, ratio in eval_metrics.per_layout_power_ratios.items():
+                    print(f"    {layout}: {ratio:.4f}")
+            
+            next_eval_step += args.eval_interval
+        
+    # =========================================================================
+    
+    # FINAL SAVE AND CLEANUP
+    # =========================================================================
+    
+    if args.save_model:
+        save_checkpoint(
+            actor, qf1, qf2, actor_optimizer, q_optimizer,
+            global_step, run_name, args, log_alpha, alpha_optimizer,
+            tqc_critic=tqc_critic,
+        )
+
+    if args.save_buffer_final or args.buffer_save_interval > 0:
+        rb.save(
+            f"runs/{run_name}/replay_buffer.npz",
+            extra_meta=buffer_meta(global_step),
+        )
+
+    print("\n" + "=" * 60)
+    print("Training finished!")
+    print(f"Total time: {(time.time() - start_time) / 3600:.2f} hours")
+    print("=" * 60)
+    
+
+    # Close evaluator (None when eval is disabled, as in the tracking run)
+    if evaluator is not None:
+        evaluator.close()
+
+    envs.close()
+    writer.close()
+
+
+if __name__ == "__main__":
+    main()
