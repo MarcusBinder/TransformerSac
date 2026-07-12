@@ -68,14 +68,16 @@ def _deep_update(base: dict, overrides: dict) -> dict:
     return base
 
 
-# "current + exactly-2-steps-ago" for a per-turbine sensor: a length-3 deque
-# [t-2, t-1, t] with window_length=1 reduces to [value_now, value_t-2].
-# Mirrors NOW_AND_T2 from Example 7 (power tracking RL setup).
+# 3 evenly-spaced samples over a ~10-step window for a per-turbine sensor: a
+# length-10 deque [t-9, ..., t] with history_N=3, window_length=1 reduces to
+# [t, t-5, t-9] (widened from the earlier 2-samples-over-3-steps [t, t-2] to
+# carry more temporal history on the dynamic dynamiks/DWM backend).
+# Mirrors (and widens) NOW_AND_T2 from Example 7 (power tracking RL setup).
 _NOW_AND_T2 = dict(
     current=False,
     rolling_mean=True,
-    history_N=2,
-    history_length=3,
+    history_N=3,
+    history_length=10,
     window_length=1,
 )
 
@@ -182,7 +184,7 @@ ENV_CONFIGS: Dict[str, Dict[str, Any]] = {
     # farm-power reference (supplied via WindFarmEnv(power_ref_function=...)).
     # The tracking reward requires the power-maximization reward off
     # (power_def.Power_reward == "None"). Per-turbine sensors are observed as
-    # [now, t-2]; wd/derate sensors are off. Fixed inflow (ws=10, wd=270,
+    # [t, t-5, t-9]; wd/derate sensors are off. Fixed inflow (ws=10, wd=270,
     # TI=0.06) so a one-off greedy probe is valid for the whole run.
     # yaw_init is forced off (base defaults it to "Random", which would
     # randomize the fixed yaw of a derate-only farm).
@@ -220,7 +222,7 @@ ENV_CONFIGS: Dict[str, Dict[str, Any]] = {
             "farm_TI": False,
             "farm_power": False,
         },
-        # Per-turbine sensors observed as [now, t-2].
+        # Per-turbine sensors observed as [t, t-5, t-9] (3 samples / ~10 steps).
         "ws_mes": _now_and_t2("ws"),
         "power_mes": _now_and_t2("power"),
         "yaw_mes": _now_and_t2("yaw"),

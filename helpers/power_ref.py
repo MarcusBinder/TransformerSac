@@ -15,8 +15,8 @@ A closure or lambda over the training scope would not be.
 import numpy as np
 
 # (n_steps, fraction_of_greedy) per segment; all <= 1.0 so a derate-only agent
-# can reach every target. 4 segments x 100 steps = 400-step episode.
-DEFAULT_SCHEDULE = [(100, 0.80), (100, 0.60), (100, 0.70), (100, 1.00)]
+# can reach every target. 4 segments x 200 steps = 800-step episode.
+DEFAULT_SCHEDULE = [(200, 0.80), (200, 0.60), (200, 0.70), (200, 1.00)]
 
 
 def stepwise_power_ref(t, env, *, greedy, schedule=DEFAULT_SCHEDULE):
@@ -27,7 +27,7 @@ def stepwise_power_ref(t, env, *, greedy, schedule=DEFAULT_SCHEDULE):
     for any step past the schedule horizon.
     """
     step = int(round(t / env.delay))
-    bounds = np.cumsum([n for n, _ in schedule])  # e.g. [100, 200, 300, 400]
+    bounds = np.cumsum([n for n, _ in schedule])  # e.g. [200, 400, 600, 800]
     fracs = [f for _, f in schedule]
     idx = min(int(np.searchsorted(bounds, step, side="right")), len(fracs) - 1)
     return fracs[idx] * greedy
