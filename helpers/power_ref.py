@@ -33,17 +33,43 @@ def stepwise_power_ref(t, env, *, greedy, schedule=DEFAULT_SCHEDULE):
     return fracs[idx] * greedy
 
 
-def measure_greedy(make_probe_env) -> float:
+def measure_greedy(make_probe_env, *, n_steps=200, burn_in=40) -> float:
     """Measure greedy (undereated) waked farm power [W] for the fixed inflow.
 
     Builds a throwaway env via ``make_probe_env()`` (a zero-arg callable
-    returning a WindFarmEnv or a wrapped env), resets it, sums the per-turbine
-    power from the settled flow, and closes it. Valid only because the inflow is
-    fixed in the power-tracking config; if wind is ever randomized, greedy must
-    be recomputed per episode instead.
+    returning a WindFarmEnv or a wrapped env), resets it, then steps it at the
+    MINIMUM-DERATE action (``-1`` -> ``derate=0`` -> full power) and averages the
+    settled farm power. Valid only because the inflow is fixed in the
+    power-tracking config; if wind is ever randomized, greedy must be recomputed
+    per episode instead.
+
+    Why a time-average and not one snapshot: on a steady backend (pywake) the
+    flow is constant, so one sample and the mean are identical -- this is a
+    no-op there. On a dynamic backend (dynamiks/DWM) the flow is turbulent and
+    wake-meandering, so a single post-reset snapshot is a NOISY draw that can sit
+    ~10-20% off the settled mean (and swing that much between seeds), which would
+    bias the whole fraction-of-greedy reference schedule low. The tracking reward
+    scores a windowed MEAN of farm power (``farm_pow_deq``), so the reference must
+    be a mean too; we read the same per-step quantity here (``farm_pow_deq[-1]``,
+    which also survives the flow cleanup on a late truncation).
     """
     env = make_probe_env()
     env.reset(seed=0)
-    greedy = float(env.unwrapped.fs.windTurbines.power().sum())
+    u = env.unwrapped
+
+    # -1 across the derate action -> derate=0 -> full power (see WindFarmEnv's
+    # affine [-1,1] -> [derate_min, derate_max] map, derate_min=0).
+    action = -np.ones(env.action_space.shape, dtype=np.float32)
+    samples = []
+    for _ in range(n_steps):
+        _, _, terminated, truncated, _ = env.step(action)
+        samples.append(float(u.farm_pow_deq[-1]))
+        if terminated or truncated:
+            break  # ws-derived time_max may be short; average what we have
     env.close()
-    return greedy
+
+    # Drop the settling prefix, but never drop so much we average <25% of the
+    # trajectory (guards the short-episode / early-truncation case).
+    drop = min(burn_in, len(samples) // 4)
+    settled = samples[drop:] if len(samples) > drop else samples
+    return float(np.mean(settled))
