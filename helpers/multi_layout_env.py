@@ -143,19 +143,38 @@ class MultiLayoutEnv(gym.Env):
             dtype=np.float32
         )
         
-        # Define padded action space (1 action per turbine).
+        # Define padded action space.
         # The wrapped env's action space may be 1-D (max_turbines,) or 2-D
         # (n_turbines, action_dim_per_turbine) depending on the wrapper version;
         # the per-turbine bounds are uniform, so extract a scalar bound in a
         # shape-agnostic way rather than indexing row 0 (which is a (act_dim,)
         # vector under the 2-D wrapper, breaking the Box shape check).
         base_action_space = self._current_env.action_space
+        # Per-turbine action width (act_var): 1 for a derate-only farm, 2 for
+        # yaw+derate. The 2-D per-turbine wrapper exposes shape
+        # (n_turbines, action_dim_per_turbine); a legacy 1-D wrapper implies 1.
+        # Surface it as an attribute so the trainer can read it via get_attr
+        # (same pattern as max_turbines) -- the vectorized single_action_space
+        # shape is NOT a reliable source once we keep the 1-D form below.
+        self.action_dim_per_turbine = (
+            int(base_action_space.shape[-1]) if len(base_action_space.shape) >= 2 else 1
+        )
         low = float(np.asarray(base_action_space.low).reshape(-1)[0])
         high = float(np.asarray(base_action_space.high).reshape(-1)[0])
+        # Keep the action space flat (max_turbines,) for the common single-action
+        # (derate-only) case so that pipeline is byte-for-byte unchanged; widen
+        # to (max_turbines, action_dim_per_turbine) only when a turbine emits >1
+        # action (yaw+derate). step() slices [:n_turbines] and permutes on axis
+        # 0, so both ranks flow through untouched.
+        action_shape = (
+            (self.max_turbines,)
+            if self.action_dim_per_turbine == 1
+            else (self.max_turbines, self.action_dim_per_turbine)
+        )
         self.action_space = spaces.Box(
             low=low,
             high=high,
-            shape=(self.max_turbines,),
+            shape=action_shape,
             dtype=np.float32
         )
         

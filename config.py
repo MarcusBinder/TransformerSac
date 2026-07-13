@@ -14,6 +14,7 @@ class Args:
 
     # === Experiment Settings ===
     config: str = "default"  # Environment config preset
+    power_schedule: str = "default"  # "default" (80/60/70/100) or "boost" (80/115/70/100, needs yaw)
     exp_name: str = "transformer_sac_windfarm"
     seed: int = 1
     torch_deterministic: bool = True
@@ -26,7 +27,7 @@ class Args:
     save_interval: int = 10000
     log_image: bool = False  # Log attention images to TensorBoard
 
-    shuffle_turbs: bool = False  # Shuffle turbine order in obs/action
+    shuffle_turbs: bool = True  # Shuffle turbine order in obs/action
     max_episode_steps: Optional[int] = None # Max steps per episode (None = use env default)
 
     # === Staggered warm-up episode lengths ===
@@ -39,17 +40,19 @@ class Args:
     warmup_min_episode_steps: Optional[int] = None  # Shortest warm-up length (e.g. 800)
 
     # === Receptivity Profile Settings ===
-    profile_encoder_kwargs: str = "{}"  # JSON string of encoder-specific kwargs
-    profile_source: str = "PyWake"  # "pywake" or "geometric"
-    profile_encoding_type: Optional[str] = None  # Now Optional, use None for no pos encoding
+    # Stage-1 baseline profile pathway: geometric dual-rose, FourierProfileEncoder,
+    # s1/h48 @ 360 dirs (see archive/stage_1.sh). These were the frozen A00 winners.
+    profile_encoder_kwargs: str = '{"use_phase": false, "learnable_weights": true, "n_harmonics": 48}'  # JSON string of encoder-specific kwargs
+    profile_source: str = "geometric"  # "PyWake" or "geometric"
+    profile_encoding_type: Optional[str] = "FourierProfileEncoder"  # None for no profile encoding
     profile_encoder_hidden: int = 128       # Hidden dim in profile encoder MLP
     rotate_profiles: bool = True            # Rotate profiles to wind-relative frame
     n_profile_directions: int = 360         # Number of directions in profile
-    profile_sigma_smooth: float = 10.0      # Gaussian smoothing sigma (bins) for geometric profile computation
+    profile_sigma_smooth: float = 1.0       # Gaussian smoothing sigma (bins) for geometric profile computation (stage-1 baseline)
     profile_use_influence: bool = True      # False => single receptivity rose + one encoder (drop redundant influence)
     profile_geom_mode: str = "wake"         # geometric rose construction: "wake" (up/downstream wake sum) or "distance" (bearing-keyed inverse-distance)
     profile_fusion_type: str = "add"       # "add" or "joint" fusion of receptivity and influence profiles
-    profile_embed_mode: str = "add"        # "add" or "concat" — how fused profile is integrated into token embedding
+    profile_embed_mode: str = "concat"     # "add" or "concat" — how fused profile is integrated into token embedding (stage-1 baseline)
     share_profile_encoder: bool = False         # Whether to share weights between actor and critic for profile encoder
 
     # === Environment Settings ===
@@ -97,7 +100,7 @@ class Args:
     history_length: int = 15            # Number of timesteps of history per feature
     use_wd_deviation: bool = False      # If True, convert WD to deviation from mean
     use_wind_relative_pos: bool = True  # Transform positions to wind-relative frame
-    wd_scale_range: float = 90.0        # Only used if use_wd_deviation=True. Wind direction deviation range for scaling (±degrees → [-1,1])
+    wd_scale_range: float = 45.0        # Only used if use_wd_deviation=True. Wind direction deviation range for scaling (±degrees → [-1,1]) (stage-1 baseline)
 
     # === Transformer Architecture ===
     embed_dim: int = 128          # Transformer hidden dimension
@@ -123,7 +126,7 @@ class Args:
     # === Positional Encoding Settings ===
     # Options: "absolute_mlp", "relative_mlp", "relative_mlp_shared",
     #          "sinusoidal_2d",
-    pos_encoding_type: Optional[str] = None  # Now Optional, use None for no pos encoding
+    pos_encoding_type: Optional[str] = "relative_mlp"  # None for no pos encoding (stage-1 baseline: relative_mlp)
     # For relative encoding: number of hidden units in the bias MLP
     rel_pos_hidden_dim: int = 64
     # For relative encoding: whether to use separate bias per head

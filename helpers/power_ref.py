@@ -14,9 +14,16 @@ A closure or lambda over the training scope would not be.
 
 import numpy as np
 
-# (n_steps, fraction_of_greedy) per segment; all <= 1.0 so a derate-only agent
-# can reach every target. 4 segments x 200 steps = 800-step episode.
+# (n_steps, fraction_of_greedy) per segment. 4 segments x 200 steps = 800-step
+# episode. In DEFAULT_SCHEDULE all fractions are <= 1.0 so a derate-only agent
+# can reach every target (greedy is the full-power, no-steering ceiling for a
+# derate-only farm).
 DEFAULT_SCHEDULE = [(200, 0.80), (200, 0.60), (200, 0.70), (200, 1.00)]
+
+# Middle segment is 115% of greedy: reachable ONLY via yaw wake steering
+# (greedy is the no-steering, full-power baseline). Derating alone cannot exceed
+# it, so this schedule REQUIRES a yaw+derate agent (config power_tracking_yaw).
+BOOST_SCHEDULE = [(200, 0.80), (200, 1.15), (200, 0.70), (200, 1.00)]
 
 
 def stepwise_power_ref(t, env, *, greedy, schedule=DEFAULT_SCHEDULE):
@@ -33,7 +40,7 @@ def stepwise_power_ref(t, env, *, greedy, schedule=DEFAULT_SCHEDULE):
     return fracs[idx] * greedy
 
 
-def measure_greedy(make_probe_env, *, n_steps=200, burn_in=40) -> float:
+def measure_greedy(make_probe_env, *, n_steps=100, burn_in=20) -> float:
     """Measure greedy (undereated) waked farm power [W] for the fixed inflow.
 
     Builds a throwaway env via ``make_probe_env()`` (a zero-arg callable
@@ -58,7 +65,11 @@ def measure_greedy(make_probe_env, *, n_steps=200, burn_in=40) -> float:
     u = env.unwrapped
 
     # -1 across the derate action -> derate=0 -> full power (see WindFarmEnv's
-    # affine [-1,1] -> [derate_min, derate_max] map, derate_min=0).
+    # affine [-1,1] -> [derate_min, derate_max] map, derate_min=0). The probe env
+    # is built YAW-DISABLED (derate-only) even when training uses yaw+derate, so
+    # this all-min action is unambiguously the no-steering, full-power baseline --
+    # the correct greedy ceiling for the >100% boost schedule. (See the probe-env
+    # construction in transformer_sac_windfarm_tracking.py.)
     action = -np.ones(env.action_space.shape, dtype=np.float32)
     samples = []
     for _ in range(n_steps):

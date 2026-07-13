@@ -241,6 +241,22 @@ ENV_CONFIGS: Dict[str, Dict[str, Any]] = {
 }
 
 
+# Yaw+derate farm power tracking: identical to "power_tracking" but with yaw
+# added as a second action channel (yaw_action=True -> act_var=2, block action
+# [yaw..., derate...]). This is the config the >100% BOOST_SCHEDULE requires:
+# the agent must steer wakes (yaw) to boost farm power above the no-steering
+# greedy baseline, since derating alone can only reduce it. Cloned from
+# "power_tracking" so it tracks any future change to that preset; only
+# yaw_action is overridden (yaw bounds +-30, yaw_mes and fixed inflow all
+# inherited). The yaw command style is set at the trainer via --action_type
+# (config["ActionMethod"] = args.action_type); the launcher uses --action_type
+# yaw (delta yaw). Derate stays an absolute setpoint (derate_method="absolute").
+ENV_CONFIGS["power_tracking_yaw"] = _deep_update(
+    deepcopy(ENV_CONFIGS["power_tracking"]),
+    {"yaw_action": True},
+)
+
+
 def make_env_config(name: str = "default") -> Dict[str, Any]:
     """Build an env config by name. Applies overrides on top of the base config."""
     if name not in ENV_CONFIGS:

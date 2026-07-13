@@ -103,7 +103,7 @@ from helpers.env_configs import make_env_config
 # Power-tracking / derate-only helpers (see module docstring).
 from functools import partial
 from helpers.derating_turbine import make_derating_dtu10mw
-from helpers.power_ref import stepwise_power_ref, measure_greedy, DEFAULT_SCHEDULE
+from helpers.power_ref import stepwise_power_ref, measure_greedy, DEFAULT_SCHEDULE, BOOST_SCHEDULE
 
 # Receptivity profile computation
 from helpers.receptivity_profiles import compute_layout_profiles
@@ -385,20 +385,37 @@ def main():
     # flow is what we read, not the reference). Valid only because the inflow is
     # fixed in the "power_tracking" config; randomizing wind would require
     # recomputing greedy per episode.
+    #
+    # Greedy must be the NO-STEERING, full-power baseline. For a yaw+derate config
+    # (power_tracking_yaw) the training action space includes yaw, but the probe
+    # needs no yaw at all -- so we build the probe with yaw DISABLED (derate-only).
+    # Then measure_greedy's all-min-derate action is simply full power at the fixed
+    # (aligned) yaw, and the >100% BOOST_SCHEDULE is measured against the true
+    # unsteered ceiling. For the derate-only config this is already the case.
+    probe_config = {**config, "yaw_action": False}
+    probe_env_kwargs = {**base_env_kwargs, "config": probe_config}
+
     def _make_probe_env():
         return WindFarmEnv(
             x_pos=np.arange(3) * 6 * D, y_pos=np.zeros(3),
-            reset_init=False, **base_env_kwargs,
+            reset_init=False, **probe_env_kwargs,
         )
+
+    # Select the fraction-of-greedy schedule. "boost" puts a 115% segment in the
+    # middle -- reachable ONLY via yaw wake steering, so it requires a yaw+derate
+    # config (e.g. power_tracking_yaw); "default" stays <= 100% for derate-only.
+    schedule = BOOST_SCHEDULE if args.power_schedule == "boost" else DEFAULT_SCHEDULE
 
     print("Measuring greedy farm power (probe env)...")
     GREEDY = measure_greedy(_make_probe_env)
+    print(f"  Power schedule: {args.power_schedule} "
+          f"(fractions {[f for _, f in schedule]})")
     print(f"  GREEDY = {GREEDY / 1e6:.3f} MW; reference cycle (MW): "
-          f"{[round(f * GREEDY / 1e6, 2) for _, f in DEFAULT_SCHEDULE]}")
+          f"{[round(f * GREEDY / 1e6, 2) for _, f in schedule]}")
 
     # partial over a module-level fn keeps this picklable for AsyncVectorEnv.
     base_env_kwargs["power_ref_function"] = partial(
-        stepwise_power_ref, greedy=GREEDY, schedule=DEFAULT_SCHEDULE
+        stepwise_power_ref, greedy=GREEDY, schedule=schedule
     )
 
     def env_factory(x_pos: np.ndarray, y_pos: np.ndarray) -> gym.Env:
@@ -480,7 +497,11 @@ def main():
 
     n_turbines_max = envs.env.get_attr('max_turbines')[0]
     obs_dim_per_turbine = envs.single_observation_space.shape[-1]
-    action_dim_per_turbine = 1
+    # act_var per turbine: 1 = derate-only, 2 = yaw+derate. Read it from
+    # MultiLayoutEnv (same get_attr pattern as max_turbines above). NOT
+    # single_action_space.shape[-1]: MultiLayoutEnv keeps the derate-only action
+    # space flat (max_turbines,), so shape[-1] would be max_turbines, not act_var.
+    action_dim_per_turbine = envs.env.get_attr('action_dim_per_turbine')[0]
     rotor_diameter = envs.env.get_attr('rotor_diameter')[0]
 
     print(f"Max turbines: {n_turbines_max}")
