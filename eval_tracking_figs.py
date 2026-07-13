@@ -1,13 +1,17 @@
-"""Tracking-eval figure generator: ONE derate-only checkpoint x the track3
-training episode -> a stack of flow-field PNGs (and an optional GIF).
+"""Tracking-eval figure generator: ONE tracking checkpoint (derate-only or
+yaw+derate) x the track3 training episode -> a stack of flow-field PNGs (and an
+optional GIF).
 
 This is the visual counterpart to eval_checkpoint.py (which produces NetCDF for
 the power-max yaw trainer). It drives WindGym's figure-generating rollout
 ``eval_single_fast`` (aka ``AgentEvalFast``) on the SAME fixed track3 episode
-used to train the derate-only power-tracking Transformer-SAC agent
+used to train the power-tracking Transformer-SAC agent
 (``transformer_sac_windfarm_tracking.py``), then renders the derating-oriented
 right-column panels (farm power + reference / per-turbine derating / per-turbine
-power) that ``agent_eval.py`` draws when it auto-detects a derate/tracking env.
+power, plus turbine yaws for yaw+derate agents) that ``agent_eval.py`` draws
+when it auto-detects a derate/tracking env. The control mode is read from the
+checkpoint's saved args (``config``/``action_type``/``power_schedule``), so
+derate-only and yaw+derate checkpoints both rebuild their exact training env.
 
 Two things this script has to bridge:
 
@@ -47,8 +51,13 @@ from networks import TransformerActor, create_profile_encoding
 from helpers.agent import WindFarmAgent
 from helpers.env_configs import make_env_config
 from helpers.helper_funcs import EnhancedPerTurbineWrapper
-from helpers.derating_turbine import make_derating_dtu10mw
-from helpers.power_ref import stepwise_power_ref, measure_greedy, DEFAULT_SCHEDULE
+from helpers.derating_turbine import make_derating_dtu10mw, make_operating_point_lookup
+from helpers.power_ref import (
+    stepwise_power_ref,
+    measure_greedy,
+    DEFAULT_SCHEDULE,
+    BOOST_SCHEDULE,
+)
 from WindGym import WindFarmEnv, AgentEvalFast
 from WindGym.farm_eval import FarmEval
 from WindGym.wrappers import PerTurbineObservationWrapper
@@ -81,13 +90,31 @@ def load_checkpoint(checkpoint_path: str, device: torch.device):
     return checkpoint, args
 
 
-def build_track3_env(args: dict, turbbox_path: str):
+# Per-turbine sensor-history generations of helpers/env_configs._NOW_AND_T2,
+# keyed by SAMPLES PER SENSOR. The block was widened from 2 samples over 3
+# steps (pywake-era checkpoints, obs 8/turbine) to 3 samples over 10 steps
+# (dynamiks-era, obs 11/turbine); the env must be rebuilt with the generation
+# a checkpoint was TRAINED on or the actor's obs width won't match. The width
+# only pins the sample COUNT, so the sample TIMING is looked up here.
+_MES_GENERATIONS = {
+    2: dict(current=False, rolling_mean=True, history_N=2, history_length=3,
+            window_length=1),
+    3: dict(current=False, rolling_mean=True, history_N=3, history_length=10,
+            window_length=1),
+}
+
+
+def build_track3_env(args: dict, turbbox_path: str, obs_width: int | None = None):
     """Rebuild the exact track3 tracking env used in training (unvectorized).
 
     Faithful to transformer_sac_windfarm_tracking.py's ENV SETUP block: derate-
-    capable DTU10MW surrogate, "power_tracking" config, a 3-turbine row at
-    x=[0, 6D, 12D], and the stepwise 80/60/70/100%-of-greedy power reference
-    (greedy measured once with a throwaway probe env at the fixed inflow).
+    capable DTU10MW surrogate, the checkpoint's saved env config (derate-only
+    "power_tracking" or yaw+derate "power_tracking_yaw"), a 3-turbine row at
+    x=[0, 6D, 12D], and the saved fraction-of-greedy power reference schedule
+    (80/60/70/100% default, or 80/115/70/100% "boost" -- the 115% segment is
+    reachable only via yaw wake steering). Greedy is measured once with a
+    throwaway probe env at the fixed inflow, with yaw DISABLED so the baseline
+    is the true no-steering full-power ceiling, exactly as the trainer does.
 
     The base env is a ``FarmEval`` (a WindFarmEnv subclass): it adds the
     set_wind_vals/set_yaw_vals surface eval_single_fast calls, and its reset()
@@ -96,17 +123,57 @@ def build_track3_env(args: dict, turbbox_path: str):
     asserts no parent_pipes) and NOT wrapped in MultiLayoutEnv (no shuffle), so
     turbine order is stable and matches the positions we hand the actor.
 
-    Returns ``(base_env, wrapped_env, D)``: ``base_env`` is driven directly by
-    eval_single_fast; ``wrapped_env`` is the per-turbine wrapper stack on top of
-    the SAME base env, used only to (a) read the actor's per-token obs width and
-    (b) transform each flat base observation into per-turbine tokens in the eval
-    adapter, exactly as training did.
+    Returns ``(base_env, wrapped_env, D, greedy)``: ``base_env`` is driven
+    directly by eval_single_fast; ``wrapped_env`` is the per-turbine wrapper
+    stack on top of the SAME base env, used only to (a) read the actor's
+    per-token obs width and (b) transform each flat base observation into
+    per-turbine tokens in the eval adapter, exactly as training did; ``greedy``
+    is the measured full-power farm baseline (W) the reference schedule scales
+    against (interactive_eval.py needs it for its slider range).
+
+    ``obs_width`` is the per-turbine obs width the checkpoint's actor expects
+    (its first-layer in_features). When given, the per-turbine sensor blocks
+    are rebuilt for the matching _MES_GENERATIONS entry, so checkpoints
+    trained before the sensor-history widening still load.
     """
     wt = make_derating_dtu10mw()
     D = wt.diameter()
+    # Steady-state pitch/RPM table (same HAWCStab2 source as the power
+    # surrogate) -> eval figures grow blade-pitch and rotor-RPM panels.
+    op_lookup = make_operating_point_lookup(rotor_diameter=D)
 
-    config = make_env_config("power_tracking")
-    config["ActionMethod"] = "wind"  # derate-only agent commands absolute setpoints
+    # Env config + action method from the SAVED args (mirrors the trainer).
+    # load_checkpoint back-fills defaults, but every track3 checkpoint saved an
+    # explicit power_tracking* config; anything else means this checkpoint was
+    # not trained by the tracking trainer, so fail loudly.
+    if not str(args["config"]).startswith("power_tracking"):
+        raise ValueError(
+            f"Checkpoint config is {args['config']!r}, expected a "
+            "power_tracking* preset -- this script only evals tracking runs."
+        )
+    config = make_env_config(args["config"])
+    config["ActionMethod"] = args["action_type"]
+
+    if obs_width is not None:
+        # Per-turbine token = 3 sensors (ws/power/yaw) x samples + broadcast
+        # tracking tail (setpoint + error + preview).
+        tail = 2 + config["track_def"]["track_obs_preview"]
+        samples, rem = divmod(int(obs_width) - tail, 3)
+        if rem == 0 and samples in _MES_GENERATIONS:
+            block = _MES_GENERATIONS[samples]
+            for prefix in ("ws", "power", "yaw"):
+                config[f"{prefix}_mes"] = {
+                    f"{prefix}_{k}": v for k, v in block.items()
+                }
+            print(f"[Eval] Checkpoint expects {obs_width} obs/turbine -> "
+                  f"{samples}-sample sensor blocks "
+                  f"(history_N={block['history_N']}, "
+                  f"history_length={block['history_length']}).")
+        else:
+            print(f"[Eval] WARNING: cannot map checkpoint obs width {obs_width} "
+                  f"to a known sensor generation (tail={tail}); keeping the "
+                  "current config -- expect a load_state_dict size mismatch "
+                  "if the config drifted.")
 
     # Shared env kwargs. NOTE: no max_time_steps -- FarmEval.reset() sets a large
     # sandbox time_max, and the WindFarmEnv probe only needs a settled reset.
@@ -120,6 +187,7 @@ def build_track3_env(args: dict, turbbox_path: str):
         "dt_sim": args["dt_sim"],
         "dt_env": args["dt_env"],
         "yaw_step_sim": args["yaw_step"],
+        "op_lookup": op_lookup,
     }
 
     x_pos = np.arange(3) * 6 * D
@@ -127,16 +195,28 @@ def build_track3_env(args: dict, turbbox_path: str):
 
     # Greedy (settled waked farm power) from a probe env built WITHOUT the power
     # reference -- exactly the trainer's ordering, so the reference cycle matches.
+    # Yaw is disabled on the probe so measure_greedy's all-min action means
+    # "full power, no steering" even for yaw+derate configs; otherwise the
+    # boost schedule's >100% segments would scale off a steered (wrong) greedy.
+    probe_config = {**config, "yaw_action": False}
+
     def _make_probe_env():
-        return WindFarmEnv(x_pos=x_pos, y_pos=y_pos, reset_init=False, **base_env_kwargs)
+        return WindFarmEnv(
+            x_pos=x_pos, y_pos=y_pos, reset_init=False,
+            **{**base_env_kwargs, "config": probe_config},
+        )
+
+    schedule = (
+        BOOST_SCHEDULE if args.get("power_schedule") == "boost" else DEFAULT_SCHEDULE
+    )
 
     print("Measuring greedy farm power (probe env)...")
     greedy = measure_greedy(_make_probe_env)
     print(f"  GREEDY = {greedy / 1e6:.3f} MW; reference cycle (MW): "
-          f"{[round(f * greedy / 1e6, 2) for _, f in DEFAULT_SCHEDULE]}")
+          f"{[round(f * greedy / 1e6, 2) for _, f in schedule]}")
 
     base_env_kwargs["power_ref_function"] = partial(
-        stepwise_power_ref, greedy=greedy, schedule=DEFAULT_SCHEDULE
+        stepwise_power_ref, greedy=greedy, schedule=schedule
     )
 
     base_env = FarmEval(
@@ -152,7 +232,7 @@ def build_track3_env(args: dict, turbbox_path: str):
     if args["use_wd_deviation"]:
         wrapped = EnhancedPerTurbineWrapper(wrapped, wd_scale_range=args["wd_scale_range"])
 
-    return base_env, wrapped, float(D)
+    return base_env, wrapped, float(D), greedy
 
 
 def build_agent(args: dict, env, rotor_diameter: float, device: torch.device):
@@ -160,13 +240,26 @@ def build_agent(args: dict, env, rotor_diameter: float, device: torch.device):
     the built env's dims (mirrors eval_checkpoint.build_agent, but reads dims off
     the unvectorized env instead of a vector env's get_attr)."""
     obs_dim_per_turbine = env.observation_space.shape[-1]
-    action_high = float(env.action_space.high.reshape(-1)[0])
-    action_low = float(env.action_space.low.reshape(-1)[0])
+    # 1 for derate-only, 2 for yaw+derate (the wrapper's per-turbine action
+    # width mirrors the base env's act_var).
+    action_dim_per_turbine = int(getattr(env.unwrapped, "act_var", 1))
+    # Action bounds must reproduce the SHAPE of the checkpoint's saved
+    # scale/bias buffers or load_state_dict rejects them: derate-only
+    # checkpoints store scalars (shape ()), yaw+derate checkpoints store one
+    # value per action dim (shape (2,), from the trainer's
+    # ``envs.single_action_space.high[0]`` on the (n_turb, 2) action space).
+    if action_dim_per_turbine == 1:
+        action_high = float(env.action_space.high.reshape(-1)[0])
+        action_low = float(env.action_space.low.reshape(-1)[0])
+    else:
+        action_high = np.asarray(env.action_space.high[0], dtype=np.float32)
+        action_low = np.asarray(env.action_space.low[0], dtype=np.float32)
     action_scale = (action_high - action_low) / 2.0
     action_bias = (action_high + action_low) / 2.0
 
     print(f"Obs dim per turbine: {obs_dim_per_turbine}")
-    print(f"Action scale/bias: {action_scale:.3f} / {action_bias:.3f}")
+    print(f"Action dim per turbine: {action_dim_per_turbine}")
+    print(f"Action scale/bias: {action_scale} / {action_bias}")
 
     # Profile encoders (a no-op for the tracking run, which trains with
     # profile_encoding_type=None -> use_profiles=False).
@@ -188,7 +281,7 @@ def build_agent(args: dict, env, rotor_diameter: float, device: torch.device):
 
     actor = TransformerActor(
         obs_dim_per_turbine=obs_dim_per_turbine,
-        action_dim_per_turbine=1,
+        action_dim_per_turbine=action_dim_per_turbine,
         embed_dim=args_ns.embed_dim,
         pos_embed_dim=args_ns.pos_embed_dim,
         num_heads=args_ns.num_heads,
@@ -220,6 +313,48 @@ def build_agent(args: dict, env, rotor_diameter: float, device: torch.device):
         rotate_profiles=args["rotate_profiles"],
     )
     return actor, agent
+
+
+def compute_track3_profiles(args: dict, x_pos, y_pos, turbine):
+    """Receptivity/influence profiles for the fixed track3 layout, or (None,
+    None) when the checkpoint trained without profile encoding.
+
+    Mirrors eval_checkpoint.build_layout_config: the profiles depend only on
+    the layout geometry (and profile args), so they are computed once here and
+    handed to the eval adapter as precomputed state -- there is no
+    MultiLayoutEnv in this unvectorized eval to get_attr them from.
+    """
+    if args["profile_encoding_type"] is None:
+        return None, None
+
+    source = str(args["profile_source"]).lower()
+    if source == "geometric":
+        from helpers.geometric_profiles import compute_layout_profiles_vectorized
+
+        print("Computing GEOMETRIC profiles for the track3 layout...")
+        receptivity, influence = compute_layout_profiles_vectorized(
+            x_pos, y_pos,
+            rotor_diameter=turbine.diameter(),
+            k_wake=0.04,
+            n_directions=args["n_profile_directions"],
+            sigma_smooth=args.get("profile_sigma_smooth", 10.0),
+            scale_factor=15.0,
+            mode=args.get("profile_geom_mode", "wake"),
+        )
+    elif source == "pywake":
+        from helpers.receptivity_profiles import compute_layout_profiles
+
+        print("Computing PyWake profiles for the track3 layout...")
+        receptivity, influence = compute_layout_profiles(
+            x_pos, y_pos, turbine,
+            n_directions=args["n_profile_directions"],
+        )
+    else:
+        raise ValueError(
+            f"Unknown profile_source: {args['profile_source']}. "
+            "Use 'pywake' or 'geometric'."
+        )
+    return receptivity, influence
 
 
 def build_obs_transform(base_env, wrapped_env):
@@ -267,12 +402,17 @@ class _TransformerEvalModel:
 
     model_type = "CleanRL"
 
-    def __init__(self, agent, transform, wind_dirs, raw_positions, masks):
+    def __init__(self, agent, transform, wind_dirs, raw_positions, masks,
+                 receptivity=None, influence=None):
         self.agent = agent
         self._transform = transform
         self._wd = wind_dirs
         self._pos = raw_positions
         self._mask = masks
+        # Precomputed (1, n_turb, n_directions) layout profiles for
+        # profile-encoding checkpoints; None otherwise.
+        self._recep = receptivity
+        self._infl = influence
 
     def get_action(self, obs_tensor, deterministic=False):
         flat = obs_tensor.detach().cpu().numpy()[0]        # (flat_obs_dim,)
@@ -280,8 +420,17 @@ class _TransformerEvalModel:
         a = self.agent.act(
             None, per_turb.astype(np.float32), deterministic=deterministic,
             wind_dirs=self._wd, raw_positions=self._pos, masks=self._mask,
-        )  # (1, n_turb)
-        return torch.as_tensor(a), None, None  # caller flattens -> (n_turb,)
+            receptivity=self._recep, influence=self._infl,
+        )  # (1, n_turb) for act dim 1, (1, n_turb, act_dim) for act dim 2
+        a = np.asarray(a)
+        if a.ndim == 3:
+            # The base env's flat action layout is VARIABLE-major
+            # ([yaw_0..yaw_n | derate_0..derate_n], wind_farm_env._adjust_yaws /
+            # _apply_derate), but the agent returns turbine-major rows. Transpose
+            # before flattening -- same as PerTurbineObservationWrapper.
+            # _flatten_action -- so the caller's .flatten() becomes a no-op.
+            a = a[0].T.reshape(1, -1)
+        return torch.as_tensor(a), None, None  # caller flattens -> (n_turb * act_dim,)
 
 
 def build_gif(fig_dir: str, name: str, fps: int, frame_stride: int) -> None:
@@ -296,6 +445,33 @@ def build_gif(fig_dir: str, name: str, fps: int, frame_stride: int) -> None:
     frames = os.path.join(fig_dir, "img_%05d.png")
     palette = os.path.join(fig_dir, "_palette.png")
 
+    # The frames are saved with bbox_inches="tight", so their pixel size
+    # drifts a few px with tick-label widths — but ffmpeg needs one constant
+    # frame size ("Error while filtering: Internal bug" on a mid-stream size
+    # change; a scale/pad filter does NOT save the paletteuse pass, since
+    # complex filtergraphs cannot reinit on an input size change). Pad the
+    # PNGs to the max WxH canvas ON DISK once, then feed uniform frames.
+    from PIL import Image
+
+    pngs = sorted(
+        os.path.join(fig_dir, f)
+        for f in os.listdir(fig_dir)
+        if f.startswith("img_") and f.endswith(".png")
+    )
+    w = h = 0
+    for f in pngs:
+        with Image.open(f) as im:
+            w, h = max(w, im.width), max(h, im.height)
+    w += w % 2  # even dims so the same frames also feed mp4/yuv420p encoders
+    h += h % 2
+    for f in pngs:
+        with Image.open(f) as im:
+            if im.size == (w, h):
+                continue
+            canvas = Image.new("RGB", (w, h), "white")
+            canvas.paste(im, ((w - im.width) // 2, (h - im.height) // 2))
+        canvas.save(f)
+
     # A [x]-producing video-filter chain that is always non-empty (a bare "[x]"
     # would be an invalid filtergraph). stride>1 decimates every Nth frame and
     # resets timestamps so the GIF stays evenly paced at `fps`.
@@ -306,7 +482,7 @@ def build_gif(fig_dir: str, name: str, fps: int, frame_stride: int) -> None:
 
     gen = [
         "ffmpeg", "-y", "-framerate", str(fps), "-i", frames,
-        "-vf", f"{vfilter},palettegen", palette,
+        "-vf", f"{vfilter},palettegen", "-update", "1", "-frames:v", "1", palette,
     ]
     use = [
         "ffmpeg", "-y", "-framerate", str(fps), "-i", frames, "-i", palette,
@@ -326,8 +502,9 @@ def build_gif(fig_dir: str, name: str, fps: int, frame_stride: int) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate tracking-eval figures for one derate-only checkpoint "
-                    "on the track3 training episode.")
+        description="Generate tracking-eval figures for one tracking checkpoint "
+                    "(derate-only or yaw+derate; mode read from the checkpoint's "
+                    "saved args) on the track3 training episode.")
     parser.add_argument("--checkpoint", required=True,
                         help="Path to runs/<run>/checkpoints/step_<N>.pt")
     parser.add_argument("--t-sim", type=int, default=800,
@@ -367,8 +544,11 @@ def main():
 
     # ---- Load checkpoint, build env + agent ----
     checkpoint, args = load_checkpoint(ckpt_path, device)
-    base_env, wrapped_env, rotor_diameter = build_track3_env(
-        args, cli.turbbox_path
+    # The actor's first-layer in_features pins the per-turbine sensor
+    # generation the checkpoint was trained on (see _MES_GENERATIONS).
+    ckpt_obs_width = checkpoint["actor_state_dict"]["obs_encoder.0.weight"].shape[1]
+    base_env, wrapped_env, rotor_diameter, _greedy = build_track3_env(
+        args, cli.turbbox_path, obs_width=ckpt_obs_width
     )
     # Actor dims come from the WRAPPED (per-turbine) obs/action spaces, matching
     # training; the rollout below drives the base env directly.
@@ -382,7 +562,14 @@ def main():
     wind_dirs = np.array([TRACK3_WD], dtype=np.float32)
     masks = np.zeros((1, n_turb), dtype=bool)  # 3 turbines, no padding -> all valid
     transform = build_obs_transform(base_env, wrapped_env)
-    model = _TransformerEvalModel(agent, transform, wind_dirs, raw_positions, masks)
+    receptivity, influence = compute_track3_profiles(
+        args, base_env.x_pos, base_env.y_pos, base_env.turbine
+    )
+    if receptivity is not None:
+        receptivity = np.asarray(receptivity, dtype=np.float32)[None]  # (1, n_turb, n_dir)
+        influence = np.asarray(influence, dtype=np.float32)[None]
+    model = _TransformerEvalModel(agent, transform, wind_dirs, raw_positions, masks,
+                                  receptivity=receptivity, influence=influence)
 
     # ---- Run the figure-generating rollout (drives the raw base env) ----
     print(f"[Eval] Running AgentEvalFast for {n_turb} turbines...")

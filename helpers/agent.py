@@ -85,6 +85,8 @@ class BatchPreparer:
         wind_dirs: Optional[np.ndarray] = None,
         raw_positions: Optional[np.ndarray] = None,
         masks: Optional[np.ndarray] = None,
+        receptivity: Optional[np.ndarray] = None,
+        influence: Optional[np.ndarray] = None,
     ) -> InferenceBatch:
         """
         Prepare batch from vectorized environment state.
@@ -96,6 +98,11 @@ class BatchPreparer:
                 provided (e.g. the training loop already fetched them), they are
                 used directly to avoid duplicate get_attr IPC to the async
                 workers. Any left as None is queried here.
+            receptivity/influence: optional precomputed layout profiles, shape
+                (num_envs, n_turbines, n_directions). Only consulted when
+                use_profiles is on; when None they are fetched from the envs
+                via get_attr (which needs a MultiLayoutEnv-wrapped vector env,
+                so unvectorized eval drivers must pass them in).
 
         Returns:
             InferenceBatch ready for actor.get_action()
@@ -129,14 +136,16 @@ class BatchPreparer:
         influence_tensor = None
         
         if self.use_profiles:
-            # Query profiles from environment
-            receptivity = np.array(
-                envs.env.get_attr('receptivity_profiles'), dtype=np.float32
-            )
-            influence = np.array(
-                envs.env.get_attr('influence_profiles'), dtype=np.float32
-            )
-            
+            # Query profiles from environment (skip the IPC when precomputed)
+            if receptivity is None:
+                receptivity = np.array(
+                    envs.env.get_attr('receptivity_profiles'), dtype=np.float32
+                )
+            if influence is None:
+                influence = np.array(
+                    envs.env.get_attr('influence_profiles'), dtype=np.float32
+                )
+
             receptivity_tensor = torch.tensor(receptivity, dtype=torch.float32, device=self.device)
             influence_tensor = torch.tensor(influence, dtype=torch.float32, device=self.device)
             
@@ -219,6 +228,8 @@ class WindFarmAgent:
         wind_dirs: Optional[np.ndarray] = None,
         raw_positions: Optional[np.ndarray] = None,
         masks: Optional[np.ndarray] = None,
+        receptivity: Optional[np.ndarray] = None,
+        influence: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Select actions given current environment state.
@@ -227,14 +238,17 @@ class WindFarmAgent:
             envs: Vectorized environment
             obs: Current observations, shape (num_envs, n_turbines, obs_dim)
             deterministic: If True, use mean action. If False, sample stochastically.
-            wind_dirs/raw_positions/masks: optional precomputed env state forwarded
-                to BatchPreparer.from_envs to avoid duplicate get_attr IPC.
+            wind_dirs/raw_positions/masks/receptivity/influence: optional
+                precomputed env state forwarded to BatchPreparer.from_envs to
+                avoid duplicate get_attr IPC (or to supply profiles when there
+                is no vector env at all).
 
         Returns:
             actions: Action array, shape (num_envs, n_turbines)
         """
         batch = self.batch_preparer.from_envs(
             envs, obs, wind_dirs=wind_dirs, raw_positions=raw_positions, masks=masks,
+            receptivity=receptivity, influence=influence,
         )
         
         with torch.no_grad():
