@@ -33,7 +33,7 @@ def build_raw_env(power_ref_function=None):
     D = wt.diameter()
     kwargs = dict(
         turbine=wt, config=make_config(), backend="pywake",
-        dt_sim=1, dt_env=1, max_time_steps=400, reset_init=False,
+        dt_sim=1, dt_env=1, max_time_steps=800, reset_init=False,
     )
     if power_ref_function is not None:
         kwargs["power_ref_function"] = power_ref_function
@@ -57,14 +57,15 @@ def main():
         layouts=[layout],
         env_factory=lambda x, y: build_raw_env(power_ref_function=ref_fn),
         per_turbine_wrapper=PerTurbineObservationWrapper,
-        seed=0, max_turbines=3, max_episode_steps=400,
+        seed=0, max_turbines=3, max_episode_steps=800,
     )
 
-    assert mle.observation_space.shape == (3, 8), mle.observation_space.shape
+    # obs width = 3 temporal samples each for ws/power/yaw (was 2) + setpoint + error.
+    assert mle.observation_space.shape == (3, 11), mle.observation_space.shape
     assert mle.action_space.shape == (3,), mle.action_space.shape
 
     obs, info = mle.reset(seed=0)
-    assert obs.shape == (3, 8), obs.shape
+    assert obs.shape == (3, 11), obs.shape
     for key in ("Power reference", "Tracking error"):
         assert key in info, f"missing info key {key}"
     print(f"reset: obs {obs.shape}, setpoint {info['Power reference']/1e6:.2f} MW "
@@ -74,12 +75,12 @@ def main():
     for t in range(5):
         a = rng.uniform(-1, 1, size=(3,)).astype(np.float32)
         obs, reward, term, trunc, info = mle.step(a)
-        assert obs.shape == (3, 8), obs.shape
+        assert obs.shape == (3, 11), obs.shape
         assert -1.5 < reward <= 1e-6, reward
         print(f"step {t}: reward={reward:+.4f}  Pref={info['Power reference']/1e6:.3f}MW "
               f"err={info['Tracking error']/1e6:+.3f}MW")
     mle.close()
-    print("\nSMOKE OK: obs (3,8), action (3,), reward in (~-1,0], tracking info present.")
+    print("\nSMOKE OK: obs (3,11), action (3,), reward in (~-1,0], tracking info present.")
 
 
 if __name__ == "__main__":

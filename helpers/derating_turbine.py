@@ -27,6 +27,14 @@ SURROGATE_NC = (
     / "windgym/examples/data/dtu10mw_derating_yaw_surrogate.nc"
 )
 
+# The un-reduced HAWCStab2 table: same (ws, yaw, derating) grid but with the
+# underlying pitch [deg] / tsr / cp variables kept. Used to report the
+# steady-state blade pitch and rotor RPM alongside the surrogate power.
+FULL_SURROGATE_NC = (
+    Path(__file__).resolve().parents[2]
+    / "windgym/examples/data/dtu10mw_derating_yaw_surrogate_full.nc"
+)
+
 
 def make_derating_dtu10mw(nc_path: Path = SURROGATE_NC) -> WindTurbine:
     """Build a DTU 10MW WindTurbine with a (ws, yaw, derate) power/ct surrogate.
@@ -63,3 +71,24 @@ def make_derating_dtu10mw(nc_path: Path = SURROGATE_NC) -> WindTurbine:
         hub_height=ref.hub_height(),
         powerCtFunction=pctf,
     )
+
+
+def make_operating_point_lookup(nc_path: Path = FULL_SURROGATE_NC, rotor_diameter=None):
+    """Build the steady-state (ws, yaw, derate) -> (pitch, rpm) lookup.
+
+    Pass the result as WindFarmEnv's / FarmEval's ``op_lookup`` kwarg so eval
+    reports blade pitch and rotor RPM per turbine. Defaults to the DTU 10MW
+    rotor diameter and the full surrogate table shipped with WindGym.
+    """
+    from WindGym.core import OperatingPointLookup
+
+    nc_path = Path(nc_path)
+    if not nc_path.exists():
+        raise FileNotFoundError(
+            f"Full derating surrogate not found at {nc_path}. It is the "
+            f"un-reduced companion of {SURROGATE_NC.name} (with pitch/tsr "
+            f"variables); expected under windgym/examples/data/."
+        )
+    if rotor_diameter is None:
+        rotor_diameter = DTU10MW().diameter()
+    return OperatingPointLookup.from_netcdf(nc_path, rotor_diameter=rotor_diameter)

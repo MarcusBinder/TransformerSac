@@ -56,7 +56,7 @@ PYTHONPATH = "$PIXI_PROJECT_ROOT/../windgym:$PIXI_PROJECT_ROOT"
 
 [tasks]
 # Seconds-long env self-test (no training): builds the full stack, resets, and
-# steps with random actions. Asserts obs (3,8), action (3,), tracking info.
+# steps with random actions. Asserts obs (3,11), action (3,), tracking info.
 smoke-env = "python smoke_tracking_env.py"
 
 # First signs of life: derate-only farm-power tracking on the fixed track3 row.

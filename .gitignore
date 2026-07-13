@@ -36,3 +36,7 @@ pretrained_pt/
 .ipynb_checkpoints/
 .claude/
 /boxes
+
+# Coverage + local runs symlink
+.coverage
+/runs
