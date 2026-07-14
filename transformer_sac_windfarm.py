@@ -88,6 +88,7 @@ from helpers.receptivity_profiles import compute_layout_profiles
 
 # Evaluation import
 from helpers.eval_utils import PolicyEvaluator, run_evaluation
+from helpers.yaw_metrics import YawTravelTracker
 
 from networks import (
     TransformerActor,
@@ -581,7 +582,16 @@ def main():
     action_low = envs.single_action_space.low[0]
     action_scale = (action_high - action_low) / 2.0
     action_bias = (action_high + action_low) / 2.0
-    
+
+    # Yaw-movement diagnostics: physical yaw travel/reversals (deg, slew-limited
+    # to yaw_step_env per env step) and normalized-action jitter before the
+    # actuator filter. Windowed alongside yaw_accumulator, flushed on the same
+    # ~20-update logging cadence.
+    yaw_step_env = args.yaw_step * (args.dt_env / args.dt_sim)
+    yaw_tracker = YawTravelTracker(deadband=0.05, slew_limit=yaw_step_env)
+    action_tracker = YawTravelTracker(deadband=0.01)
+
+
     # =========================================================================
     # DEBUG LOGGER AND TRACKING SETUP
     # =========================================================================
@@ -1406,6 +1416,15 @@ def main():
             for t in range(len(env0_yaw)):
                 yaw_accumulator[f'yaw_env0_turb{t}_deg'].append(float(env0_yaw[t]))
 
+            # Movement diagnostics (travel, reversals, duty cycle). Mask done
+            # envs so post-autoreset yaw is never diffed against pre-reset yaw.
+            dones = np.logical_or(terminations, truncations)
+            yaw_tracker.update(yaw_deg, done=dones)
+            actions_np = np.asarray(actions)
+            action_tracker.update(actions_np.reshape(args.num_envs, -1), done=dones)
+            yaw_accumulator['action_saturation_frac'].append(
+                float(np.mean(np.abs(actions_np) > 0.95)))
+
         # Log episode stats
         if "final_info" in infos:
             ep_return = np.mean(envs.return_queue)
@@ -1834,10 +1853,36 @@ def main():
                         if yaw_accumulator.get(key):
                             writer.add_scalar(f"yaw_env0/turbine_{t}_deg", np.mean(yaw_accumulator[key]), global_step)
                             writer.add_histogram(
-                                f"yaw_env0_hist/turbine_{t}",                                                               
-                                np.array(yaw_accumulator[key]),            
-                                global_step,                                                                                
+                                f"yaw_env0_hist/turbine_{t}",
+                                np.array(yaw_accumulator[key]),
+                                global_step,
                             )
+
+                    # Movement metrics: oscillation is visible here even when
+                    # position stats (abs_mean/max) are flat.
+                    yaw_move = yaw_tracker.compute_and_reset()
+                    for k, v in yaw_move.items():
+                        writer.add_scalar(f"yaw/{k}", v, global_step)
+                    if 'travel_deg_per_step' in yaw_move:
+                        # Matches the env's "change" penalty formula:
+                        # action_penalty * mean(|yaw change|) per step. Logged
+                        # even with penalty disabled ("what it would charge").
+                        writer.add_scalar(
+                            "yaw/penalty_reward_estimate",
+                            args.action_penalty * yaw_move['travel_deg_per_step'],
+                            global_step)
+                    act_move = action_tracker.compute_and_reset()
+                    if 'travel_deg_per_step' in act_move:
+                        writer.add_scalar("action/delta_abs_mean",
+                                          act_move['travel_deg_per_step'], global_step)
+                    if 'reversal_rate' in act_move:
+                        writer.add_scalar("action/reversal_rate",
+                                          act_move['reversal_rate'], global_step)
+                    if yaw_accumulator.get('action_saturation_frac'):
+                        writer.add_scalar(
+                            "action/saturation_frac",
+                            np.mean(yaw_accumulator['action_saturation_frac']),
+                            global_step)
                     yaw_accumulator.clear()
 
                 if args.log_timing:

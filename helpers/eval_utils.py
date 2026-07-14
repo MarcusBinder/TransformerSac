@@ -34,9 +34,10 @@ import torch
 import torch.nn as nn
 import gymnasium as gym
 from typing import Dict, List, Any, Optional, Callable, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections import defaultdict
 from .agent import WindFarmAgent
+from .yaw_metrics import YawTravelTracker
 from .multi_layout_env import MultiLayoutEnv, LayoutConfig
 from .helper_funcs import transform_to_wind_relative
 from .layouts import get_layout_positions
@@ -58,7 +59,14 @@ class EvalMetrics:
     per_layout_power_ratios: Dict[str, float]
     num_episodes: int
     num_steps_per_episode: int
-    
+    # Yaw movement stats (deterministic policy, so oscillation here is the
+    # controller, not exploration noise). Defaults keep old callers working.
+    mean_yaw_travel: float = 0.0       # mean |yaw change| deg per env step
+    yaw_reversal_rate: float = 0.0     # frac of steps with a sign-flipped move
+    yaw_duty_cycle: float = 0.0        # frac of steps with any movement
+    per_layout_yaw_travel: Dict[str, float] = field(default_factory=dict)
+    per_layout_yaw_reversal: Dict[str, float] = field(default_factory=dict)
+
     def to_dict(self, prefix: str = "eval") -> Dict[str, float]:
         """Convert to flat dictionary for logging."""
         metrics = {
@@ -69,8 +77,11 @@ class EvalMetrics:
             f"{prefix}/std_power": self.std_power,
             f"{prefix}/mean_baseline_power": self.mean_baseline_power,
             f"{prefix}/power_ratio": self.power_ratio,
+            f"{prefix}/yaw_travel_deg_per_step": self.mean_yaw_travel,
+            f"{prefix}/yaw_reversal_rate": self.yaw_reversal_rate,
+            f"{prefix}/yaw_duty_cycle": self.yaw_duty_cycle,
         }
-        
+
         # Add per-layout metrics
         for layout, reward in self.per_layout_rewards.items():
             metrics[f"{prefix}/layout/{layout}/mean_reward"] = reward
@@ -78,7 +89,11 @@ class EvalMetrics:
             metrics[f"{prefix}/layout/{layout}/mean_power"] = power
         for layout, ratio in self.per_layout_power_ratios.items():
             metrics[f"{prefix}/layout/{layout}/power_ratio"] = ratio
-            
+        for layout, travel in self.per_layout_yaw_travel.items():
+            metrics[f"{prefix}/layout/{layout}/yaw_travel_deg_per_step"] = travel
+        for layout, rate in self.per_layout_yaw_reversal.items():
+            metrics[f"{prefix}/layout/{layout}/yaw_reversal_rate"] = rate
+
         return metrics
 
 
@@ -268,11 +283,16 @@ class PolicyEvaluator:
         all_episode_rewards = []  # Total reward per episode (length: num_eval_episodes * num_envs)
         all_episode_powers = []   # Mean power per episode
         all_baseline_powers = []  # Mean baseline power per episode
-        
+        all_yaw_travel = []       # Mean |yaw change| deg/step per episode
+        all_yaw_reversal = []     # Yaw reversal rate per episode
+        all_yaw_duty = []         # Yaw duty cycle per episode
+
         # Per-layout tracking (already correct - tracks each env independently)
         layout_rewards = defaultdict(list)
         layout_powers = defaultdict(list)
         layout_baseline_powers = defaultdict(list)
+        layout_yaw_travel = defaultdict(list)
+        layout_yaw_reversal = defaultdict(list)
         
         n_turbines_max = self.eval_envs.single_observation_space.shape[0]
         
@@ -289,6 +309,9 @@ class PolicyEvaluator:
             episode_power = []      # List of (num_envs,) arrays per step
             episode_baseline_power = []
             episode_layouts = self._get_current_layouts()
+            # Fresh tracker per episode: no cross-episode diffs, and fixed-length
+            # episodes mean no done-masking is needed inside the step loop.
+            yaw_tracker = YawTravelTracker(deadband=0.05)
             
             for step_idx in range(self.num_eval_steps):
 
@@ -306,11 +329,17 @@ class PolicyEvaluator:
                     episode_power.append(infos["Power agent"])
                 if "Power baseline" in infos:
                     episode_baseline_power.append(infos["Power baseline"])
-                
+                if "yaw angles agent" in infos:
+                    yaw_tracker.update(np.array(infos["yaw angles agent"]))
+
                 # Handle auto-reset (environments that terminated/truncated)
                 # The rewards are already captured, we just continue with the new obs
                 obs = next_obs
             
+            # Per-env yaw movement stats for this episode (arrays over envs;
+            # NaN where undefined, e.g. reversal rate with no valid pairs)
+            ep_yaw = yaw_tracker.compute_per_env_and_reset()
+
             # Store metrics for EACH env as an independent episode
             for env_idx in range(self.num_envs):
                 # Total reward for this env's episode
@@ -332,7 +361,20 @@ class PolicyEvaluator:
                     layout_powers[layout_name].append(env_mean_power)
                 if episode_baseline_power:
                     layout_baseline_powers[layout_name].append(env_mean_baseline)
-        
+
+                if ep_yaw:
+                    travel = float(ep_yaw["travel_deg_per_step"][env_idx])
+                    reversal = float(ep_yaw["reversal_rate"][env_idx])
+                    duty = float(ep_yaw["duty_cycle"][env_idx])
+                    if np.isfinite(travel):
+                        all_yaw_travel.append(travel)
+                        layout_yaw_travel[layout_name].append(travel)
+                    if np.isfinite(reversal):
+                        all_yaw_reversal.append(reversal)
+                        layout_yaw_reversal[layout_name].append(reversal)
+                    if np.isfinite(duty):
+                        all_yaw_duty.append(duty)
+
         self.agent.train()
         
         # Compute aggregate metrics over ALL episodes (num_eval_episodes * num_envs)
@@ -363,7 +405,20 @@ class PolicyEvaluator:
                 baseline = float(np.mean(layout_baseline_powers[layout]))
                 if baseline > 0:
                     per_layout_power_ratios[layout] = per_layout_powers[layout] / baseline
-        
+
+        # Yaw movement aggregates
+        mean_yaw_travel = float(np.mean(all_yaw_travel)) if all_yaw_travel else 0.0
+        yaw_reversal_rate = float(np.mean(all_yaw_reversal)) if all_yaw_reversal else 0.0
+        yaw_duty_cycle = float(np.mean(all_yaw_duty)) if all_yaw_duty else 0.0
+        per_layout_yaw_travel = {
+            layout: float(np.mean(vals))
+            for layout, vals in layout_yaw_travel.items()
+        }
+        per_layout_yaw_reversal = {
+            layout: float(np.mean(vals))
+            for layout, vals in layout_yaw_reversal.items()
+        }
+
         return EvalMetrics(
             mean_reward=mean_reward,
             std_reward=std_reward,
@@ -377,6 +432,11 @@ class PolicyEvaluator:
             per_layout_power_ratios=per_layout_power_ratios,
             num_episodes=self.num_eval_episodes,
             num_steps_per_episode=self.num_eval_steps,
+            mean_yaw_travel=mean_yaw_travel,
+            yaw_reversal_rate=yaw_reversal_rate,
+            yaw_duty_cycle=yaw_duty_cycle,
+            per_layout_yaw_travel=per_layout_yaw_travel,
+            per_layout_yaw_reversal=per_layout_yaw_reversal,
         )
     
     def close(self):
