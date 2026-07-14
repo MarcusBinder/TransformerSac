@@ -103,6 +103,39 @@ ENV_CONFIGS: Dict[str, Dict[str, Any]] = {
     },
     "hard_2": {
         "power_def": {"Power_reward": "Wake_recovery", "Power_avg": 5, "Power_scaling": 1.0},
+        "act_pen": {"action_penalty": 0.0, "action_penalty_type": "Change"},
+        "wind": {
+            "wd_min": 225, "wd_max": 315,
+            "ws_min": 10, "ws_max": 14,
+        },
+    },
+    "hard_3": {
+        "power_def": {"Power_reward": "Wake_recovery", "Power_avg": 5, "Power_scaling": 1.0},
+        "act_pen": {"action_penalty": 0.01, "action_penalty_type": "Change"},
+        "wind": {
+            "wd_min": 225, "wd_max": 315,
+            "ws_min": 10, "ws_max": 14,
+        },
+    },
+    "hard_4": {
+        "power_def": {"Power_reward": "Wake_recovery", "Power_avg": 5, "Power_scaling": 1.0},
+        "act_pen": {"action_penalty": 0.02, "action_penalty_type": "Change"},
+        "wind": {
+            "wd_min": 225, "wd_max": 315,
+            "ws_min": 10, "ws_max": 14,
+        },
+    },
+    "hard_5": {
+        "power_def": {"Power_reward": "Wake_recovery", "Power_avg": 5, "Power_scaling": 1.0},
+        "act_pen": {"action_penalty": 0.05, "action_penalty_type": "Change"},
+        "wind": {
+            "wd_min": 225, "wd_max": 315,
+            "ws_min": 10, "ws_max": 14,
+        },
+    },
+    "hard_6": {
+        "power_def": {"Power_reward": "Wake_recovery", "Power_avg": 5, "Power_scaling": 1.0},
+        "act_pen": {"action_penalty": 0.1, "action_penalty_type": "Change"},
         "wind": {
             "wd_min": 225, "wd_max": 315,
             "ws_min": 10, "ws_max": 14,
