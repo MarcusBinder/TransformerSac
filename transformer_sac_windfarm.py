@@ -389,6 +389,11 @@ def main():
     # Override ActionMethod from args (default "wind", or overridden by checkpoint above)
     config["ActionMethod"] = args.action_type
     print(f"ActionMethod set to: {config['ActionMethod']}")
+
+    # Override yaw-travel penalty weight from args (default 0.0 = disabled, matching
+    # the shipped configs). Persisted via the checkpoint's saved args.
+    config["act_pen"]["action_penalty"] = args.action_penalty
+    print(f"action_penalty set to: {config['act_pen']['action_penalty']} (type: {config['act_pen']['action_penalty_type']})")
     
     mes_prefixes = {
         "ws_mes": "ws",

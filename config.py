@@ -216,6 +216,10 @@ class Args:
 
     # === Action Settings ===
     action_type: str = "wind"   # "wind" (target setpoint) or "yaw" (delta). Overridden by BC checkpoint if provided.
+    # Yaw-travel penalty weight: reward -= action_penalty * mean(|yaw change|) per env
+    # step (RewardCalculator type "Change"). 0.0 keeps the shipped configs' behavior
+    # (penalty disabled). Overrides the env config's act_pen["action_penalty"].
+    action_penalty: float = 0.0
 
     # === LES-calibrated Domain Randomization ===
     # Path to a posterior .npz file containing `samples` (N, d) and
