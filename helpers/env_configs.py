@@ -231,6 +231,24 @@ for _name, _mes in _LES_ABLATIONS.items():
     ENV_CONFIGS[_name] = _cfg
 
 
+# LES + instantaneous current yaw (yaw_current=True adds the latest yaw, +1 per
+# turbine, on top of the base's rolling-mean yaw). Two reward arms for LEStest10,
+# both with Power_avg=3 so the arms differ ONLY in reward type.
+# NB: "LES_yaw" above is a sensor ablation, hence "LES_curyaw".
+_les_curyaw = deepcopy(ENV_CONFIGS["LES"])
+_deep_update(_les_curyaw, {
+    "yaw_mes": {"yaw_current": True},
+    "power_def": {"Power_reward": "Baseline", "Power_avg": 3, "Power_scaling": 1.0},
+})
+ENV_CONFIGS["LES_curyaw"] = _les_curyaw            # Baseline reward
+
+_les_curyaw_wr = deepcopy(_les_curyaw)
+_deep_update(_les_curyaw_wr, {
+    "power_def": {"Power_reward": "Wake_recovery", "Power_avg": 3, "Power_scaling": 1.0},
+})
+ENV_CONFIGS["LES_curyaw_wr"] = _les_curyaw_wr      # Wake_recovery reward
+
+
 def make_env_config(name: str = "default") -> Dict[str, Any]:
     """Build an env config by name. Applies overrides on top of the base config."""
     if name not in ENV_CONFIGS:
