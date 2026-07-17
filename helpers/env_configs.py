@@ -238,6 +238,30 @@ ENV_CONFIGS: Dict[str, Dict[str, Any]] = {
         # flip these to the NOW_AND_T2 pattern (_now_and_t2("derate")).
         "derate_mes": {"derate_current": False, "derate_rolling_mean": False},
     },
+
+    # Yaw+derate power MAXIMIZATION (not tracking) for the DEL-penalty A/B
+    # experiment on square_2x2. Inherits the base Baseline reward
+    # (P_agent/P_baseline - 1), which forces Baseline_comp=True, so the greedy
+    # baseline farm exists in every run -- both the reward denominator and the
+    # DELRewardWrapper's DEL reference come for free and cost the same with the
+    # penalty on or off. derate_max=0.2 caps the derate at 20% (pset >= 0.8),
+    # the DEL surrogate's validity range, so derating alone can never push the
+    # surrogate out of distribution. BaseController="Global" pins the baseline
+    # farm at zero yaw offset (deterministic greedy reference); the base
+    # default "Local" would chase wake-perturbed local wind directions and add
+    # noise to both the reward and the DEL ratio. Fixed inflow (ws=10, wd=270,
+    # TI=0.06) matches the power_tracking presets.
+    "power_max_derate": {
+        "BaseController": "Global",
+        "yaw_action": True,
+        "derate_action": True,
+        "derate_min": 0.0,
+        "derate_max": 0.2,          # pset in [0.8, 1.0] = DEL surrogate validity
+        "derate_method": "absolute",
+        "wind": {"ws_min": 10.0, "ws_max": 10.0, "TI_min": 0.06, "TI_max": 0.06,
+                 "wd_min": 270.0, "wd_max": 270.0},
+        "derate_mes": {"derate_current": False, "derate_rolling_mean": False},
+    },
 }
 
 

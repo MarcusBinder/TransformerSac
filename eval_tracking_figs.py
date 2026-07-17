@@ -104,7 +104,8 @@ _MES_GENERATIONS = {
 }
 
 
-def build_track3_env(args: dict, turbbox_path: str, obs_width: int | None = None):
+def build_track3_env(args: dict, turbbox_path: str, obs_width: int | None = None,
+                     *, baseline_comp: bool = False):
     """Rebuild the exact track3 tracking env used in training (unvectorized).
 
     Faithful to transformer_sac_windfarm_tracking.py's ENV SETUP block: derate-
@@ -135,6 +136,11 @@ def build_track3_env(args: dict, turbbox_path: str, obs_width: int | None = None
     (its first-layer in_features). When given, the per-turbine sensor blocks
     are rebuilt for the matching _MES_GENERATIONS entry, so checkpoints
     trained before the sensor-history widening still load.
+
+    ``baseline_comp`` builds the FarmEval with a parallel greedy baseline farm
+    (Baseline_comp=True, BaseController "Global" so the baseline holds yaw=0 /
+    derate=0), which DELRewardWrapper needs to compare DELs against. The greedy
+    probe stays single-farm. Default False keeps existing callers unchanged.
     """
     wt = make_derating_dtu10mw()
     D = wt.diameter()
@@ -219,8 +225,14 @@ def build_track3_env(args: dict, turbbox_path: str, obs_width: int | None = None
         stepwise_power_ref, greedy=greedy, schedule=schedule
     )
 
+    if baseline_comp:
+        # "Global" holds the baseline farm at yaw=0/derate=0 (true greedy),
+        # applied only to the FarmEval build -- the probe above stays single-farm.
+        base_env_kwargs["config"] = {**config, "BaseController": "Global"}
+
     base_env = FarmEval(
         x_pos=x_pos, y_pos=y_pos, reset_init=False, finite_episode=False,
+        Baseline_comp=baseline_comp,
         **base_env_kwargs,
     )
 

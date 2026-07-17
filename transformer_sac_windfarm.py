@@ -23,6 +23,7 @@ Author: Marcus Binder Nilsen (DTU Wind Energy)
 
 import os
 import random
+import sys
 import time
 from typing import Optional, Tuple, List, Dict, Any, Union
 from collections import deque
@@ -83,6 +84,12 @@ from helpers.receptivity_profiles import compute_layout_profiles
 
 # Evaluation import
 from helpers.eval_utils import PolicyEvaluator, run_evaluation
+
+# Repo root (parent of TransformerSac/): `del_surrogate` lives there and is
+# not installed into the pixi env. The path insert + import happen INSIDE
+# combined_wrapper so they also run in AsyncVectorEnv worker processes,
+# where module-level state of __main__ may not be replayed.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 from networks import (
     TransformerActor,
@@ -210,15 +217,23 @@ def main():
     from WindGym.wrappers import RecordEpisodeVals, PerTurbineObservationWrapper
     from helpers.multi_layout_env import MultiLayoutEnv, LayoutConfig
     
-    # Wind turbine
-    if args.turbtype == "DTU10MW":
-        from py_wake.examples.data.dtu10mw import DTU10MW as WT
-    elif args.turbtype == "V80":
-        from py_wake.examples.data.hornsrev1 import V80 as WT
+    # Wind turbine. Derate-enabled configs (e.g. power_max_derate) need a
+    # turbine whose powerCtFunction accepts a `derate` input; plain DTU10MW()
+    # fails WindFarmEnv's check_turbine_supports_derating, so use the
+    # derate-capable DTU10MW surrogate instead (same turbine the tracking
+    # trainer always uses). make_env_config is pure/cheap; the full env config
+    # is (re)built later for the env itself.
+    if make_env_config(args.config).get("derate_action", False):
+        from helpers.derating_turbine import make_derating_dtu10mw
+        wind_turbine = make_derating_dtu10mw()
     else:
-        raise ValueError(f"Unknown turbine type: {args.turbtype}")
-    
-    wind_turbine = WT()
+        if args.turbtype == "DTU10MW":
+            from py_wake.examples.data.dtu10mw import DTU10MW as WT
+        elif args.turbtype == "V80":
+            from py_wake.examples.data.hornsrev1 import V80 as WT
+        else:
+            raise ValueError(f"Unknown turbine type: {args.turbtype}")
+        wind_turbine = WT()
     
     # Create layout configurations
     print("Setting up layouts...")
@@ -373,7 +388,22 @@ def main():
         "dt_env": args.dt_env,
         "yaw_step_sim": args.yaw_step,
     }
-    
+
+    # DEL-constrained reward: DELRewardWrapper compares agent DELs against a
+    # greedy baseline farm, which only exists when the env is built with
+    # Baseline_comp=True. With Power_reward="Baseline" (the power-max presets)
+    # windgym forces Baseline_comp anyway, so the explicit kwarg is free; it
+    # matters only for other reward types. --del_log attaches the wrapper with
+    # penalty_scale=0 (penalty exactly 0, reward untouched) so an unpenalized
+    # A/B arm still logs the same charts/del_* metrics. BaseController
+    # "Global" pins the baseline yaw offset to 0 (deterministic greedy
+    # reference); "Local" would chase the fluctuating local wind direction and
+    # add noise to both the Baseline reward denominator and the DEL reference.
+    _del_active = args.del_penalty_scale > 0 or args.del_log
+    if _del_active:
+        base_env_kwargs["Baseline_comp"] = True
+        config["BaseController"] = "Global"
+
     def env_factory(x_pos: np.ndarray, y_pos: np.ndarray) -> gym.Env:
         """Create a base WindFarmEnv with given positions."""
         env = WindFarmEnv(x_pos=x_pos,
@@ -388,10 +418,38 @@ def main():
         Combined wrapper that:
         1. Applies PerTurbineObservationWrapper (reshapes obs to per-turbine)
         2. Optionally applies EnhancedPerTurbineWrapper (converts WD to deviation)
+        3. Optionally applies DELRewardWrapper (baseline-relative DEL hinge penalty)
+        4. Optionally applies TransformReward (reward_scale)
         """
         env = PerTurbineObservationWrapper(env)
         if args.use_wd_deviation:
             env = EnhancedPerTurbineWrapper(env, wd_scale_range=args.wd_scale_range)
+        # DEL hinge penalty BEFORE TransformReward, so the scaler multiplies
+        # the ALREADY-penalized reward: effective reward is
+        # reward_scale * (power_reward - del_penalty). del_penalty_scale is
+        # therefore in pre-scale units and the penalty/reward ratio is
+        # invariant to --reward_scale. Placed after the obs wrappers (not
+        # innermost) because gymnasium 1.x wrappers don't forward attributes:
+        # PerTurbineObservationWrapper reads env.n_turb at construction, while
+        # DELRewardWrapper only touches env.unwrapped, so it can sit anywhere
+        # in the chain. Reward-wise the two orders are identical (obs wrappers
+        # pass reward through untouched).
+        if args.del_penalty_scale > 0 or args.del_log:
+            if _REPO_ROOT not in sys.path:
+                sys.path.insert(0, _REPO_ROOT)
+            from del_surrogate import DELRewardWrapper
+
+            env = DELRewardWrapper(
+                env,
+                penalty_scale=args.del_penalty_scale,
+                allowed_increase=args.del_allowed_increase,
+                ti_window=args.del_ti_window,
+                # Reduced rotor template for training: 3*12=36 sample points
+                # per turbine per dt_sim per farm (vs the 288-point eval
+                # default) -- the sector means are what the surrogate sees.
+                n_r=3,
+                n_theta=12,
+            )
         # v9.1: scale the (tiny) Wake_recovery reward to probe optimization signal-to-noise.
         if args.reward_scale != 1.0:
             _scale = float(args.reward_scale)
@@ -453,7 +511,9 @@ def main():
 
     n_turbines_max = envs.env.get_attr('max_turbines')[0]
     obs_dim_per_turbine = envs.single_observation_space.shape[-1]
-    action_dim_per_turbine = 1
+    # 1 for yaw-only, 2 for yaw+derate (block action [yaw..., derate...]);
+    # MultiLayoutEnv derives it from the wrapped env's action space.
+    action_dim_per_turbine = envs.env.get_attr('action_dim_per_turbine')[0]
     rotor_diameter = envs.env.get_attr('rotor_diameter')[0]
 
     print(f"Max turbines: {n_turbines_max}")
@@ -1183,6 +1243,16 @@ def main():
     
     # Tracking
     step_reward_window = deque(maxlen=1000)
+    # DEL-penalty diagnostics (filled only when the DELRewardWrapper is
+    # attached: --del_penalty_scale > 0 or --del_log). ratio/max keys are NaN
+    # during each episode's ti_window warm-up; only finite values are
+    # collected so the logged means reflect evaluated steps.
+    del_penalty_window = deque(maxlen=1000)
+    del_ratio_window = deque(maxlen=1000)
+    del_agent_max_window = deque(maxlen=1000)
+    del_base_max_window = deque(maxlen=1000)
+    reward_unpen_window = deque(maxlen=1000)
+    del_ood_window = deque(maxlen=1000)
     # next_save_step = ((start_step // args.save_interval) + 1) * args.save_interval  # Account for resumed step
     next_save_step = start_step + args.save_interval
     # Replay buffer saving
@@ -1282,7 +1352,30 @@ def main():
 
         # Track rewards
         step_reward_window.extend(np.array(rewards).flatten().tolist())
-        
+
+        # DEL-penalty per-step diagnostics (vector env exposes wrapper info
+        # keys as per-env arrays).
+        if _del_active and "del_penalty" in infos:
+            del_penalty_window.extend(
+                np.asarray(infos["del_penalty"], dtype=float).flatten().tolist())
+            reward_unpen_window.extend(
+                np.asarray(infos["reward_unpenalized"], dtype=float).flatten().tolist())
+            for _key, _win in (("del_ratio", del_ratio_window),
+                               ("del_agent_max", del_agent_max_window),
+                               ("del_baseline_max", del_base_max_window)):
+                _vals = np.asarray(infos[_key], dtype=float).flatten()
+                _win.extend(_vals[np.isfinite(_vals)].tolist())
+            # loads_ood is per-env (T,) bool arrays; collation across envs can
+            # be ragged/objecty depending on gymnasium version -- diagnostic
+            # only, so never let it kill training.
+            try:
+                _ood = infos.get("loads_ood")
+                if _ood is not None:
+                    del_ood_window.extend(
+                        float(np.mean(np.asarray(o, dtype=float))) for o in _ood)
+            except (TypeError, ValueError):
+                pass
+
         # Log episode stats
         if "final_info" in infos:
             ep_return = np.mean(envs.return_queue)
@@ -1293,6 +1386,37 @@ def main():
             writer.add_scalar("charts/episodic_return", ep_return, global_step)
             writer.add_scalar("charts/episodic_length", ep_length, global_step)
             writer.add_scalar("charts/episodic_power", ep_power, global_step)
+
+            # Greedy-baseline comparison (filled by RecordEpisodeVals only when
+            # the env is built with Baseline_comp, e.g. Power_reward="Baseline").
+            # power_ratio > 1 means the agent beats the zero-offset greedy farm.
+            if getattr(envs, "mean_power_queue_baseline", None) and len(envs.mean_power_queue_baseline) > 0:
+                ep_power_base = float(np.mean(envs.mean_power_queue_baseline))
+                writer.add_scalar("charts/episodic_power_baseline", ep_power_base, global_step)
+                if ep_power_base > 0:
+                    writer.add_scalar("charts/episodic_power_ratio",
+                                      ep_power / ep_power_base, global_step)
+
+            # DEL signs of life (rolling-window means; window length ~ recent
+            # episode(s)). del_penalty stays 0 through each warm-up, and is
+            # identically 0 in --del_log-only (unpenalized) runs.
+            if _del_active and len(del_penalty_window) > 0:
+                writer.add_scalar("charts/episodic_del_penalty",
+                                  float(np.mean(del_penalty_window)), global_step)
+                writer.add_scalar("charts/episodic_reward_unpenalized",
+                                  float(np.mean(reward_unpen_window)), global_step)
+                if len(del_ratio_window) > 0:
+                    writer.add_scalar("charts/episodic_del_ratio",
+                                      float(np.mean(del_ratio_window)), global_step)
+                if len(del_agent_max_window) > 0:
+                    writer.add_scalar("charts/del_agent_max",
+                                      float(np.mean(del_agent_max_window)), global_step)
+                if len(del_base_max_window) > 0:
+                    writer.add_scalar("charts/del_baseline_max",
+                                      float(np.mean(del_base_max_window)), global_step)
+                if len(del_ood_window) > 0:
+                    writer.add_scalar("charts/del_ood_frac",
+                                      float(np.mean(del_ood_window)), global_step)
 
 
         # Handle final observations

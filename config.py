@@ -173,6 +173,21 @@ class Args:
     # reward is tiny (~0.02-0.10/step) -> small Q -> small gradients; scaling tests signal-to-noise.
     # Applied via a gymnasium reward wrapper in combined_wrapper; 1.0 = no change.
 
+    # === DEL-constrained reward (baseline-relative max-DEL hinge penalty) ===
+    # penalty = del_penalty_scale * max(0, DEL_agent_max/DEL_baseline_max
+    #                                      - (1 + del_allowed_increase))
+    # subtracted from the tracking reward BEFORE reward_scale (see
+    # combined_wrapper). 0.0 disables the DELRewardWrapper entirely -- the env
+    # is then built WITHOUT Baseline_comp, avoiding the doubled DWM cost.
+    del_penalty_scale: float = 0.0     # lambda, in pre-reward_scale units
+    del_allowed_increase: float = 0.10  # allowed fractional DEL increase over greedy baseline
+    del_ti_window: float = 60.0        # trailing window (s) for sector statistics
+    # Attach the DEL wrapper even when del_penalty_scale == 0 (info-only:
+    # penalty is exactly 0, reward untouched) so case-A runs log the same
+    # charts/del_* metrics as penalized runs. Free with Power_reward="Baseline"
+    # (the baseline farm already exists).
+    del_log: bool = False
+
     # === Gradient Clipping ===
     grad_clip: bool = True
     grad_clip_max_norm: float = 1.0

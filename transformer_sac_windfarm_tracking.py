@@ -45,6 +45,7 @@ Author: Marcus Binder Nilsen (DTU Wind Energy)
 
 import os
 import random
+import sys
 import time
 from typing import Optional, Tuple, List, Dict, Any, Union
 from collections import deque
@@ -110,6 +111,12 @@ from helpers.receptivity_profiles import compute_layout_profiles
 
 # Evaluation import
 from helpers.eval_utils import PolicyEvaluator, run_evaluation
+
+# Repo root (parent of TransformerSac/): `del_surrogate` lives there and is
+# not installed into the pixi env. The path insert + import happen INSIDE
+# combined_wrapper so they also run in AsyncVectorEnv worker processes,
+# where module-level state of __main__ may not be replayed.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 from networks import (
     TransformerActor,
@@ -418,6 +425,19 @@ def main():
         stepwise_power_ref, greedy=GREEDY, schedule=schedule
     )
 
+    # DEL-constrained reward: DELRewardWrapper compares agent DELs against a
+    # greedy baseline farm, which only exists when the env is built with
+    # Baseline_comp=True (works even with Power_reward="None" / tracking).
+    # Gated on del_penalty_scale > 0 because the baseline farm DOUBLES the DWM
+    # sim cost. Added AFTER probe_env_kwargs was snapshotted above, so the
+    # greedy probe env stays free of it. BaseController "Global" drives the
+    # baseline yaw offset to 0 (deterministic greedy row), matching the
+    # wrapper's baseline pset=1.0 assumption; "Local" would chase the
+    # fluctuating local wind direction and add noise to the DEL reference.
+    if args.del_penalty_scale > 0:
+        base_env_kwargs["Baseline_comp"] = True
+        config["BaseController"] = "Global"
+
     def env_factory(x_pos: np.ndarray, y_pos: np.ndarray) -> gym.Env:
         """Create a base WindFarmEnv with given positions."""
         env = WindFarmEnv(x_pos=x_pos,
@@ -432,10 +452,38 @@ def main():
         Combined wrapper that:
         1. Applies PerTurbineObservationWrapper (reshapes obs to per-turbine)
         2. Optionally applies EnhancedPerTurbineWrapper (converts WD to deviation)
+        3. Optionally applies DELRewardWrapper (baseline-relative DEL hinge penalty)
+        4. Optionally applies TransformReward (reward_scale)
         """
         env = PerTurbineObservationWrapper(env)
         if args.use_wd_deviation:
             env = EnhancedPerTurbineWrapper(env, wd_scale_range=args.wd_scale_range)
+        # DEL hinge penalty BEFORE TransformReward, so the scaler multiplies
+        # the ALREADY-penalized reward: effective reward is
+        # reward_scale * (tracking_reward - del_penalty). del_penalty_scale is
+        # therefore in pre-scale units and the penalty/reward ratio is
+        # invariant to --reward_scale. Placed after the obs wrappers (not
+        # innermost) because gymnasium 1.x wrappers don't forward attributes:
+        # PerTurbineObservationWrapper reads env.n_turb at construction, while
+        # DELRewardWrapper only touches env.unwrapped, so it can sit anywhere
+        # in the chain. Reward-wise the two orders are identical (obs wrappers
+        # pass reward through untouched).
+        if args.del_penalty_scale > 0:
+            if _REPO_ROOT not in sys.path:
+                sys.path.insert(0, _REPO_ROOT)
+            from del_surrogate import DELRewardWrapper
+
+            env = DELRewardWrapper(
+                env,
+                penalty_scale=args.del_penalty_scale,
+                allowed_increase=args.del_allowed_increase,
+                ti_window=args.del_ti_window,
+                # Reduced rotor template for training: 3*12=36 sample points
+                # per turbine per dt_sim per farm (vs the 288-point eval
+                # default) -- the sector means are what the surrogate sees.
+                n_r=3,
+                n_theta=12,
+            )
         # v9.1: scale the (tiny) Wake_recovery reward to probe optimization signal-to-noise.
         if args.reward_scale != 1.0:
             _scale = float(args.reward_scale)
@@ -1230,6 +1278,12 @@ def main():
     
     # Tracking
     step_reward_window = deque(maxlen=1000)
+    # DEL-penalty diagnostics (filled only when --del_penalty_scale > 0).
+    # del_ratio is NaN during each episode's ti_window warm-up; only finite
+    # values are collected so the logged mean reflects evaluated steps.
+    del_penalty_window = deque(maxlen=1000)
+    del_ratio_window = deque(maxlen=1000)
+    reward_unpen_window = deque(maxlen=1000)
     # next_save_step = ((start_step // args.save_interval) + 1) * args.save_interval  # Account for resumed step
     next_save_step = start_step + args.save_interval
     # Replay buffer saving
@@ -1329,6 +1383,16 @@ def main():
 
         # Track rewards
         step_reward_window.extend(np.array(rewards).flatten().tolist())
+
+        # DEL-penalty per-step diagnostics (vector env exposes wrapper info
+        # keys as per-env arrays).
+        if args.del_penalty_scale > 0 and "del_penalty" in infos:
+            del_penalty_window.extend(
+                np.asarray(infos["del_penalty"], dtype=float).flatten().tolist())
+            reward_unpen_window.extend(
+                np.asarray(infos["reward_unpenalized"], dtype=float).flatten().tolist())
+            _ratios = np.asarray(infos["del_ratio"], dtype=float).flatten()
+            del_ratio_window.extend(_ratios[np.isfinite(_ratios)].tolist())
         
         # Log episode stats
         if "final_info" in infos:
@@ -1359,6 +1423,17 @@ def main():
             if getattr(envs, "mean_power_ref_queue", None) and len(envs.mean_power_ref_queue) > 0:
                 writer.add_scalar("charts/episodic_power_ref",
                                   float(np.mean(envs.mean_power_ref_queue)), global_step)
+
+            # DEL-penalty signs of life (rolling-window means; window length
+            # ~ recent episode(s)). del_penalty stays 0 through each warm-up.
+            if args.del_penalty_scale > 0 and len(del_penalty_window) > 0:
+                writer.add_scalar("charts/episodic_del_penalty",
+                                  float(np.mean(del_penalty_window)), global_step)
+                writer.add_scalar("charts/episodic_reward_unpenalized",
+                                  float(np.mean(reward_unpen_window)), global_step)
+                if len(del_ratio_window) > 0:
+                    writer.add_scalar("charts/episodic_del_ratio",
+                                      float(np.mean(del_ratio_window)), global_step)
 
 
         # Handle final observations
