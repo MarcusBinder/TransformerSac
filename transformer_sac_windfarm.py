@@ -364,15 +364,23 @@ def main():
     # Override ActionMethod from args (default "wind", or overridden by checkpoint above)
     config["ActionMethod"] = args.action_type
     print(f"ActionMethod set to: {config['ActionMethod']}")
+
+    # Optional derate slew limit (fraction per sim substep, like yaw_step_sim).
+    if args.derate_step_sim is not None:
+        config["derate_step_sim"] = args.derate_step_sim
+        print(f"derate_step_sim set to: {config['derate_step_sim']}")
     
     mes_prefixes = {
         "ws_mes": "ws",
         "wd_mes": "wd",
         "yaw_mes": "yaw",
         "power_mes": "power",
+        "derate_mes": "derate",
     }
 
     for mes_type, prefix in mes_prefixes.items():
+        if mes_type not in config:
+            continue  # e.g. derate_mes is absent outside the derate presets
         config[mes_type][f"{prefix}_history_N"] = args.history_length
         config[mes_type][f"{prefix}_history_length"] = args.history_length
 

@@ -62,6 +62,10 @@ class Args:
     dt_sim: int = 5           # Simulation timestep (seconds)
     dt_env: int = 10          # Environment timestep (seconds)
     yaw_step: float = 5.0     # Max yaw change per sim step (degrees)
+    # Derate slew limit toward the setpoint, in derate FRACTION per sim
+    # substep (mirrors yaw_step_sim; windgym config key "derate_step_sim").
+    # None = setpoint applies instantly (windgym default).
+    derate_step_sim: Optional[float] = None
     max_eps: int = 20         # Number of flow passthroughs per episode
     num_envs: int = 1         # Number of parallel environments
 

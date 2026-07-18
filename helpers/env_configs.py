@@ -265,6 +265,26 @@ ENV_CONFIGS: Dict[str, Dict[str, Any]] = {
 }
 
 
+# power_max_derate with the derate SENSOR enabled (same 15-sample pattern as
+# the base ws/yaw/power sensors; history_N/length are overridden to
+# --history_length by the trainer like every other per-turbine sensor).
+# Needed once derate_step_sim rate-limits the derate: the realized derate
+# then lags the commanded setpoint and becomes a genuine (otherwise hidden)
+# state, exactly like the slewed yaw whose sensor has always been on.
+# Cloned instead of editing power_max_derate in place so the finished
+# delmax_2x2 runs remain reproducible from their pinned preset.
+ENV_CONFIGS["power_max_derate_dobs"] = _deep_update(
+    deepcopy(ENV_CONFIGS["power_max_derate"]),
+    {"derate_mes": {
+        "derate_current": False,
+        "derate_rolling_mean": True,
+        "derate_history_N": 15,
+        "derate_history_length": 15,
+        "derate_window_length": 1,
+    }},
+)
+
+
 # Yaw+derate farm power tracking: identical to "power_tracking" but with yaw
 # added as a second action channel (yaw_action=True -> act_var=2, block action
 # [yaw..., derate...]). This is the config the >100% BOOST_SCHEDULE requires:
