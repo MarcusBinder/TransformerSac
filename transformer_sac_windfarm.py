@@ -408,6 +408,11 @@ def main():
     # reference); "Local" would chase the fluctuating local wind direction and
     # add noise to both the Baseline reward denominator and the DEL reference.
     _del_active = args.del_penalty_scale > 0 or args.del_log
+    assert not args.del_limit_random or _del_active, (
+        "--del_limit_random conditions the policy on the DEL limit, which "
+        "only exists when the DEL wrapper is attached: also pass "
+        "--del_penalty_scale > 0 (or --del_log)."
+    )
     if _del_active:
         base_env_kwargs["Baseline_comp"] = True
         config["BaseController"] = "Global"
@@ -451,6 +456,14 @@ def main():
                 env,
                 penalty_scale=args.del_penalty_scale,
                 allowed_increase=args.del_allowed_increase,
+                # Goal-conditioned limit: per-episode uniform sample + one
+                # obs column per turbine (limit / del_limit_obs_ref). None
+                # keeps the fixed allowed_increase behavior bit-identical.
+                limit_range=(
+                    (args.del_limit_lo, args.del_limit_hi)
+                    if args.del_limit_random else None
+                ),
+                limit_obs_ref=args.del_limit_obs_ref,
                 ti_window=args.del_ti_window,
                 # Reduced rotor template for training: 3*12=36 sample points
                 # per turbine per dt_sim per farm (vs the 288-point eval
@@ -1261,6 +1274,13 @@ def main():
     del_base_max_window = deque(maxlen=1000)
     reward_unpen_window = deque(maxlen=1000)
     del_ood_window = deque(maxlen=1000)
+    # Goal-conditioned limit diagnostics: the limit in effect (varies across
+    # episodes under --del_limit_random) and the budget margin
+    # (1 + limit) - ratio; margin > 0 <=> inside the DEL budget, so its mean
+    # is the constraint-satisfaction signal across the sampled-limit
+    # distribution. Margin is NaN wherever ratio is (finite-filtered below).
+    del_limit_window = deque(maxlen=1000)
+    del_margin_window = deque(maxlen=1000)
     # next_save_step = ((start_step // args.save_interval) + 1) * args.save_interval  # Account for resumed step
     next_save_step = start_step + args.save_interval
     # Replay buffer saving
@@ -1368,9 +1388,15 @@ def main():
                 np.asarray(infos["del_penalty"], dtype=float).flatten().tolist())
             reward_unpen_window.extend(
                 np.asarray(infos["reward_unpenalized"], dtype=float).flatten().tolist())
+            if "del_limit" in infos:
+                del_limit_window.extend(
+                    np.asarray(infos["del_limit"], dtype=float).flatten().tolist())
             for _key, _win in (("del_ratio", del_ratio_window),
                                ("del_agent_max", del_agent_max_window),
-                               ("del_baseline_max", del_base_max_window)):
+                               ("del_baseline_max", del_base_max_window),
+                               ("del_margin", del_margin_window)):
+                if _key not in infos:
+                    continue
                 _vals = np.asarray(infos[_key], dtype=float).flatten()
                 _win.extend(_vals[np.isfinite(_vals)].tolist())
             # loads_ood is per-env (T,) bool arrays; collation across envs can
@@ -1425,6 +1451,12 @@ def main():
                 if len(del_ood_window) > 0:
                     writer.add_scalar("charts/del_ood_frac",
                                       float(np.mean(del_ood_window)), global_step)
+                if len(del_limit_window) > 0:
+                    writer.add_scalar("charts/del_limit",
+                                      float(np.mean(del_limit_window)), global_step)
+                if len(del_margin_window) > 0:
+                    writer.add_scalar("charts/del_margin",
+                                      float(np.mean(del_margin_window)), global_step)
 
 
         # Handle final observations

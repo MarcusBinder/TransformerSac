@@ -191,6 +191,17 @@ class Args:
     # charts/del_* metrics as penalized runs. Free with Power_reward="Baseline"
     # (the baseline farm already exists).
     del_log: bool = False
+    # Goal-conditioned DEL limit: sample del_allowed_increase per episode
+    # (uniform in [del_limit_lo, del_limit_hi]) and expose it as one extra
+    # observation column per turbine (limit / del_limit_obs_ref). One policy
+    # then covers the whole limit sweep; at eval a limit is pinned via
+    # DELRewardWrapper(fixed_limit=...) / reset(options={"del_limit": x}).
+    # Requires the DEL wrapper to be attached (del_penalty_scale > 0 or
+    # del_log). del_allowed_increase is ignored while this is on.
+    del_limit_random: bool = False   # sample the limit per episode; adds 1 obs column/turbine
+    del_limit_lo: float = 0.0
+    del_limit_hi: float = 0.3
+    del_limit_obs_ref: float = 0.3   # obs normalization denominator; keep fixed across checkpoints
 
     # === Gradient Clipping ===
     grad_clip: bool = True
