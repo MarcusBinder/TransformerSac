@@ -40,3 +40,4 @@ pretrained_pt/
 # Coverage + local runs symlink
 .coverage
 /runs
+/data

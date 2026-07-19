@@ -203,6 +203,22 @@ class Args:
     del_limit_hi: float = 0.3
     del_limit_obs_ref: float = 0.3   # obs normalization denominator; keep fixed across checkpoints
 
+    # === PPO Hyperparameters (transformer_ppo_windfarm.py only) ===
+    # Reused existing fields: gamma, total_timesteps, num_envs, policy_lr,
+    # grad_clip/grad_clip_max_norm, plus all env/arch/profile/layout/eval/DEL
+    # fields. Harmless defaults for the SAC trainer, which never reads these.
+    num_steps: int = 256          # rollout length per env (batch = num_steps * num_envs)
+    ppo_epochs: int = 10          # optimization epochs per rollout
+    num_minibatches: int = 8      # minibatches per epoch
+    clip_coef: float = 0.2        # PPO surrogate clipping epsilon
+    ent_coef: float = 0.0         # entropy bonus coefficient (per-dim normalized)
+    vf_coef: float = 0.5          # value loss coefficient
+    gae_lambda: float = 0.95      # GAE lambda
+    norm_adv: bool = True         # normalize advantages per minibatch
+    clip_vloss: bool = True       # clipped value loss (CleanRL style)
+    target_kl: Optional[float] = None  # early-stop epoch when approx_kl exceeds this
+    anneal_lr: bool = True        # linear LR anneal over num_iterations
+
     # === Gradient Clipping ===
     grad_clip: bool = True
     grad_clip_max_norm: float = 1.0
