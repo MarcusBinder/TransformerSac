@@ -249,6 +249,18 @@ _deep_update(_les_curyaw_wr, {
 ENV_CONFIGS["LES_curyaw_wr"] = _les_curyaw_wr      # Wake_recovery reward
 
 
+# LEStest11: current-yaw presets with the wd sampling range widened to 260-280
+# (ws 8-11 and TI 0.038 inherited from LES). Separate presets so LES_curyaw/_wr
+# keep meaning "fixed wd=270" for the LEStest10/LESfinal runs.
+_les_curyaw_wide = deepcopy(_les_curyaw)
+_deep_update(_les_curyaw_wide, {"wind": {"wd_min": 260, "wd_max": 280}})
+ENV_CONFIGS["LES_curyaw_wide"] = _les_curyaw_wide
+
+_les_curyaw_wr_wide = deepcopy(_les_curyaw_wr)
+_deep_update(_les_curyaw_wr_wide, {"wind": {"wd_min": 260, "wd_max": 280}})
+ENV_CONFIGS["LES_curyaw_wr_wide"] = _les_curyaw_wr_wide
+
+
 def make_env_config(name: str = "default") -> Dict[str, Any]:
     """Build an env config by name. Applies overrides on top of the base config."""
     if name not in ENV_CONFIGS:
