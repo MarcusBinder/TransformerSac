@@ -329,7 +329,14 @@ class MultiLayoutEnv(gym.Env):
         n_turb = self.n_turbines
         
         for key, value in info.items():
-            if not isinstance(value, np.ndarray):
+            if isinstance(value, dict):
+                # AsyncVectorEnv._add_info RECURSES into dict-valued keys and
+                # stacks their inner ndarrays across envs, so nested arrays
+                # must be padded too (DELWrapper's info["loads"] /
+                # info["loads_baseline"] are {channel: (n_turb,) array} —
+                # ragged across envs under DR layouts).
+                padded_info[key] = self._pad_dict_info(value, n_turb)
+            elif not isinstance(value, np.ndarray):
                 # Non-arrays pass through unchanged
                 padded_info[key] = value
             elif key in self._PER_TURBINE_KEYS:
@@ -348,6 +355,26 @@ class MultiLayoutEnv(gym.Env):
                 
         return padded_info
     
+    def _pad_dict_info(self, d: Dict[str, Any], n_turb: int) -> Dict[str, Any]:
+        """
+        Pad ndarrays inside a dict-valued info key (keys are channel names, so
+        the top-level key-based sets don't apply). 1-D arrays of length n_turb
+        are per-turbine -> pad to max_turbines; any other ndarray falls back
+        to a list so AsyncVectorEnv stores it as an object instead of stacking.
+        """
+        out = {}
+        for k, v in d.items():
+            if isinstance(v, dict):
+                out[k] = self._pad_dict_info(v, n_turb)
+            elif isinstance(v, np.ndarray):
+                if v.ndim == 1 and v.shape[0] == n_turb:
+                    out[k] = self._pad_1d_to_max(v)
+                else:
+                    out[k] = v.tolist()
+            else:
+                out[k] = v
+        return out
+
     def _pad_1d_to_max(self, arr: np.ndarray) -> np.ndarray:
         """Pad 1D array from (n_turb,) to (max_turbines,)."""
         if arr.shape[0] >= self.max_turbines:
