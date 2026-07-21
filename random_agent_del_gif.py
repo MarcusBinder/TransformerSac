@@ -415,6 +415,7 @@ def main():
     )
     del_env = DELRewardWrapper(
         base_env,
+        turbine={"IEA34": "iea34", "DTU10MW": "dtu10mw"}[env_args["turbtype"]],
         penalty_scale=cli.penalty_scale,
         allowed_increase=cli.allowed_increase,
         ti_window=cli.ti_window,

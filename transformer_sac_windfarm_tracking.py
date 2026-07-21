@@ -8,7 +8,8 @@ windgym/examples/Example 7 Power tracking RL setup.ipynb). The network and
 training loop are byte-for-byte identical to the yaw trainer.
 
 Differences from transformer_sac_windfarm.py (all in ENV SETUP):
-  - turbine: a derating-capable DTU10MW surrogate (make_derating_dtu10mw).
+  - turbine: a derating-capable surrogate turbine (make_derating_turbine;
+    IEA34/annrpm default, DTU10MW via --turbtype).
   - layout: a single hardcoded "track3" row, x = [0, 6D, 12D], y = 0.
   - config: "power_tracking" (Track_power, derate_action, yaw_action=False).
   - per-sensor history from the config (NOW_AND_T2) is kept -- the uniform
@@ -103,7 +104,7 @@ from helpers.env_configs import make_env_config
 
 # Power-tracking / derate-only helpers (see module docstring).
 from functools import partial
-from helpers.derating_turbine import make_derating_dtu10mw
+from helpers.derating_turbine import make_derating_turbine
 from helpers.power_ref import stepwise_power_ref, measure_greedy, DEFAULT_SCHEDULE, BOOST_SCHEDULE
 
 # Receptivity profile computation
@@ -244,11 +245,13 @@ def main():
     from WindGym.wrappers import RecordEpisodeVals, PerTurbineObservationWrapper
     from helpers.multi_layout_env import MultiLayoutEnv, LayoutConfig
     
-    # Wind turbine -- derate-capable DTU10MW surrogate. Derating requires a
-    # turbine whose powerCtFunction accepts a `derate` input; plain DTU10MW()
-    # fails WindFarmEnv's check_turbine_supports_derating. --turbtype is kept
-    # for run-naming only (this trainer always uses the surrogate).
-    wind_turbine = make_derating_dtu10mw()
+    # Wind turbine -- derate-capable surrogate dispatched on --turbtype
+    # (IEA34 default, DTU10MW for old-checkpoint reproduction). Derating
+    # requires a turbine whose powerCtFunction accepts a `derate` input;
+    # plain turbine classes fail WindFarmEnv's check_turbine_supports_derating.
+    wind_turbine = make_derating_turbine(
+        args.turbtype, iea34_variant=args.iea34_variant
+    )
     
     # Create layout configurations
     print("Setting up layouts...")
@@ -473,8 +476,22 @@ def main():
                 sys.path.insert(0, _REPO_ROOT)
             from del_surrogate import DELRewardWrapper
 
+            del_turbine = args.del_artifact_set or {
+                "IEA34": "iea34", "DTU10MW": "dtu10mw",
+            }.get(args.turbtype)
+            if del_turbine is None:
+                raise ValueError(
+                    f"No DEL surrogate set for turbtype {args.turbtype!r}; "
+                    "pass --del_artifact_set explicitly."
+                )
+            del_channels = [
+                c.strip() for c in args.del_channels.split(",") if c.strip()
+            ]
             env = DELRewardWrapper(
                 env,
+                turbine=del_turbine,
+                channels=del_channels,
+                reward_channels=del_channels,
                 penalty_scale=args.del_penalty_scale,
                 allowed_increase=args.del_allowed_increase,
                 ti_window=args.del_ti_window,

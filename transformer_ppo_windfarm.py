@@ -305,12 +305,15 @@ def main():
     from helpers.multi_layout_env import MultiLayoutEnv, LayoutConfig
 
     # Wind turbine. Derate-enabled configs (e.g. power_max_derate) need a
-    # turbine whose powerCtFunction accepts a `derate` input; plain DTU10MW()
-    # fails WindFarmEnv's check_turbine_supports_derating, so use the
-    # derate-capable DTU10MW surrogate instead.
+    # turbine whose powerCtFunction accepts a `derate` input; plain turbine
+    # classes fail WindFarmEnv's check_turbine_supports_derating, so dispatch
+    # on --turbtype to the derate-capable surrogate turbines (IEA34 default;
+    # DTU10MW for reproducing old checkpoints).
     if make_env_config(args.config).get("derate_action", False):
-        from helpers.derating_turbine import make_derating_dtu10mw
-        wind_turbine = make_derating_dtu10mw()
+        from helpers.derating_turbine import make_derating_turbine
+        wind_turbine = make_derating_turbine(
+            args.turbtype, iea34_variant=args.iea34_variant
+        )
     else:
         if args.turbtype == "DTU10MW":
             from py_wake.examples.data.dtu10mw import DTU10MW as WT
@@ -470,8 +473,23 @@ def main():
                 sys.path.insert(0, _REPO_ROOT)
             from del_surrogate import DELRewardWrapper
 
+            # DEL surrogate set follows the turbine unless overridden.
+            del_turbine = args.del_artifact_set or {
+                "IEA34": "iea34", "DTU10MW": "dtu10mw",
+            }.get(args.turbtype)
+            if del_turbine is None:
+                raise ValueError(
+                    f"No DEL surrogate set for turbtype {args.turbtype!r}; "
+                    "pass --del_artifact_set explicitly."
+                )
+            del_channels = [
+                c.strip() for c in args.del_channels.split(",") if c.strip()
+            ]
             env = DELRewardWrapper(
                 env,
+                turbine=del_turbine,
+                channels=del_channels,
+                reward_channels=del_channels,
                 penalty_scale=args.del_penalty_scale,
                 allowed_increase=args.del_allowed_increase,
                 limit_range=(
@@ -818,6 +836,25 @@ def main():
     del_ood_window = deque(maxlen=1000)
     del_limit_window = deque(maxlen=1000)
     del_margin_window = deque(maxlen=1000)
+    # Multi-channel penalty: which reward channel realized the binding (max)
+    # ratio each step -> charts/del_binding_frac/<channel>. Only logged when
+    # more than one channel is configured (single-channel: trivially 1.0).
+    # Canonicalized ("wtow_H0FAMnt" -> "H0FAMnt") to match the names the
+    # wrapper reports in info["del_binding_channel"].
+    del_binding_window = deque(maxlen=1000)
+    _del_reward_channels = [
+        c.strip() for c in args.del_channels.split(",") if c.strip()
+    ]
+    if _del_active:
+        if _REPO_ROOT not in sys.path:
+            sys.path.insert(0, _REPO_ROOT)
+        from del_surrogate import get_set as _del_get_set
+        _del_tset = _del_get_set(args.del_artifact_set or {
+            "IEA34": "iea34", "DTU10MW": "dtu10mw",
+        }[args.turbtype])
+        _del_reward_channels = [
+            _del_tset.canonical_channel(c) for c in _del_reward_channels
+        ]
 
     # One-time sanity check: on the very first minibatch (before any gradient
     # step) the recomputed log-prob must equal the rollout one, i.e. ratio ≈ 1.
@@ -927,6 +964,12 @@ def main():
                             float(np.mean(np.asarray(o, dtype=float))) for o in _ood)
                 except (TypeError, ValueError):
                     pass
+                if len(_del_reward_channels) > 1 and "del_binding_channel" in infos:
+                    del_binding_window.extend(
+                        ch for ch in np.asarray(
+                            infos["del_binding_channel"], dtype=object
+                        ).flatten() if ch is not None
+                    )
 
             # Log episode stats
             if "final_info" in infos:
@@ -969,6 +1012,12 @@ def main():
                     if len(del_margin_window) > 0:
                         writer.add_scalar("charts/del_margin",
                                           float(np.mean(del_margin_window)), global_step)
+                    if len(del_binding_window) > 0:
+                        _bind = list(del_binding_window)
+                        for _ch in _del_reward_channels:
+                            writer.add_scalar(
+                                f"charts/del_binding_frac/{_ch}",
+                                _bind.count(_ch) / len(_bind), global_step)
 
             obs = next_obs
 

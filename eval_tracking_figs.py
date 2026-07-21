@@ -51,7 +51,10 @@ from networks import TransformerActor, create_profile_encoding
 from helpers.agent import WindFarmAgent
 from helpers.env_configs import make_env_config
 from helpers.helper_funcs import EnhancedPerTurbineWrapper
-from helpers.derating_turbine import make_derating_dtu10mw, make_operating_point_lookup
+from helpers.derating_turbine import (
+    make_derating_turbine,
+    make_operating_point_lookup_for,
+)
 from helpers.power_ref import (
     stepwise_power_ref,
     measure_greedy,
@@ -87,6 +90,12 @@ def load_checkpoint(checkpoint_path: str, device: torch.device):
     if missing:
         print(f"[Eval] Back-filled {len(missing)} missing args from defaults: "
               f"{sorted(missing)}")
+    # Backfill guard: config.Args now defaults turbtype to "IEA34", but every
+    # checkpoint written before the switch trained on the DTU10MW surrogate —
+    # a checkpoint whose args LACK turbtype must rebuild DTU.
+    if "turbtype" in missing:
+        args["turbtype"] = "DTU10MW"
+        print('[Eval] Checkpoint predates turbtype arg — pinned to "DTU10MW"')
     return checkpoint, args
 
 
@@ -142,11 +151,15 @@ def build_track3_env(args: dict, turbbox_path: str, obs_width: int | None = None
     derate=0), which DELRewardWrapper needs to compare DELs against. The greedy
     probe stays single-farm. Default False keeps existing callers unchanged.
     """
-    wt = make_derating_dtu10mw()
+    wt = make_derating_turbine(
+        args["turbtype"], iea34_variant=args["iea34_variant"]
+    )
     D = wt.diameter()
-    # Steady-state pitch/RPM table (same HAWCStab2 source as the power
+    # Steady-state pitch/RPM table (same table source as the power
     # surrogate) -> eval figures grow blade-pitch and rotor-RPM panels.
-    op_lookup = make_operating_point_lookup(rotor_diameter=D)
+    op_lookup = make_operating_point_lookup_for(
+        args["turbtype"], iea34_variant=args["iea34_variant"], rotor_diameter=D
+    )
 
     # Env config + action method from the SAVED args (mirrors the trainer).
     # load_checkpoint back-fills defaults, but every track3 checkpoint saved an
@@ -533,6 +546,13 @@ def main():
     parser.add_argument("--frame-stride", type=int, default=1,
                         help="Keep every Nth PNG frame in the GIF (all PNGs are "
                              "still written; this only decimates the GIF).")
+    parser.add_argument("--turbtype", default=None,
+                        choices=["IEA34", "DTU10MW"],
+                        help="Override the checkpoint's turbine (default: the "
+                             "checkpoint's saved turbtype).")
+    parser.add_argument("--iea34-variant", default=None,
+                        choices=["annrpm", "minct"],
+                        help="Override the checkpoint's IEA34 table variant.")
     cli = parser.parse_args()
 
     sys.stdout.reconfigure(line_buffering=True)
@@ -556,6 +576,12 @@ def main():
 
     # ---- Load checkpoint, build env + agent ----
     checkpoint, args = load_checkpoint(ckpt_path, device)
+    # CLI turbine override (default: the checkpoint's saved args).
+    if cli.turbtype is not None:
+        print(f"[Eval] turbtype override: {args['turbtype']} -> {cli.turbtype}")
+        args["turbtype"] = cli.turbtype
+    if cli.iea34_variant is not None:
+        args["iea34_variant"] = cli.iea34_variant
     # The actor's first-layer in_features pins the per-turbine sensor
     # generation the checkpoint was trained on (see _MES_GENERATIONS).
     ckpt_obs_width = checkpoint["actor_state_dict"]["obs_encoder.0.weight"].shape[1]

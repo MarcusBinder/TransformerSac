@@ -5,7 +5,7 @@ The env build mirrors transformer_sac_windfarm.py's ENV SETUP block for the
 DEL-active path (the same stack every delmax/randlim checkpoint trained on):
 
     WindFarmEnv(Baseline_comp=True, BaseController="Global",
-                turbine=make_derating_dtu10mw())
+                turbine=make_derating_turbine(<checkpoint turbtype>))
       -> PerTurbineObservationWrapper [-> EnhancedPerTurbineWrapper]
       -> DELRewardWrapper(...)            # limit seams live here
       -> MultiLayoutEnv(shuffle=False)    # stable turbine order for interp
@@ -39,7 +39,7 @@ from networks import TransformerActor, create_profile_encoding
 from helpers.env_configs import make_env_config
 from helpers.layouts import get_layout_positions
 from helpers.multi_layout_env import MultiLayoutEnv, LayoutConfig
-from helpers.derating_turbine import make_derating_dtu10mw
+from helpers.derating_turbine import make_derating_turbine
 from helpers.helper_funcs import EnhancedPerTurbineWrapper
 from WindGym import WindFarmEnv
 from WindGym.wrappers import PerTurbineObservationWrapper
@@ -71,6 +71,13 @@ def load_checkpoint(checkpoint_path: str, device: torch.device):
     if missing:
         print(f"[interp] Back-filled {len(missing)} missing args from defaults: "
               f"{sorted(missing)}")
+    # Backfill guard: config.Args now defaults turbtype to "IEA34", but every
+    # checkpoint written before the switch trained on the DTU10MW surrogate.
+    # A checkpoint whose args LACK turbtype must rebuild DTU, not the new
+    # default. (Checkpoints that saved turbtype keep their saved value.)
+    if "turbtype" in missing:
+        args["turbtype"] = "DTU10MW"
+        print('[interp] Checkpoint predates turbtype arg — pinned to "DTU10MW"')
     return checkpoint, args
 
 
@@ -131,7 +138,9 @@ def build_delmax_env(
     if limit_mode == "fixed" and fixed_limit is None:
         raise ValueError("limit_mode='fixed' requires fixed_limit")
 
-    wt = make_derating_dtu10mw()
+    wt = make_derating_turbine(
+        args["turbtype"], iea34_variant=args["iea34_variant"]
+    )
 
     config = make_env_config(args["config"])
     config["ActionMethod"] = args["action_type"]
@@ -188,7 +197,18 @@ def build_delmax_env(
         env = PerTurbineObservationWrapper(env)
         if args["use_wd_deviation"]:
             env = EnhancedPerTurbineWrapper(env, wd_scale_range=args["wd_scale_range"])
+        # DEL surrogate set follows the checkpoint's turbine (same derivation
+        # as the trainers); del_channels drives multi-channel penalties.
+        del_turbine = args.get("del_artifact_set") or {
+            "IEA34": "iea34", "DTU10MW": "dtu10mw",
+        }[args["turbtype"]]
+        del_channels = [
+            ch.strip() for ch in str(args["del_channels"]).split(",") if ch.strip()
+        ]
         del_kwargs = dict(
+            turbine=del_turbine,
+            channels=del_channels,
+            reward_channels=del_channels,
             penalty_scale=args["del_penalty_scale"],
             allowed_increase=args["del_allowed_increase"],
             ti_window=args["del_ti_window"],

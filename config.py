@@ -57,7 +57,15 @@ class Args:
 
     # === Environment Settings ===
     backend: str = "dynamiks"  # Flow solver backend: "dynamiks" (default) or "pywake" (steady-state)
-    turbtype: str = "DTU10MW"  # Wind turbine type
+    # Wind turbine type. Default IEA34 (the paper turbine as of 2026-07); old
+    # checkpoints saved turbtype="DTU10MW" in their args, so checkpoint-driven
+    # env rebuilds stay DTU automatically.
+    turbtype: str = "IEA34"
+    # IEA34 derating-table variant (helpers.derating_turbine): "annrpm"
+    # (constant-Omega derating, rotor speed from the DLC12 RotSpd ANN — ct
+    # consistent with the HF controller the load surrogates saw) or "minct"
+    # (pure min-Ct, rotor speed free). Ignored for other turbtypes.
+    iea34_variant: str = "annrpm"
     TI_type: str = "Random"   # Turbulence intensity sampling
     dt_sim: int = 5           # Simulation timestep (seconds)
     dt_env: int = 10          # Environment timestep (seconds)
@@ -186,6 +194,18 @@ class Args:
     del_penalty_scale: float = 0.0     # lambda, in pre-reward_scale units
     del_allowed_increase: float = 0.10  # allowed fractional DEL increase over greedy baseline
     del_ti_window: float = 60.0        # trailing window (s) for sector statistics
+    # DEL channel(s) the hinge penalty is computed on (CSV). One channel keeps
+    # today's behavior; several make the penalty bind on the WORST channel:
+    # ratio_c = farm-max agent / farm-max baseline per channel, penalty =
+    # hinge(max_c ratio_c) with the shared episode limit. Channel names must
+    # exist in the active turbine set (del_surrogate.SETS; e.g. wtow_H0FAMnt
+    # is spelled H0FAMnt).
+    del_channels: str = "Bl1Rad0FlpMnt"
+    # Which del_surrogate artifact set to load. None (default) derives it from
+    # turbtype (IEA34 -> "iea34", DTU10MW -> "dtu10mw"); set explicitly only
+    # to cross-evaluate (e.g. DTU loads on an IEA34 farm — not meaningful for
+    # training).
+    del_artifact_set: Optional[str] = None
     # Attach the DEL wrapper even when del_penalty_scale == 0 (info-only:
     # penalty is exactly 0, reward untouched) so case-A runs log the same
     # charts/del_* metrics as penalized runs. Free with Power_reward="Baseline"
