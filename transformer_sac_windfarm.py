@@ -21,6 +21,7 @@ Positional encoding options (--pos_encoding_type):
 Author: Marcus Binder Nilsen (DTU Wind Energy)
 """
 
+import inspect
 import os
 import random
 import time
@@ -395,6 +396,23 @@ def main():
     # the shipped configs). Persisted via the checkpoint's saved args.
     config["act_pen"]["action_penalty"] = args.action_penalty
     print(f"action_penalty set to: {config['act_pen']['action_penalty']} (type: {config['act_pen']['action_penalty_type']})")
+
+    # Wind veer range + rotor tilt from args (defaults 0 = off). An outdated
+    # WindGym would silently ignore these config keys, so fail loudly instead.
+    config["wind"]["veer_min"] = args.veer_min
+    config["wind"]["veer_max"] = args.veer_max
+    config["farm"]["tilt"] = args.tilt
+    if args.veer_min != 0 or args.veer_max != 0 or args.tilt != 0:
+        if "tilt" not in inspect.signature(WindFarmEnv.__init__).parameters:
+            raise RuntimeError(
+                "veer/tilt requested but this WindGym predates veer+tilt "
+                "support (needs windgym commit 9b746f8 or later); the config "
+                "keys would be silently ignored."
+            )
+        print(
+            f"veer range set to: [{args.veer_min}, {args.veer_max}] deg/100m, "
+            f"tilt set to: {args.tilt} deg"
+        )
     
     mes_prefixes = {
         "ws_mes": "ws",

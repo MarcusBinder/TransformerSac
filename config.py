@@ -62,6 +62,16 @@ class Args:
     max_eps: int = 20         # Number of flow passthroughs per episode
     num_envs: int = 1         # Number of parallel environments
 
+    # Wind veer, sampled U[veer_min, veer_max] per episode (deg per 100 m,
+    # pinned to 0 at hub height, positive = wd increases with height).
+    # Overrides the env config's wind veer keys. Needs windgym >= 9b746f8;
+    # veer only produces a yaw-sign asymmetry when tilt != 0.
+    veer_min: float = 0.0
+    veer_max: float = 0.0
+    # Fixed rotor tilt for all turbines (deg; positive deflects the wake
+    # upward in DWM). Overrides the env config's farm tilt.
+    tilt: float = 0.0
+
     # === Evaluation Settings ===
     eval_interval: int = 50000        # How often to evaluate (in env steps)
     eval_initial: bool = False        # Run evaluation before training starts
