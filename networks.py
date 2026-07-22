@@ -1066,7 +1066,7 @@ class TransformerCritic(nn.Module):
         q_head_layers.append(nn.Linear(embed_dim, 1))
         self.q_head = nn.Sequential(*q_head_layers)
 
-    def forward(
+    def forward_trunk(
         self,
         obs: torch.Tensor,
         action: torch.Tensor,
@@ -1076,18 +1076,9 @@ class TransformerCritic(nn.Module):
         influence_profile: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Compute Q-value for observation-action pair.
-
-        Args:
-            obs: (batch, n_turbines, obs_dim)
-            action: (batch, n_turbines, action_dim)
-            positions: (batch, n_turbines, 2) wind-relative normalized positions
-            key_padding_mask: (batch, n_turbines) where True = padding
-            recep_profile: (batch, n_turbines, n_directions) receptivity profiles (optional)
-            influence_profile: (batch, n_turbines, n_directions) influence profiles (optional)
-
-        Returns:
-            q_value: (batch, 1) Q-value for the entire farm
+        Everything up to (and including) the transformer: encode obs+action,
+        positional/profile encoding, transformer. Returns per-turbine embeddings
+        h of shape (batch, n_turbines, embed_dim) — no aggregation, no q_head.
         """
         batch_size = obs.shape[0]
 
@@ -1148,6 +1139,33 @@ class TransformerCritic(nn.Module):
         h, _ = self.transformer(h, key_padding_mask, attn_bias,
                                 local_allow=local_allow, need_weights=False)
 
+        return h
+
+    def forward(
+        self,
+        obs: torch.Tensor,
+        action: torch.Tensor,
+        positions: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        recep_profile: Optional[torch.Tensor] = None,
+        influence_profile: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute Q-value for observation-action pair.
+
+        Args:
+            obs: (batch, n_turbines, obs_dim)
+            action: (batch, n_turbines, action_dim)
+            positions: (batch, n_turbines, 2) wind-relative normalized positions
+            key_padding_mask: (batch, n_turbines) where True = padding
+            recep_profile: (batch, n_turbines, n_directions) receptivity profiles (optional)
+            influence_profile: (batch, n_turbines, n_directions) influence profiles (optional)
+
+        Returns:
+            q_value: (batch, 1) Q-value for the entire farm
+        """
+        h = self.forward_trunk(obs, action, positions, key_padding_mask,
+                               recep_profile, influence_profile)
 
         if self.critic_agg == "vdn":
             # v9 value decomposition: per-turbine Q-head, then masked-SUM over turbines.
@@ -1178,6 +1196,27 @@ class TransformerCritic(nn.Module):
 # TQC CRITIC (Truncated Quantile Critics)
 # =============================================================================
 
+def _make_tqc_head(
+    embed_dim: int,
+    n_quantiles: int,
+    droq_dropout: float = 0.0,
+    droq_layer_norm: bool = False,
+) -> nn.Sequential:
+    """Quantile head MLP: Linear -> [LayerNorm] -> ReLU -> [Dropout] -> Linear.
+
+    Same layer order as TransformerCritic's q_head so RNG consumption (and thus
+    seeded init) is unchanged for the independent TQC critic.
+    """
+    layers: list[nn.Module] = [nn.Linear(embed_dim, embed_dim)]
+    if droq_layer_norm:
+        layers.append(nn.LayerNorm(embed_dim))
+    layers.append(nn.ReLU())
+    if droq_dropout > 0.0:
+        layers.append(nn.Dropout(droq_dropout))
+    layers.append(nn.Linear(embed_dim, n_quantiles))
+    return nn.Sequential(*layers)
+
+
 class TransformerTQCCritic(nn.Module):
     """
     TQC critic: N independent TransformerCritic networks, each outputting
@@ -1199,15 +1238,8 @@ class TransformerTQCCritic(nn.Module):
         droq_layer_norm = critic_kwargs.get("droq_layer_norm", False)
 
         for critic in self.critics:
-            embed_dim = critic.embed_dim
-            q_head_layers: list[nn.Module] = [nn.Linear(embed_dim, embed_dim)]
-            if droq_layer_norm:
-                q_head_layers.append(nn.LayerNorm(embed_dim))
-            q_head_layers.append(nn.ReLU())
-            if droq_dropout > 0.0:
-                q_head_layers.append(nn.Dropout(droq_dropout))
-            q_head_layers.append(nn.Linear(embed_dim, n_quantiles))
-            critic.q_head = nn.Sequential(*q_head_layers)
+            critic.q_head = _make_tqc_head(
+                critic.embed_dim, n_quantiles, droq_dropout, droq_layer_norm)
 
     def forward(
         self,
@@ -1224,6 +1256,74 @@ class TransformerTQCCritic(nn.Module):
               recep_profile, influence_profile)
             for c in self.critics
         ], dim=0)
+
+
+class TransformerTQCSharedCritic(nn.Module):
+    """
+    Shared-trunk TQC critic: ONE TransformerCritic trunk feeding n_critics small
+    quantile heads. TQC's quantile truncation handles overestimation without
+    independent ensembles, so the heads may be correlated — the payoff is ~1/N
+    the trunk compute and params vs TransformerTQCCritic.
+
+    Same output contract as TransformerTQCCritic: (n_critics, batch, n_quantiles).
+    Checkpoints are NOT interchangeable with the independent TQC critic.
+    """
+
+    def __init__(self, n_critics: int, n_quantiles: int, **critic_kwargs):
+        super().__init__()
+        self.n_critics = n_critics
+        self.n_quantiles = n_quantiles
+        self.trunk = TransformerCritic(**critic_kwargs)
+        self.critic_agg = self.trunk.critic_agg
+        # Drop the trunk's unused scalar q_head so it never shows up in
+        # state_dict/parameters (only the agg branch reads it, which we bypass).
+        self.trunk.q_head = nn.Identity()
+        droq_dropout = critic_kwargs.get("droq_dropout", 0.0)
+        droq_layer_norm = critic_kwargs.get("droq_layer_norm", False)
+        self.heads = nn.ModuleList([
+            _make_tqc_head(self.trunk.embed_dim, n_quantiles,
+                           droq_dropout, droq_layer_norm)
+            for _ in range(n_critics)
+        ])
+
+    def forward(
+        self,
+        obs: torch.Tensor,
+        action: torch.Tensor,
+        positions: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        recep_profile: Optional[torch.Tensor] = None,
+        influence_profile: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Returns (n_critics, batch, n_quantiles)."""
+        h = self.trunk.forward_trunk(obs, action, positions, key_padding_mask,
+                                     recep_profile, influence_profile)
+        # Python loop over heads (N tiny MLPs): measured faster than a vmap
+        # ensemble under reduce-overhead cudagraphs (see trainer compile block).
+        if self.critic_agg == "vdn":
+            # Per-turbine quantiles -> zero padded turbines -> masked-SUM.
+            valid = None
+            if key_padding_mask is not None:
+                valid = (~key_padding_mask).unsqueeze(-1).float()  # (batch, n_turb, 1)
+            outs = []
+            for head in self.heads:
+                q_per = head(h)  # (batch, n_turb, n_quantiles)
+                if valid is not None:
+                    q_per = q_per * valid
+                outs.append(q_per.sum(dim=1))  # (batch, n_quantiles)
+            return torch.stack(outs, dim=0)
+        else:
+            # "pool": masked-mean pool ONCE, then all heads on the pooled embedding.
+            if key_padding_mask is not None:
+                mask = ~key_padding_mask.unsqueeze(-1)  # (batch, n_turb, 1), True = real
+                mask_f = mask.float()
+                h = h * mask_f
+                h_sum = h.sum(dim=1)  # (batch, embed_dim)
+                n_real = mask_f.sum(dim=1).clamp(min=1)  # (batch, 1)
+                h_pooled = h_sum / n_real
+            else:
+                h_pooled = h.mean(dim=1)  # (batch, embed_dim)
+            return torch.stack([head(h_pooled) for head in self.heads], dim=0)
 
 
 def quantile_huber_loss(

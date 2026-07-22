@@ -153,6 +153,11 @@ class Args:
     tqc_n_critics: int = 5               # Number of critic networks
     tqc_n_quantiles: int = 25            # Quantiles per critic
     tqc_top_quantiles_to_drop: int = 2   # Truncation: drop top-d per-sample quantiles
+    tqc_share_trunk: bool = False        # ONE TransformerCritic trunk + tqc_n_critics small
+    # quantile heads (TransformerTQCSharedCritic) instead of n_critics independent trunks.
+    # ~4x fewer critic params / 2 trunk passes per grad-step instead of 2*n_critics; relies
+    # on TQC's quantile truncation (not ensemble independence) to control overestimation.
+    # Checkpoints are NOT interchangeable with the independent TQC critic.
 
     # === DroQ Hyperparameters (only used when use_droq=True) ===
     droq_dropout: float = 0.01           # Dropout rate for DroQ critic MLPs

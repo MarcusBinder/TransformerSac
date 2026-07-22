@@ -840,6 +840,11 @@ def main():
     taus = None
 
     if args.algorithm == "tqc":
+        assert not getattr(args, "tqc_share_trunk", False), (
+            "--tqc_share_trunk is not wired into the tracking trainer "
+            "(transformer_sac_windfarm_tracking.py builds independent TQC critics "
+            "and iterates .critics). Use transformer_sac_windfarm.py or drop the flag."
+        )
         tqc_critic = TransformerTQCCritic(
             n_critics=args.tqc_n_critics,
             n_quantiles=args.tqc_n_quantiles,

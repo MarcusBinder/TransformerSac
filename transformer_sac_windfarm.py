@@ -95,6 +95,7 @@ from networks import (
     TransformerActor,
     TransformerCritic,
     TransformerTQCCritic,
+    TransformerTQCSharedCritic,
     create_profile_encoding,
     quantile_huber_loss,
 )
@@ -826,12 +827,16 @@ def main():
     taus = None
 
     if args.algorithm == "tqc":
-        tqc_critic = TransformerTQCCritic(
+        # NOTE (pre-existing, both TQC variants + SAC): with --share_profile_encoder,
+        # critic_kwargs holds the LIVE encoder modules, so the target's profile
+        # encoders alias the live ones and soft_update lerps them with themselves.
+        tqc_cls = TransformerTQCSharedCritic if args.tqc_share_trunk else TransformerTQCCritic
+        tqc_critic = tqc_cls(
             n_critics=args.tqc_n_critics,
             n_quantiles=args.tqc_n_quantiles,
             **critic_kwargs,
         ).to(device)
-        tqc_critic_target = TransformerTQCCritic(
+        tqc_critic_target = tqc_cls(
             n_critics=args.tqc_n_critics,
             n_quantiles=args.tqc_n_quantiles,
             **critic_kwargs,
@@ -847,7 +852,9 @@ def main():
         actor_params = sum(p.numel() for p in actor.parameters())
         critic_params = sum(p.numel() for p in tqc_critic.parameters())
         print(f"Actor parameters: {actor_params:,}")
-        print(f"TQC Critic parameters: {critic_params:,} ({args.tqc_n_critics} critics x {args.tqc_n_quantiles} quantiles)")
+        shared_note = (f" [shared trunk: 1 trunk x {args.tqc_n_critics} heads]"
+                       if args.tqc_share_trunk else "")
+        print(f"TQC Critic parameters: {critic_params:,} ({args.tqc_n_critics} critics x {args.tqc_n_quantiles} quantiles){shared_note}")
     else:
         # SAC: standard dual-critic setup (DroQ regularization applied via critic_kwargs if enabled)
         qf1 = TransformerCritic(**critic_kwargs).to(device)
@@ -936,6 +943,18 @@ def main():
                 f"--algorithm={args.algorithm} but checkpoint contains TQC critic weights. "
                 f"Use --algorithm=tqc to resume this checkpoint."
             )
+        if ckpt_is_tqc:
+            # Key probe (not saved args) so pre-tqc_share_trunk checkpoints validate:
+            # shared-trunk critics have "trunk.*" keys, independent ones "critics.*".
+            ckpt_shared = any(k.startswith("trunk.")
+                              for k in checkpoint["tqc_critic_state_dict"])
+            if ckpt_shared != args.tqc_share_trunk:
+                raise ValueError(
+                    f"TQC critic layout mismatch: checkpoint was saved with "
+                    f"tqc_share_trunk={ckpt_shared} but current run has "
+                    f"tqc_share_trunk={args.tqc_share_trunk}. Shared-trunk and "
+                    f"independent TQC checkpoints are not interchangeable."
+                )
 
         # Load network weights
         actor.load_state_dict(checkpoint["actor_state_dict"])
@@ -1087,8 +1106,11 @@ def main():
 
         # Critics always get encoder-only loading (obs_action_encoder input dim differs)
         if args.algorithm == "tqc":
-            for i, critic in enumerate(tqc_critic.critics):
-                load_pretrained_into(critic, f"TQC Critic {i}", _pretrain_encoder_sd)
+            if args.tqc_share_trunk:
+                load_pretrained_into(tqc_critic.trunk, "TQC shared trunk", _pretrain_encoder_sd)
+            else:
+                for i, critic in enumerate(tqc_critic.critics):
+                    load_pretrained_into(critic, f"TQC Critic {i}", _pretrain_encoder_sd)
             tqc_critic_target.load_state_dict(tqc_critic.state_dict())
         else:
             n_qf1 = load_pretrained_into(qf1, "Critic qf1", _pretrain_encoder_sd)
@@ -1515,12 +1537,25 @@ def main():
                     q_optimizer.step()
 
                     if debug_logger.should_log_gradients(total_gradient_steps):
-                        for i, critic in enumerate(tqc_critic.critics):
+                        if args.tqc_share_trunk:
                             grad_norm = sum(
                                 p.grad.norm().item() ** 2
-                                for p in critic.parameters() if p.grad is not None
+                                for p in tqc_critic.trunk.parameters() if p.grad is not None
                             ) ** 0.5
-                            writer.add_scalar(f"debug/grad_norm/tqc_critic_{i}", grad_norm, global_step)
+                            writer.add_scalar("debug/grad_norm/tqc_trunk", grad_norm, global_step)
+                            for i, head in enumerate(tqc_critic.heads):
+                                grad_norm = sum(
+                                    p.grad.norm().item() ** 2
+                                    for p in head.parameters() if p.grad is not None
+                                ) ** 0.5
+                                writer.add_scalar(f"debug/grad_norm/tqc_head_{i}", grad_norm, global_step)
+                        else:
+                            for i, critic in enumerate(tqc_critic.critics):
+                                grad_norm = sum(
+                                    p.grad.norm().item() ** 2
+                                    for p in critic.parameters() if p.grad is not None
+                                ) ** 0.5
+                                writer.add_scalar(f"debug/grad_norm/tqc_critic_{i}", grad_norm, global_step)
 
                     loss_accumulator['qf_loss'] += qf_loss.detach()
                     n_critic_updates += 1
