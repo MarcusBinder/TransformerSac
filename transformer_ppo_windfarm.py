@@ -109,6 +109,101 @@ class TransformerValue(TransformerCritic):
                                recep_profile, influence_profile)  # (batch, 1)
 
 
+class ValueHead(nn.Module):
+    """V(s) head over the actor's trunk embeddings (--ppo_share_trunk).
+
+    Same MLP as TransformerCritic's q_head with DroQ off (Linear-ReLU-Linear),
+    and the same two aggregations as --critic_agg: "pool" = masked-mean of
+    turbine embeddings -> one farm value; "vdn" = per-turbine value -> masked
+    sum.
+    """
+
+    def __init__(self, embed_dim: int, agg: str = "pool", detach_trunk: bool = False):
+        super().__init__()
+        assert agg in ("pool", "vdn"), f"Unknown value aggregation: {agg!r}"
+        self.agg = agg
+        self.detach_trunk = detach_trunk
+        self.v_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, 1),
+        )
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """h: (batch, n_turb, embed_dim) trunk output. Returns (batch, 1)."""
+        if self.detach_trunk:
+            h = h.detach()
+
+        if self.agg == "vdn":
+            # Per-turbine value head, then masked-SUM over turbines. Padded
+            # turbines' embeddings are non-zero, so zero their value first.
+            v_per = self.v_head(h)  # (batch, n_turb, 1)
+            if key_padding_mask is not None:
+                valid = (~key_padding_mask).unsqueeze(-1).float()  # (batch, n_turb, 1)
+                v_per = v_per * valid
+            return v_per.sum(dim=1)  # (batch, 1)
+
+        # "pool" (standard): masked-mean of turbine embeddings -> single farm-V.
+        if key_padding_mask is not None:
+            mask = ~key_padding_mask.unsqueeze(-1)  # (batch, n_turb, 1), True = real
+            mask_f = mask.float()
+            h = h * mask_f
+            h_sum = h.sum(dim=1)  # (batch, embed_dim)
+            n_real = mask_f.sum(dim=1).clamp(min=1)  # (batch, 1)
+            h_pooled = h_sum / n_real
+        else:
+            h_pooled = h.mean(dim=1)  # (batch, embed_dim)
+        return self.v_head(h_pooled)  # (batch, 1)
+
+
+class SharedTrunkValue(nn.Module):
+    """V(s) = ValueHead(actor.forward_trunk(...)) — the --ppo_share_trunk path.
+
+    Drop-in for TransformerValue: same forward(obs, positions, mask, recep,
+    infl) signature, so no vf() call site changes. The actor is held in a
+    plain list, NOT registered as a submodule: state_dict()/parameters()
+    contain ONLY the head (the trainer owns/checkpoints the actor itself),
+    and .to()/.train() don't touch the actor — the trainer moves the actor
+    first and never toggles train/eval modes.
+
+    In the update loop the trunk runs twice per minibatch (once inside
+    evaluate_actions, once here). With dropout == 0 (the RL default; dropout
+    > 0 already trips the first-minibatch ratio assert) both forwards are
+    identical, so the summed gradients equal a fused forward's.
+    """
+
+    def __init__(self, actor: TransformerActor, agg: str = "pool",
+                 detach_trunk: bool = False):
+        super().__init__()
+        self._actor = [actor]  # list => NOT a registered submodule
+        self.head = ValueHead(actor.fc_mean.in_features, agg=agg,
+                              detach_trunk=detach_trunk)
+
+    @property
+    def actor(self) -> TransformerActor:
+        return self._actor[0]
+
+    def forward(
+        self,
+        obs: torch.Tensor,
+        positions: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        recep_profile: Optional[torch.Tensor] = None,
+        influence_profile: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        actor = self.actor
+        if not actor.use_influence:  # same guard as get_action/evaluate_actions
+            influence_profile = None
+        h, _ = actor.forward_trunk(obs, positions, key_padding_mask,
+                                   recep_profile, influence_profile,
+                                   need_weights=False)
+        return self.head(h, key_padding_mask)  # (batch, 1)
+
+
 # =============================================================================
 # DISTRIBUTION MATH (mirrors TransformerActor.get_action; networks.py untouched)
 # =============================================================================
@@ -220,13 +315,18 @@ def save_ppo_checkpoint(actor, vf, optimizer, step, run_name, args) -> str:
     checkpoint_dir = f"runs/{run_name}/checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = f"{checkpoint_dir}/step_{step}.pt"
-    torch.save({
+    ckpt = {
         "step": step,
         "actor_state_dict": actor.state_dict(),
-        "vf_state_dict": vf.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
-        "args": vars(args),
-    }, checkpoint_path)
+        "args": vars(args),  # embeds ppo_share_trunk as the mode marker
+    }
+    if args.ppo_share_trunk:
+        # Head-only (the shared trunk is already in actor_state_dict).
+        ckpt["value_head_state_dict"] = vf.state_dict()
+    else:
+        ckpt["vf_state_dict"] = vf.state_dict()
+    torch.save(ckpt, checkpoint_path)
     print(f"Checkpoint saved to {checkpoint_path}")
     return checkpoint_path
 
@@ -244,6 +344,12 @@ def main():
 
     assert args.pretrain_checkpoint is None, \
         "--pretrain_checkpoint is not supported by the PPO trainer (use --resume_checkpoint to warm-start the actor)"
+
+    if args.ppo_share_trunk and args.dropout > 0:
+        print("WARNING: --ppo_share_trunk with --dropout > 0: train-mode noise "
+              "makes rollout and update log-probs disagree, so the "
+              "first-minibatch ratio assert will trip (same as the separate-net "
+              "path today — dropout is unsupported in this trainer).")
 
     # Derived PPO sizes
     batch_size = args.num_envs * args.num_steps
@@ -703,9 +809,14 @@ def main():
     # Update evaluator with actor reference
     evaluator.agent = agent
 
-    # Value network: critic kwargs identical to SAC's critic_kwargs
-    critic_kwargs = {**common_kwargs}
-    vf = TransformerValue(**critic_kwargs).to(device)
+    # Value network: shared trunk (head over actor.forward_trunk) or the
+    # default separate TransformerValue (critic kwargs identical to SAC's).
+    if args.ppo_share_trunk:
+        vf = SharedTrunkValue(actor, agg=args.critic_agg,
+                              detach_trunk=args.ppo_value_detach_trunk).to(device)
+    else:
+        critic_kwargs = {**common_kwargs}
+        vf = TransformerValue(**critic_kwargs).to(device)
 
     # Single optimizer over actor + value params, deduped by id() — with
     # share_profile_encoder the shared encoders appear in BOTH modules'
@@ -721,8 +832,15 @@ def main():
 
     actor_params = sum(p.numel() for p in actor.parameters())
     vf_params = sum(p.numel() for p in vf.parameters())
-    print(f"Actor parameters: {actor_params:,}")
-    print(f"Value parameters: {vf_params:,}")
+    if args.ppo_share_trunk:
+        print(f"Actor parameters (shared trunk): {actor_params:,}")
+        print(f"Value HEAD parameters (trunk not duplicated): {vf_params:,}")
+        print("Value gradients into shared trunk: "
+              + ("DETACHED (head-only)" if args.ppo_value_detach_trunk
+                 else f"flowing (weighted by vf_coef={args.vf_coef})"))
+    else:
+        print(f"Actor parameters: {actor_params:,}")
+        print(f"Value parameters: {vf_params:,}")
     print(f"Algorithm: PPO")
 
     # =========================================================================
@@ -743,15 +861,35 @@ def main():
         actor.load_state_dict(checkpoint["actor_state_dict"])
         print(f"✓ Loaded actor weights from step {checkpoint['step']}")
 
-        # A SAC checkpoint warm-starts the actor alone (no vf/optimizer keys).
-        if "vf_state_dict" in checkpoint:
-            vf.load_state_dict(checkpoint["vf_state_dict"])
-            print(f"✓ Loaded value network weights")
+        # Value-net resume matrix: the checkpoint's ppo_share_trunk flag (from
+        # its saved args) vs this run's. On mismatch the optimizer param list
+        # doesn't line up with the checkpointed one either, so force it fresh
+        # below (explicit gate — don't rely on load_state_dict raising).
+        ckpt_shared = checkpoint.get("args", {}).get("ppo_share_trunk", False)
+        _mode_mismatch = False
+        if args.ppo_share_trunk:
+            if "value_head_state_dict" in checkpoint:
+                vf.load_state_dict(checkpoint["value_head_state_dict"])
+                print(f"✓ Loaded shared-trunk value head weights")
+            elif "vf_state_dict" in checkpoint:
+                _mode_mismatch = True
+                print(f"  Separate value net in checkpoint — shared value head starts fresh")
+            else:
+                print(f"  No value weights in checkpoint (SAC checkpoint?) — shared value head starts fresh")
         else:
-            print(f"  No vf_state_dict in checkpoint (SAC checkpoint?) — value net starts fresh")
+            if "vf_state_dict" in checkpoint:
+                vf.load_state_dict(checkpoint["vf_state_dict"])
+                print(f"✓ Loaded value network weights")
+            elif ckpt_shared:
+                _mode_mismatch = True
+                print(f"  Shared-trunk checkpoint (head-only value weights) — separate value net starts fresh")
+            else:
+                print(f"  No vf_state_dict in checkpoint (SAC checkpoint?) — value net starts fresh")
 
         _reset_opt = args.finetune_reset_actor_optimizer or args.finetune_reset_critic_optimizer
-        if "optimizer_state_dict" in checkpoint and not _reset_opt:
+        if _mode_mismatch:
+            print(f"✓ Optimizer starts fresh (shared-trunk mode differs from checkpoint)")
+        elif "optimizer_state_dict" in checkpoint and not _reset_opt:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             print(f"✓ Loaded optimizer state")
         else:

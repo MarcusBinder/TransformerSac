@@ -238,6 +238,15 @@ class Args:
     clip_vloss: bool = True       # clipped value loss (CleanRL style)
     target_kl: Optional[float] = None  # early-stop epoch when approx_kl exceeds this
     anneal_lr: bool = True        # linear LR anneal over num_iterations
+    # Shared actor-critic trunk (opt-in A/B vs the default separate value
+    # net): the value head reads the ACTOR's trunk output (forward_trunk)
+    # instead of owning its own transformer. actor_state_dict is unchanged
+    # either way (eval/interp tooling and SAC warm-starts unaffected). With
+    # sharing on, vf_coef * v_loss gradients flow into the policy trunk —
+    # if the policy destabilizes, lower vf_coef or set
+    # ppo_value_detach_trunk so the value loss only trains the head.
+    ppo_share_trunk: bool = False        # value head reads the ACTOR's trunk output
+    ppo_value_detach_trunk: bool = False # stop-grad: value loss doesn't shape trunk
 
     # === Gradient Clipping ===
     grad_clip: bool = True

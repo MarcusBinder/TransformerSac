@@ -719,7 +719,7 @@ class TransformerActor(nn.Module):
         self.register_buffer("action_scale", torch.tensor(action_scale, dtype=torch.float32))
         self.register_buffer("action_bias_val", torch.tensor(action_bias, dtype=torch.float32))
 
-    def forward(
+    def forward_trunk(
         self,
         obs: torch.Tensor,
         positions: torch.Tensor,
@@ -727,9 +727,11 @@ class TransformerActor(nn.Module):
         recep_profile: Optional[torch.Tensor] = None,
         influence_profile: Optional[torch.Tensor] = None,
         need_weights: bool = False,  # Whether to return attention weights for debugging
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
-        Forward pass returning action distribution parameters.
+        Trunk forward: everything up to (and including) the transformer, i.e.
+        forward() minus the action heads. The PPO trainer's shared-trunk value
+        head reads these per-turbine embeddings directly.
 
         Args:
             obs: (batch, n_turbines, obs_dim_per_turbine)
@@ -740,8 +742,7 @@ class TransformerActor(nn.Module):
             need_weights: If True, compute and return attention weights for all layers
 
         Returns:
-            mean: (batch, n_turbines, action_dim) action means
-            log_std: (batch, n_turbines, action_dim) action log stds
+            h: (batch, n_turbines, embed_dim) final-LayerNorm'd token embeddings
             attn_weights: List of attention weights from each layer
         """
         batch_size, n_turbines, _ = obs.shape
@@ -804,6 +805,38 @@ class TransformerActor(nn.Module):
 
         h, attn_weights = self.transformer(h, key_padding_mask, attn_bias,
                                            local_allow=local_allow, need_weights=need_weights)
+
+        return h, attn_weights
+
+    def forward(
+        self,
+        obs: torch.Tensor,
+        positions: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        recep_profile: Optional[torch.Tensor] = None,
+        influence_profile: Optional[torch.Tensor] = None,
+        need_weights: bool = False,  # Whether to return attention weights for debugging
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        """
+        Forward pass returning action distribution parameters.
+
+        Args:
+            obs: (batch, n_turbines, obs_dim_per_turbine)
+            positions: (batch, n_turbines, 2) wind-relative normalized positions
+            key_padding_mask: (batch, n_turbines) where True = padding
+            recep_profile: (batch, n_turbines, n_directions) receptivity profiles (optional)
+            influence_profile: (batch, n_turbines, n_directions) influence profiles (optional)
+            need_weights: If True, compute and return attention weights for all layers
+
+        Returns:
+            mean: (batch, n_turbines, action_dim) action means
+            log_std: (batch, n_turbines, action_dim) action log stds
+            attn_weights: List of attention weights from each layer
+        """
+        h, attn_weights = self.forward_trunk(
+            obs, positions, key_padding_mask,
+            recep_profile, influence_profile, need_weights,
+        )
 
         # Action distribution parameters
         mean = self.fc_mean(h)
