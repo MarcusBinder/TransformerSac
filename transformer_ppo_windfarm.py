@@ -356,9 +356,17 @@ def main():
     assert batch_size % args.num_minibatches == 0, \
         f"batch_size ({batch_size} = num_envs*num_steps) must be divisible by num_minibatches ({args.num_minibatches})"
     minibatch_size = batch_size // args.num_minibatches
-    assert args.total_timesteps % batch_size == 0, \
-        f"total_timesteps ({args.total_timesteps}) must be divisible by batch_size ({batch_size})"
-    num_iterations = args.total_timesteps // batch_size
+    # Treat total_timesteps as a MINIMUM: round the iteration count UP (ceil, not
+    # floor) so we always run at least the requested budget, overshooting by < one
+    # batch. num_iterations drives both the LR anneal and the training loop, so no
+    # other change is needed (effective >= requested, so any `< total_timesteps`
+    # check still holds).
+    num_iterations = -(-args.total_timesteps // batch_size)  # ceil division, no math import
+    effective_timesteps = num_iterations * batch_size
+    if effective_timesteps != args.total_timesteps:
+        print(f"[ppo] total_timesteps {args.total_timesteps} is not a multiple of "
+              f"batch_size {batch_size}; rounding UP to {effective_timesteps} "
+              f"({num_iterations} iterations).")
 
     # Parse layouts
     layout_names = [l.strip() for l in args.layouts.split(",")]
@@ -842,6 +850,28 @@ def main():
         print(f"Actor parameters: {actor_params:,}")
         print(f"Value parameters: {vf_params:,}")
     print(f"Algorithm: PPO")
+
+    # `trainable_params` (above) is already deduped for the optimizer, so this is
+    # the honest count even with --ppo_share_trunk (no double-counted trunk) — the
+    # right x-axis for the model-size scaling curve.
+    total_params = sum(p.numel() for p in trainable_params)
+    # Mirror the counts into TensorBoard at step 0 so the OFFLINE scaling analysis
+    # (scaling_curve.py) can read model/total_params straight from the events.*
+    # files: wandb.run.summary below is NOT synced back into TB by sync_tensorboard.
+    writer.add_scalar("model/actor_params", actor_params, 0)
+    writer.add_scalar("model/vf_params", vf_params, 0)
+    writer.add_scalar("model/total_params", total_params, 0)
+
+    if args.track:
+        import wandb  # already imported + cached in the init block above
+        # Post-hoc summary columns (wandb.init ran before the model was built), so
+        # these are queryable per-run for the scaling x-axis; works offline too.
+        wandb.run.summary["model/actor_params"] = actor_params
+        wandb.run.summary["model/vf_params"] = vf_params
+        wandb.run.summary["model/total_params"] = total_params
+        # The rounded-up honest budget (Deliverable 0); queryable per run because
+        # different batch_size settings round to different totals.
+        wandb.run.summary["ppo/effective_timesteps"] = effective_timesteps
 
     # =========================================================================
     # LOAD CHECKPOINT (for fine-tuning or resuming)
