@@ -257,6 +257,13 @@ class Args:
     compile: bool = False    # torch.compile the network forward passes (static shapes)
     compile_mode: str = "reduce-overhead"  # torch.compile mode; "default" disables cudagraphs (needed for single-rose arms)
     log_timing: bool = False  # Log a wall-clock breakdown (env step / sample / critic / actor) to TensorBoard
+    # Overlap the SAC gradient burst with the (async) env step: step_async ->
+    # gradient updates -> step_wait, so the AsyncVectorEnv workers simulate the
+    # next step while the GPU trains. Iteration time ~ max(env, grad) instead of
+    # the sum. Both modes run the burst on the same (one-iteration-lagged)
+    # buffer contents, so loss traces are comparable; the flag only moves the
+    # blocking point. SAC-only (PPO has its own loop).
+    async_overlap: bool = False
 
     # === Fine-tuning / Resume Settings ===
     resume_checkpoint: Optional[str] = None  # Path to checkpoint .pt file for fine-tuning or resuming

@@ -1261,7 +1261,11 @@ def main():
     # Wall-clock breakdown (only populated when --log_timing). Accumulated over a
     # logging window and reset on each flush. Syncs are gated so they add no
     # overhead when timing is off.
-    timing = {"env": 0.0, "sample": 0.0, "critic": 0.0, "actor": 0.0}
+    # "env" = time BLOCKED in step_wait (name kept for dashboard continuity);
+    # "env_span" = wall-clock from step_async to step_wait return, i.e. the
+    # full env-step duration whether or not it was hidden behind the gradient
+    # burst (--async_overlap). hidden time = env_span - env.
+    timing = {"env": 0.0, "env_span": 0.0, "sample": 0.0, "critic": 0.0, "actor": 0.0}
 
     def _sync_timer():
         """Return perf_counter, syncing CUDA first so GPU work is included."""
@@ -1369,14 +1373,22 @@ def main():
         if args.profile_encoding_type is not None:
             current_layout_indices = get_env_layout_indices(envs)
             current_permutations = get_env_permutations(envs)
+            # Prefetch the profiles too so agent.act does no get_attr of its
+            # own: ALL env IPC must happen before step_async (--async_overlap
+            # forbids IPC while a step is in flight).
+            current_receptivity = get_env_receptivity_profiles(envs)
+            current_influence = get_env_influence_profiles(envs)
         else:
             current_layout_indices = None
             current_permutations = None
+            current_receptivity = None
+            current_influence = None
 
 
         # Select action
         # Reuse the env state already fetched above to avoid duplicate get_attr IPC
-        act_state = dict(wind_dirs=wind_dirs, raw_positions=raw_positions, masks=current_masks)
+        act_state = dict(wind_dirs=wind_dirs, raw_positions=raw_positions, masks=current_masks,
+                        receptivity=current_receptivity, influence=current_influence)
         if global_step < args.learning_starts:
             if args.initial_exploration == "policy":
                 # Use the actor network (useful when resuming from checkpoint)
@@ -1389,173 +1401,35 @@ def main():
             with torch.no_grad():
                 actions = agent.act(envs, obs, **act_state)
         
-        # Step environment
-        _t0 = _sync_timer()
-        next_obs, rewards, terminations, truncations, infos = envs.step(actions)
-        if args.log_timing:
-            timing["env"] += time.perf_counter() - _t0
+        # Step environment. The step is always dispatched async; the flag only
+        # picks the blocking point. --async_overlap collects the result AFTER
+        # the gradient burst (env workers simulate while the GPU trains);
+        # otherwise we block right here, giving the same compute order as the
+        # old blocking envs.step().
+        _t_async = time.perf_counter()
+        envs.step_async(actions)
+        step_result = None
+        if not args.async_overlap:
+            _t0 = _sync_timer()
+            step_result = envs.step_wait()
+            if args.log_timing:
+                _t_now = time.perf_counter()
+                timing["env"] += _t_now - _t0
+                timing["env_span"] += _t_now - _t_async
 
 
-        # Get current layout names for each env. Under domain randomization the pool
-        # is huge, so bucket every training layout under "dr_pool" for debug stats.
-        if dr_enabled:
-            current_layouts = ["dr_pool"] * args.num_envs
-        else:
-            current_layouts = get_env_current_layout(envs)
-
-        # Log per-step data to debug tracker (always - internal deques handle storage)
-        for i in range(args.num_envs):
-            debug_logger.log_layout_step(
-                layout_name=current_layouts[i],
-                reward=float(rewards[i]),
-                power=float(infos.get("Power agent", [0.0] * args.num_envs)[i]) if "Power agent" in infos else None,
-                actions=actions[i] if isinstance(actions, np.ndarray) else np.array(actions[i]),
-            )
-            debug_logger.log_wind_direction(float(wind_dirs[i]))
-
-
-        # Track rewards
-        step_reward_window.extend(np.array(rewards).flatten().tolist())
-
-        # DEL-penalty per-step diagnostics (vector env exposes wrapper info
-        # keys as per-env arrays).
-        if _del_active and "del_penalty" in infos:
-            del_penalty_window.extend(
-                np.asarray(infos["del_penalty"], dtype=float).flatten().tolist())
-            reward_unpen_window.extend(
-                np.asarray(infos["reward_unpenalized"], dtype=float).flatten().tolist())
-            if "del_limit" in infos:
-                del_limit_window.extend(
-                    np.asarray(infos["del_limit"], dtype=float).flatten().tolist())
-            for _key, _win in (("del_ratio", del_ratio_window),
-                               ("del_agent_max", del_agent_max_window),
-                               ("del_baseline_max", del_base_max_window),
-                               ("del_margin", del_margin_window)):
-                if _key not in infos:
-                    continue
-                _vals = np.asarray(infos[_key], dtype=float).flatten()
-                _win.extend(_vals[np.isfinite(_vals)].tolist())
-            # loads_ood is per-env (T,) bool arrays; collation across envs can
-            # be ragged/objecty depending on gymnasium version -- diagnostic
-            # only, so never let it kill training.
-            try:
-                _ood = infos.get("loads_ood")
-                if _ood is not None:
-                    del_ood_window.extend(
-                        float(np.mean(np.asarray(o, dtype=float))) for o in _ood)
-            except (TypeError, ValueError):
-                pass
-            if len(_del_reward_channels) > 1 and "del_binding_channel" in infos:
-                del_binding_window.extend(
-                    ch for ch in np.asarray(
-                        infos["del_binding_channel"], dtype=object
-                    ).flatten() if ch is not None
-                )
-
-        # Log episode stats
-        if "final_info" in infos:
-            ep_return = np.mean(envs.return_queue)
-            ep_length = np.mean(envs.length_queue)
-            ep_power = np.mean(envs.mean_power_queue)
-            
-            print(f"Step {global_step}: Episode return={ep_return:.2f}, power={ep_power:.2f}")
-            writer.add_scalar("charts/episodic_return", ep_return, global_step)
-            writer.add_scalar("charts/episodic_length", ep_length, global_step)
-            writer.add_scalar("charts/episodic_power", ep_power, global_step)
-
-            # Greedy-baseline comparison (filled by RecordEpisodeVals only when
-            # the env is built with Baseline_comp, e.g. Power_reward="Baseline").
-            # power_ratio > 1 means the agent beats the zero-offset greedy farm.
-            if getattr(envs, "mean_power_queue_baseline", None) and len(envs.mean_power_queue_baseline) > 0:
-                ep_power_base = float(np.mean(envs.mean_power_queue_baseline))
-                writer.add_scalar("charts/episodic_power_baseline", ep_power_base, global_step)
-                if ep_power_base > 0:
-                    writer.add_scalar("charts/episodic_power_ratio",
-                                      ep_power / ep_power_base, global_step)
-
-            # DEL signs of life (rolling-window means; window length ~ recent
-            # episode(s)). del_penalty stays 0 through each warm-up, and is
-            # identically 0 in --del_log-only (unpenalized) runs.
-            if _del_active and len(del_penalty_window) > 0:
-                writer.add_scalar("charts/episodic_del_penalty",
-                                  float(np.mean(del_penalty_window)), global_step)
-                writer.add_scalar("charts/episodic_reward_unpenalized",
-                                  float(np.mean(reward_unpen_window)), global_step)
-                if len(del_ratio_window) > 0:
-                    writer.add_scalar("charts/episodic_del_ratio",
-                                      float(np.mean(del_ratio_window)), global_step)
-                if len(del_agent_max_window) > 0:
-                    writer.add_scalar("charts/del_agent_max",
-                                      float(np.mean(del_agent_max_window)), global_step)
-                if len(del_base_max_window) > 0:
-                    writer.add_scalar("charts/del_baseline_max",
-                                      float(np.mean(del_base_max_window)), global_step)
-                if len(del_ood_window) > 0:
-                    writer.add_scalar("charts/del_ood_frac",
-                                      float(np.mean(del_ood_window)), global_step)
-                if len(del_limit_window) > 0:
-                    writer.add_scalar("charts/del_limit",
-                                      float(np.mean(del_limit_window)), global_step)
-                if len(del_margin_window) > 0:
-                    writer.add_scalar("charts/del_margin",
-                                      float(np.mean(del_margin_window)), global_step)
-                if len(del_binding_window) > 0:
-                    _bind = list(del_binding_window)
-                    for _ch in _del_reward_channels:
-                        writer.add_scalar(
-                            f"charts/del_binding_frac/{_ch}",
-                            _bind.count(_ch) / len(_bind), global_step)
-
-
-        # Handle final observations
-        real_next_obs = next_obs.copy()
-        for idx, trunc in enumerate(truncations):
-            if trunc:
-                real_next_obs[idx] = infos["final_obs"][idx]
-        
-        # Store in replay buffer
-        for i in range(args.num_envs):
-            done = terminations[i] or truncations[i]
-            action_reshaped = actions[i].reshape(-1, action_dim_per_turbine)
-        
-            layout_idx_i = current_layout_indices[i] if current_layout_indices is not None else None
-            perm_i = current_permutations[i] if current_permutations is not None else None
-
-            rb.add(
-                obs[i],
-                real_next_obs[i],
-                action_reshaped,
-                rewards[i],
-                done,
-                raw_positions[i],
-                current_masks[i],
-                wind_dirs[i],
-                layout_index=layout_idx_i,
-                permutation=perm_i,
-            )
-
-        # One-shot warmup buffer save (buffer pre-generation for ablation runs)
-        if (args.save_buffer_at_learning_starts
-                and not warmup_buffer_saved
-                and global_step >= args.learning_starts):
-            rb.save(
-                f"runs/{run_name}/replay_buffer_warmup_{args.learning_starts}.npz",
-                extra_meta=buffer_meta(global_step),
-            )
-            warmup_buffer_saved = True
-            if args.buffer_only:
-                print("\n--buffer_only set: warmup buffer saved, exiting before training.")
-                evaluator.close()
-                envs.close()
-                writer.close()
-                return
-
-        obs = next_obs
-        
         # =====================================================================
         # TRAINING
         # =====================================================================
-        
+        # NOTE (--async_overlap): an env step may be IN FLIGHT throughout this
+        # block -- do not add env IPC (get_attr / call / step) anywhere in the
+        # training region or AsyncVectorEnv raises AlreadyPendingCallError.
+        # envs.return_queue reads below are wrapper-local deques: safe, but one
+        # iteration stale (cosmetic only). The replay buffer excludes the
+        # in-flight transitions (rb.add runs after step_wait, below); at the
+        # first gated iteration len(rb) ~ learning_starts >> batch_size, so at
+        # worst the first burst happens one iteration later.
+
         if global_step > args.learning_starts and len(rb) >= args.batch_size:
 
             # Calculate number of gradient updates for this iteration
@@ -1909,11 +1783,22 @@ def main():
                 writer.add_scalar("debug/gradient_updates_per_iter", num_gradient_updates, global_step)
 
                 if args.log_timing:
-                    total_t = sum(timing.values()) or 1.0
+                    # env_span overlaps the other buckets (the burst runs inside
+                    # it under --async_overlap), so it is excluded from the
+                    # fraction denominator. overlap_hidden = un-blocked portion
+                    # of the dispatch->collect span (~ the burst duration when
+                    # overlapping; ~0 sequential). The direct evidence of
+                    # hiding is env_sec collapsing vs a sequential run.
+                    total_t = sum(v for k, v in timing.items() if k != "env_span") or 1.0
                     for k, v in timing.items():
                         writer.add_scalar(f"timing/{k}_sec", v, global_step)
-                        writer.add_scalar(f"timing/{k}_frac", v / total_t, global_step)
+                        if k != "env_span":
+                            writer.add_scalar(f"timing/{k}_frac", v / total_t, global_step)
+                    _hidden = timing["env_span"] - timing["env"]
+                    writer.add_scalar("timing/overlap_hidden_sec", _hidden, global_step)
                     print(f"  timing(s): " + ", ".join(f"{k}={v:.2f}" for k, v in timing.items()))
+                    if args.async_overlap:
+                        print(f"  overlap: hidden={_hidden:.2f}s, wait={timing['env']:.2f}s")
                     timing = {k: 0.0 for k in timing}
 
                 print(f"Step {global_step}: SPS={sps}, qf_loss={mean_qf_loss:.4f}, "
@@ -1989,6 +1874,173 @@ def main():
                     debug_logger.print_diagnostics(global_step)
 
 
+        # =====================================================================
+        # COLLECT ENV STEP (dispatched before the training block)
+        # =====================================================================
+        if step_result is None:  # overlap mode: workers simulated during the burst
+            _t0 = _sync_timer()
+            step_result = envs.step_wait()
+            if args.log_timing:
+                _t_now = time.perf_counter()
+                timing["env"] += _t_now - _t0
+                timing["env_span"] += _t_now - _t_async
+        next_obs, rewards, terminations, truncations, infos = step_result
+
+        # Get current layout names for each env. Under domain randomization the pool
+        # is huge, so bucket every training layout under "dr_pool" for debug stats.
+        if dr_enabled:
+            current_layouts = ["dr_pool"] * args.num_envs
+        else:
+            current_layouts = get_env_current_layout(envs)
+
+        # Log per-step data to debug tracker (always - internal deques handle storage)
+        for i in range(args.num_envs):
+            debug_logger.log_layout_step(
+                layout_name=current_layouts[i],
+                reward=float(rewards[i]),
+                power=float(infos.get("Power agent", [0.0] * args.num_envs)[i]) if "Power agent" in infos else None,
+                actions=actions[i] if isinstance(actions, np.ndarray) else np.array(actions[i]),
+            )
+            debug_logger.log_wind_direction(float(wind_dirs[i]))
+
+
+        # Track rewards
+        step_reward_window.extend(np.array(rewards).flatten().tolist())
+
+        # DEL-penalty per-step diagnostics (vector env exposes wrapper info
+        # keys as per-env arrays).
+        if _del_active and "del_penalty" in infos:
+            del_penalty_window.extend(
+                np.asarray(infos["del_penalty"], dtype=float).flatten().tolist())
+            reward_unpen_window.extend(
+                np.asarray(infos["reward_unpenalized"], dtype=float).flatten().tolist())
+            if "del_limit" in infos:
+                del_limit_window.extend(
+                    np.asarray(infos["del_limit"], dtype=float).flatten().tolist())
+            for _key, _win in (("del_ratio", del_ratio_window),
+                               ("del_agent_max", del_agent_max_window),
+                               ("del_baseline_max", del_base_max_window),
+                               ("del_margin", del_margin_window)):
+                if _key not in infos:
+                    continue
+                _vals = np.asarray(infos[_key], dtype=float).flatten()
+                _win.extend(_vals[np.isfinite(_vals)].tolist())
+            # loads_ood is per-env (T,) bool arrays; collation across envs can
+            # be ragged/objecty depending on gymnasium version -- diagnostic
+            # only, so never let it kill training.
+            try:
+                _ood = infos.get("loads_ood")
+                if _ood is not None:
+                    del_ood_window.extend(
+                        float(np.mean(np.asarray(o, dtype=float))) for o in _ood)
+            except (TypeError, ValueError):
+                pass
+            if len(_del_reward_channels) > 1 and "del_binding_channel" in infos:
+                del_binding_window.extend(
+                    ch for ch in np.asarray(
+                        infos["del_binding_channel"], dtype=object
+                    ).flatten() if ch is not None
+                )
+
+        # Log episode stats
+        if "final_info" in infos:
+            ep_return = np.mean(envs.return_queue)
+            ep_length = np.mean(envs.length_queue)
+            ep_power = np.mean(envs.mean_power_queue)
+
+            print(f"Step {global_step}: Episode return={ep_return:.2f}, power={ep_power:.2f}")
+            writer.add_scalar("charts/episodic_return", ep_return, global_step)
+            writer.add_scalar("charts/episodic_length", ep_length, global_step)
+            writer.add_scalar("charts/episodic_power", ep_power, global_step)
+
+            # Greedy-baseline comparison (filled by RecordEpisodeVals only when
+            # the env is built with Baseline_comp, e.g. Power_reward="Baseline").
+            # power_ratio > 1 means the agent beats the zero-offset greedy farm.
+            if getattr(envs, "mean_power_queue_baseline", None) and len(envs.mean_power_queue_baseline) > 0:
+                ep_power_base = float(np.mean(envs.mean_power_queue_baseline))
+                writer.add_scalar("charts/episodic_power_baseline", ep_power_base, global_step)
+                if ep_power_base > 0:
+                    writer.add_scalar("charts/episodic_power_ratio",
+                                      ep_power / ep_power_base, global_step)
+
+            # DEL signs of life (rolling-window means; window length ~ recent
+            # episode(s)). del_penalty stays 0 through each warm-up, and is
+            # identically 0 in --del_log-only (unpenalized) runs.
+            if _del_active and len(del_penalty_window) > 0:
+                writer.add_scalar("charts/episodic_del_penalty",
+                                  float(np.mean(del_penalty_window)), global_step)
+                writer.add_scalar("charts/episodic_reward_unpenalized",
+                                  float(np.mean(reward_unpen_window)), global_step)
+                if len(del_ratio_window) > 0:
+                    writer.add_scalar("charts/episodic_del_ratio",
+                                      float(np.mean(del_ratio_window)), global_step)
+                if len(del_agent_max_window) > 0:
+                    writer.add_scalar("charts/del_agent_max",
+                                      float(np.mean(del_agent_max_window)), global_step)
+                if len(del_base_max_window) > 0:
+                    writer.add_scalar("charts/del_baseline_max",
+                                      float(np.mean(del_base_max_window)), global_step)
+                if len(del_ood_window) > 0:
+                    writer.add_scalar("charts/del_ood_frac",
+                                      float(np.mean(del_ood_window)), global_step)
+                if len(del_limit_window) > 0:
+                    writer.add_scalar("charts/del_limit",
+                                      float(np.mean(del_limit_window)), global_step)
+                if len(del_margin_window) > 0:
+                    writer.add_scalar("charts/del_margin",
+                                      float(np.mean(del_margin_window)), global_step)
+                if len(del_binding_window) > 0:
+                    _bind = list(del_binding_window)
+                    for _ch in _del_reward_channels:
+                        writer.add_scalar(
+                            f"charts/del_binding_frac/{_ch}",
+                            _bind.count(_ch) / len(_bind), global_step)
+
+
+        # Handle final observations
+        real_next_obs = next_obs.copy()
+        for idx, trunc in enumerate(truncations):
+            if trunc:
+                real_next_obs[idx] = infos["final_obs"][idx]
+
+        # Store in replay buffer
+        for i in range(args.num_envs):
+            done = terminations[i] or truncations[i]
+            action_reshaped = actions[i].reshape(-1, action_dim_per_turbine)
+
+            layout_idx_i = current_layout_indices[i] if current_layout_indices is not None else None
+            perm_i = current_permutations[i] if current_permutations is not None else None
+
+            rb.add(
+                obs[i],
+                real_next_obs[i],
+                action_reshaped,
+                rewards[i],
+                done,
+                raw_positions[i],
+                current_masks[i],
+                wind_dirs[i],
+                layout_index=layout_idx_i,
+                permutation=perm_i,
+            )
+
+        # One-shot warmup buffer save (buffer pre-generation for ablation runs)
+        if (args.save_buffer_at_learning_starts
+                and not warmup_buffer_saved
+                and global_step >= args.learning_starts):
+            rb.save(
+                f"runs/{run_name}/replay_buffer_warmup_{args.learning_starts}.npz",
+                extra_meta=buffer_meta(global_step),
+            )
+            warmup_buffer_saved = True
+            if args.buffer_only:
+                print("\n--buffer_only set: warmup buffer saved, exiting before training.")
+                evaluator.close()
+                envs.close()
+                writer.close()
+                return
+
+        obs = next_obs
 
         # =====================================================================
         # CHECKPOINTING
