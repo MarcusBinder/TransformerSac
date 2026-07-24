@@ -70,6 +70,11 @@ class Args:
     eval_layouts: str = ""            # Comma-separated eval layouts (empty = use training layouts)
     eval_seed: int = 42               # Seed for evaluation environments
     eval_deterministic: bool = True   # Use the deterministic (mean) policy action during evaluation
+    # Named time-varying wd schedule (helpers/wd_functions.py registry) applied to EVAL
+    # envs only; training envs keep the config's static per-episode wd. When set, eval
+    # wind is pinned to wd_min=wd_max=wd_function(0) and ws=12 so the burn-in matches
+    # the schedule's start. None = static eval wd (unchanged behavior).
+    eval_wd_function: Optional[str] = None
 
     # === Layout Settings ===
     # Comma-separated list of layouts. Single = single-layout, Multiple = multi-layout
@@ -91,7 +96,7 @@ class Args:
     dr_min_dist_D: float = 3.0       # minimum turbine spacing in rotor diameters
     dr_screen_headroom: bool = True  # reject generated layouts with no wake-steering headroom
     dr_min_involved_frac: float = 0.5  # min fraction of turbines in a wake interaction to keep a layout
-    dr_generator: str = "irregular"  # {"irregular","cluster"}: procedural pool generator (cluster = PLayGen Poisson-disc)
+    dr_generator: str = "irregular"  # {"irregular","cluster","grid"}: procedural pool generator (cluster = PLayGen Poisson-disc; grid = rotated regular grids, dr_n_lo/hi bound nx*ny)
 
     # === Observation Settings ===
     history_length: int = 15            # Number of timesteps of history per feature

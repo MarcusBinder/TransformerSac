@@ -21,6 +21,7 @@ Positional encoding options (--pos_encoding_type):
 Author: Marcus Binder Nilsen (DTU Wind Energy)
 """
 
+import copy
 import os
 import random
 import time
@@ -382,7 +383,31 @@ def main():
                           **base_env_kwargs)
         env.action_space.seed(args.seed)
         return env
-    
+
+    # Eval-only env factory: when --eval_wd_function is set, eval envs get a
+    # time-varying wd schedule (training envs are untouched). The burn-in holds the
+    # per-reset base_wd, so wd is pinned to wd_function(0) — and ws to 12 m/s so all
+    # eval episodes share one condition — mirroring make_flow_gif.py.
+    eval_env_factory = env_factory
+    if args.eval_wd_function is not None:
+        from helpers.wd_functions import get_wd_function
+        _wd_fn = get_wd_function(args.eval_wd_function)
+        eval_config = copy.deepcopy(config)
+        _wd0 = float(_wd_fn(0.0))
+        eval_config["wind"]["wd_min"] = eval_config["wind"]["wd_max"] = _wd0
+        eval_config["wind"]["ws_min"] = eval_config["wind"]["ws_max"] = 12.0
+        eval_env_kwargs = {**base_env_kwargs, "config": eval_config, "wd_function": _wd_fn}
+        print(f"Eval wd_function: {args.eval_wd_function} "
+              f"(eval wind pinned to wd={_wd0}, ws=12.0)")
+
+        def eval_env_factory(x_pos: np.ndarray, y_pos: np.ndarray) -> gym.Env:
+            env = WindFarmEnv(x_pos=x_pos,
+                              y_pos=y_pos,
+                              reset_init=False,
+                              **eval_env_kwargs)
+            env.action_space.seed(args.seed)
+            return env
+
     def combined_wrapper(env: gym.Env) -> gym.Env:
         """
         Combined wrapper that:
@@ -466,7 +491,7 @@ def main():
     evaluator = PolicyEvaluator(
         agent=None,  # Will be set after actor is created
         eval_layouts=eval_layout_names,
-        env_factory=env_factory,
+        env_factory=eval_env_factory,
         combined_wrapper=combined_wrapper,
         num_envs=args.num_envs,
         num_eval_steps=args.num_eval_steps,
