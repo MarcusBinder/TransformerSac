@@ -375,38 +375,66 @@ def main():
         "yaw_step_sim": args.yaw_step,
     }
     
-    def env_factory(x_pos: np.ndarray, y_pos: np.ndarray) -> gym.Env:
-        """Create a base WindFarmEnv with given positions."""
-        env = WindFarmEnv(x_pos=x_pos,
-                          y_pos=y_pos,
-                          reset_init=False,  # Defer reset to training loop
-                          **base_env_kwargs)
-        env.action_space.seed(args.seed)
-        return env
+    def make_env_factory(env_kwargs: dict):
+        """Build a WindFarmEnv factory bound to one set of env kwargs."""
+        def _factory(x_pos: np.ndarray, y_pos: np.ndarray) -> gym.Env:
+            env = WindFarmEnv(x_pos=x_pos,
+                              y_pos=y_pos,
+                              reset_init=False,  # Defer reset to training loop
+                              **env_kwargs)
+            env.action_space.seed(args.seed)
+            return env
+        return _factory
 
-    # Eval-only env factory: when --eval_wd_function is set, eval envs get a
-    # time-varying wd schedule (training envs are untouched). The burn-in holds the
-    # per-reset base_wd, so wd is pinned to wd_function(0) — and ws to 12 m/s so all
-    # eval episodes share one condition — mirroring make_flow_gif.py.
-    eval_env_factory = env_factory
-    if args.eval_wd_function is not None:
+    # Static-wd factory: the default for training, and the eval fallback when no
+    # --eval_wd_function is given. Deliberately carries NO wd_function, so a
+    # --train_wd_function can never leak into the eval envs.
+    env_factory = make_env_factory(base_env_kwargs)
+
+    # Eval-only env factories: when --eval_wd_function is set (comma-separated for
+    # several schedules), eval envs get a time-varying wd schedule (training envs are
+    # untouched by this path). The burn-in holds the per-reset base_wd, so wd is pinned
+    # to wd_function(0) — and ws to 12 m/s so all eval episodes share one condition —
+    # mirroring make_flow_gif.py.
+    eval_wd_names = []
+    if args.eval_wd_function is not None and args.eval_wd_function.strip():
+        eval_wd_names = [s.strip() for s in args.eval_wd_function.split(",") if s.strip()]
+
+    def make_eval_env_factory(wd_name: str):
         from helpers.wd_functions import get_wd_function
-        _wd_fn = get_wd_function(args.eval_wd_function)
+        _wd_fn = get_wd_function(wd_name)
         eval_config = copy.deepcopy(config)
         _wd0 = float(_wd_fn(0.0))
         eval_config["wind"]["wd_min"] = eval_config["wind"]["wd_max"] = _wd0
         eval_config["wind"]["ws_min"] = eval_config["wind"]["ws_max"] = 12.0
-        eval_env_kwargs = {**base_env_kwargs, "config": eval_config, "wd_function": _wd_fn}
-        print(f"Eval wd_function: {args.eval_wd_function} "
+        print(f"Eval wd_function: {wd_name} "
               f"(eval wind pinned to wd={_wd0}, ws=12.0)")
+        return make_env_factory({**base_env_kwargs,
+                                 "config": eval_config,
+                                 "wd_function": _wd_fn})
 
-        def eval_env_factory(x_pos: np.ndarray, y_pos: np.ndarray) -> gym.Env:
-            env = WindFarmEnv(x_pos=x_pos,
-                              y_pos=y_pos,
-                              reset_init=False,
-                              **eval_env_kwargs)
-            env.action_space.seed(args.seed)
-            return env
+    eval_env_factories = ([make_eval_env_factory(n) for n in eval_wd_names]
+                          if eval_wd_names else [env_factory])
+
+    # Training wd schedule (--train_wd_function). Unlike the eval path these are
+    # RELATIVE — wd(t) = base_wd + delta(t) — so wd_min/wd_max are deliberately NOT
+    # pinned and the config's per-episode wd randomization survives. The schedules are
+    # stateful (they re-draw every episode), so each vector-env slot builds its own
+    # instance seeded off that slot's seed; a single shared instance would make all
+    # num_envs envs walk one identical wd trajectory.
+    def make_train_env_factory(env_seed: int):
+        if args.train_wd_function is None:
+            return env_factory
+        from helpers.wd_functions import get_train_wd_factory
+        return make_env_factory({
+            **base_env_kwargs,
+            "wd_function": get_train_wd_factory(args.train_wd_function, seed=env_seed),
+        })
+
+    if args.train_wd_function is not None:
+        print(f"Train wd_function: {args.train_wd_function} "
+              f"(relative schedule; wd domain randomization preserved, "
+              f"per-env seeds {args.seed}..{args.seed + args.num_envs - 1})")
 
     def combined_wrapper(env: gym.Env) -> gym.Env:
         """
@@ -426,9 +454,11 @@ def main():
     def make_env_fn(seed, warmup_steps=None):
         """Factory function for vectorized environments."""
         def _init():
+            # Built inside _init so the (stateful) training wd schedule is
+            # constructed in this worker process, one instance per env slot.
             env = MultiLayoutEnv(
                 layouts=layouts,
-                env_factory=env_factory,
+                env_factory=make_train_env_factory(seed),
                 per_turbine_wrapper=combined_wrapper,  # Use combined wrapper
                 seed=seed,
                 shuffle=args.shuffle_turbs,  # Shuffle turbines within each layout
@@ -487,27 +517,60 @@ def main():
     print(f"Rotor diameter: {rotor_diameter:.1f} m")
     
 
-    # Create policy evaluator
-    evaluator = PolicyEvaluator(
-        agent=None,  # Will be set after actor is created
-        eval_layouts=eval_layout_names,
-        env_factory=eval_env_factory,
-        combined_wrapper=combined_wrapper,
-        num_envs=args.num_envs,
-        num_eval_steps=args.num_eval_steps,
-        num_eval_episodes=args.num_eval_episodes,
-        device=device,
-        rotor_diameter=rotor_diameter,
-        wind_turbine=wind_turbine,
-        seed=args.eval_seed,
-        max_turbines=n_turbines_max,
-        deterministic=args.eval_deterministic,
-        use_profiles=use_profiles,  # NEW: Pass profile setting
-        n_profile_directions=args.n_profile_directions,  # NEW: Pass profile resolution
-        profile_source=args.profile_source,
-        profile_sigma_smooth=args.profile_sigma_smooth,
-        profile_geom_mode=args.profile_geom_mode,
-    )
+    # Create policy evaluators — one per eval wd schedule. Every evaluator shares the
+    # same eval_seed, so the schedules are compared on PAIRED episodes.
+    evaluators = [
+        PolicyEvaluator(
+            agent=None,  # Will be set after actor is created
+            eval_layouts=eval_layout_names,
+            env_factory=_factory,
+            combined_wrapper=combined_wrapper,
+            num_envs=args.num_envs,
+            num_eval_steps=args.num_eval_steps,
+            num_eval_episodes=args.num_eval_episodes,
+            device=device,
+            rotor_diameter=rotor_diameter,
+            wind_turbine=wind_turbine,
+            seed=args.eval_seed,
+            max_turbines=n_turbines_max,
+            deterministic=args.eval_deterministic,
+            use_profiles=use_profiles,  # NEW: Pass profile setting
+            n_profile_directions=args.n_profile_directions,  # NEW: Pass profile resolution
+            profile_source=args.profile_source,
+            profile_sigma_smooth=args.profile_sigma_smooth,
+            profile_geom_mode=args.profile_geom_mode,
+        )
+        for _factory in eval_env_factories
+    ]
+
+    def run_all_evaluations():
+        """Evaluate on every eval wd schedule.
+
+        Returns (metrics_dict, primary_metrics). The FIRST schedule additionally
+        writes the historical unprefixed eval/... keys so existing W&B panels and
+        paper_figures.ipynb readers keep working; every schedule also writes
+        eval/wd/<schedule>/... . Extra evaluators are closed after their pass —
+        each holds its own num_envs-wide AsyncVectorEnv, and leaving them resident
+        would multiply the sweep's worker-process count per extra schedule. They
+        are recreated lazily on the next eval cycle.
+        """
+        metrics = {}
+        primary = None
+        for i, ev in enumerate(evaluators):
+            m = ev.evaluate()
+            if i == 0:
+                primary = m
+                metrics.update(m.to_dict())
+            if eval_wd_names:
+                metrics.update(m.to_dict(prefix=f"eval/wd/{eval_wd_names[i]}"))
+                print(f"  [{eval_wd_names[i]}] power ratio: {m.power_ratio:.4f}")
+            if i > 0:
+                ev.close()
+        return metrics, primary
+
+    def close_all_evaluators():
+        for ev in evaluators:
+            ev.close()
 
 
     # Action scaling
@@ -719,7 +782,8 @@ def main():
     )
 
     # Update evaluator with actor reference
-    evaluator.agent = agent
+    for _ev in evaluators:
+        _ev.agent = agent
 
     # Build critic-specific kwargs (DroQ params only go to critics, not actor)
     critic_kwargs = {**common_kwargs}
@@ -1162,12 +1226,11 @@ def main():
     # Initial evaluation
     if args.eval_initial:
         print("\nRunning initial evaluation before training...")
-        eval_metrics = evaluator.evaluate()
-        eval_dict = eval_metrics.to_dict()
-        
+        eval_dict, eval_metrics = run_all_evaluations()
+
         for name, value in eval_dict.items():
             writer.add_scalar(name, value, 0)
-        
+
         print(f"Initial eval - Mean reward: {eval_metrics.mean_reward:.4f}, "
               f"Power ratio: {eval_metrics.power_ratio:.4f}")
 
@@ -1358,7 +1421,7 @@ def main():
             warmup_buffer_saved = True
             if args.buffer_only:
                 print("\n--buffer_only set: warmup buffer saved, exiting before training.")
-                evaluator.close()
+                close_all_evaluators()
                 envs.close()
                 writer.close()
                 return
@@ -1830,9 +1893,8 @@ def main():
         
         if global_step >= next_eval_step:
             print(f"\nRunning evaluation at step {global_step}...")
-            eval_metrics = evaluator.evaluate()
-            eval_dict = eval_metrics.to_dict()
-            
+            eval_dict, eval_metrics = run_all_evaluations()
+
             # Log to tensorboard/wandb
             for name, value in eval_dict.items():
                 writer.add_scalar(name, value, global_step)
@@ -1872,8 +1934,8 @@ def main():
     print("=" * 60)
     
 
-    # Close evaluator
-    evaluator.close()
+    # Close evaluators
+    close_all_evaluators()
 
     envs.close()
     writer.close()

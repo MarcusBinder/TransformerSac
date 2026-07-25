@@ -70,11 +70,25 @@ class Args:
     eval_layouts: str = ""            # Comma-separated eval layouts (empty = use training layouts)
     eval_seed: int = 42               # Seed for evaluation environments
     eval_deterministic: bool = True   # Use the deterministic (mean) policy action during evaluation
-    # Named time-varying wd schedule (helpers/wd_functions.py registry) applied to EVAL
-    # envs only; training envs keep the config's static per-episode wd. When set, eval
-    # wind is pinned to wd_min=wd_max=wd_function(0) and ws=12 so the burn-in matches
-    # the schedule's start. None = static eval wd (unchanged behavior).
+    # Named time-varying wd schedule(s) from the EVAL registry (helpers/wd_functions.py
+    # WD_FUNCTIONS), applied to eval envs only. Comma-separated for multiple schedules
+    # (e.g. "static_270,step_ramp_270_315"): each gets its own evaluator, and its
+    # metrics are namespaced eval/wd/<schedule>/... . The FIRST schedule additionally
+    # keeps the plain eval/... keys so existing W&B panels and readers still work.
+    # When set, eval wind is pinned to wd_min=wd_max=wd_function(0) and ws=12 so the
+    # burn-in matches the schedule's start. None = static eval wd (unchanged behavior).
     eval_wd_function: Optional[str] = None
+
+    # === Training wind-direction schedule ===
+    # Named randomized wd schedule from the TRAIN registry (helpers/wd_functions.py
+    # TRAIN_WD_FACTORIES, e.g. "dr_ramp") applied to TRAINING envs. These schedules are
+    # RELATIVE -- wd(t) = base_wd + delta(t) with delta(0) = 0 -- so unlike the eval
+    # path they do NOT pin wd_min/wd_max: the config's per-episode wd randomization is
+    # preserved and the schedule composes on top of it. Each vector env is seeded
+    # independently so the 30 envs do not share one wd trajectory. The train and eval
+    # registries are disjoint, so an eval schedule name is rejected here (and vice
+    # versa). None = static per-episode wd (unchanged behavior).
+    train_wd_function: Optional[str] = None
 
     # === Layout Settings ===
     # Comma-separated list of layouts. Single = single-layout, Multiple = multi-layout

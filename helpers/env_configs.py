@@ -93,6 +93,23 @@ ENV_CONFIGS: Dict[str, Dict[str, Any]] = {
         },
     },
 
+    # hard_2 with wind direction removed from the per-turbine observation.
+    # Probes whether wind-frame profile ROTATION alone is sufficient for wd
+    # perception: rotation reads env.wd directly (a privileged, noiseless,
+    # instantaneous channel), so it is unaffected by dropping the lagged
+    # rolling-mean wd from the obs. Removing turb_wd costs exactly
+    # history_length features per turbine (wd_rolling_mean with wd_history_N =
+    # history_length), and EnhancedPerTurbineWrapper degrades to a pass-through
+    # because _detect_wd_indices returns None when turb_wd is False.
+    "hard_2_nowd": {
+        "power_def": {"Power_reward": "Wake_recovery", "Power_avg": 5, "Power_scaling": 1.0},
+        "wind": {
+            "wd_min": 225, "wd_max": 315,
+            "ws_min": 10, "ws_max": 14,
+        },
+        "mes_level": {"turb_wd": False},
+    },
+
     "basic": {
         "yaw_init": "Random",
         "BaseController": "Local",
