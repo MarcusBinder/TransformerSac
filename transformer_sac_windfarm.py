@@ -77,7 +77,11 @@ from helpers.helper_funcs import (
     soft_update,
 )
 from helpers.layouts import get_layout_positions
-from helpers.env_configs import make_env_config
+from helpers.env_configs import (
+    make_env_config,
+    apply_config_overrides,
+    make_eval_wind_config,
+)
 
 # Receptivity profile computation
 from helpers.receptivity_profiles import compute_layout_profiles
@@ -362,7 +366,12 @@ def main():
         config[mes_type][f"{prefix}_history_N"] = args.history_length
         config[mes_type][f"{prefix}_history_length"] = args.history_length
 
-    
+    # change_wd_3 reward / training-wind overrides (all no-ops when unset).
+    # Applied HERE, before make_eval_env_factory deep-copies `config`, so the
+    # reward definition is shared by training and eval envs; the training-only
+    # ws range is then overwritten per eval spec below.
+    apply_config_overrides(config, args)
+
     base_env_kwargs = {
         "turbine": wind_turbine,
         "n_passthrough": args.max_eps,
@@ -394,27 +403,35 @@ def main():
     # Eval-only env factories: when --eval_wd_function is set (comma-separated for
     # several schedules), eval envs get a time-varying wd schedule (training envs are
     # untouched by this path). The burn-in holds the per-reset base_wd, so wd is pinned
-    # to wd_function(0) — and ws to 12 m/s so all eval episodes share one condition —
-    # mirroring make_flow_gif.py.
-    eval_wd_names = []
-    if args.eval_wd_function is not None and args.eval_wd_function.strip():
-        eval_wd_names = [s.strip() for s in args.eval_wd_function.split(",") if s.strip()]
+    # to wd_function(0) — and ws to the spec's speed so all episodes in a cell share
+    # one condition — mirroring make_flow_gif.py.
+    #
+    # The ladder is the CROSS PRODUCT (schedule x --eval_ws), because the reward
+    # conditioning under test is largely a wind-SPEED story: DTU10MW rates near
+    # 11.4 m/s, so an eval pinned only at 12 m/s sits above rated and cannot show
+    # whether an arm gained anything below it. eval_specs entries are
+    # (wd_name, ws, spec_name); spec_name carries the /ws<speed> segment only when
+    # more than one speed is requested, keeping the single-speed namespace
+    # byte-identical to change_wd_2.
+    from helpers.wd_functions import build_eval_specs
+    eval_specs = build_eval_specs(args.eval_wd_function, args.eval_ws)
+    eval_spec_names = [name for _, _, name in eval_specs]
 
-    def make_eval_env_factory(wd_name: str):
+    def make_eval_env_factory(wd_name: str, ws: float):
         from helpers.wd_functions import get_wd_function
         _wd_fn = get_wd_function(wd_name)
-        eval_config = copy.deepcopy(config)
         _wd0 = float(_wd_fn(0.0))
-        eval_config["wind"]["wd_min"] = eval_config["wind"]["wd_max"] = _wd0
-        eval_config["wind"]["ws_min"] = eval_config["wind"]["ws_max"] = 12.0
+        # Pins wd to the schedule's t=0 value and ws UNCONDITIONALLY — the latter
+        # is what keeps a --train_ws_min/max override out of the eval condition.
+        eval_config = make_eval_wind_config(config, _wd0, ws)
         print(f"Eval wd_function: {wd_name} "
-              f"(eval wind pinned to wd={_wd0}, ws=12.0)")
+              f"(eval wind pinned to wd={_wd0}, ws={float(ws)})")
         return make_env_factory({**base_env_kwargs,
                                  "config": eval_config,
                                  "wd_function": _wd_fn})
 
-    eval_env_factories = ([make_eval_env_factory(n) for n in eval_wd_names]
-                          if eval_wd_names else [env_factory])
+    eval_env_factories = ([make_eval_env_factory(wd, ws) for wd, ws, _ in eval_specs]
+                          if eval_specs else [env_factory])
 
     # Training wd schedule (--train_wd_function). Unlike the eval path these are
     # RELATIVE — wd(t) = base_wd + delta(t) — so wd_min/wd_max are deliberately NOT
@@ -546,12 +563,12 @@ def main():
     def run_all_evaluations():
         """Evaluate on every eval wd schedule.
 
-        Returns (metrics_dict, primary_metrics). The FIRST schedule additionally
+        Returns (metrics_dict, primary_metrics). The FIRST spec additionally
         writes the historical unprefixed eval/... keys so existing W&B panels and
-        paper_figures.ipynb readers keep working; every schedule also writes
-        eval/wd/<schedule>/... . Extra evaluators are closed after their pass —
+        paper_figures.ipynb readers keep working; every spec also writes
+        eval/wd/<spec>/... . Extra evaluators are closed after their pass —
         each holds its own num_envs-wide AsyncVectorEnv, and leaving them resident
-        would multiply the sweep's worker-process count per extra schedule. They
+        would multiply the sweep's worker-process count per extra spec. They
         are recreated lazily on the next eval cycle.
         """
         metrics = {}
@@ -561,9 +578,9 @@ def main():
             if i == 0:
                 primary = m
                 metrics.update(m.to_dict())
-            if eval_wd_names:
-                metrics.update(m.to_dict(prefix=f"eval/wd/{eval_wd_names[i]}"))
-                print(f"  [{eval_wd_names[i]}] power ratio: {m.power_ratio:.4f}")
+            if eval_spec_names:
+                metrics.update(m.to_dict(prefix=f"eval/wd/{eval_spec_names[i]}"))
+                print(f"  [{eval_spec_names[i]}] power ratio: {m.power_ratio:.4f}")
             if i > 0:
                 ev.close()
         return metrics, primary

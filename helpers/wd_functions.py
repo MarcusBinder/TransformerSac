@@ -68,10 +68,72 @@ def static_270(t):
     return np.full_like(t, 270.0, dtype=float)
 
 
+def static_315(t):
+    """Constant 315 deg — static-wd control matching step_ramp_270_315's END.
+
+    The change_wd_2 verdict flagged the missing half of the static control: with
+    only static_270 the ramp-vs-static gap conflates "tracking a moving wd is
+    hard" with "315 deg simply has less to gain". On the square_5x5 @6D eval
+    layout 270 deg is row-aligned (deep wakes) while 315 deg is the diagonal at
+    8.49D (shallow wakes), so the two endpoints are not interchangeable and the
+    retention ratio is uninterpretable without both.
+    """
+    t = np.asarray(t)
+    return np.full_like(t, 315.0, dtype=float)
+
+
 WD_FUNCTIONS = {
     "step_ramp_270_315": step_ramp_270_315,
     "static_270": static_270,
+    "static_315": static_315,
 }
+
+
+def parse_eval_ws(eval_ws) -> list:
+    """Parse ``--eval_ws`` ("12" or "12,10.5") into a list of floats.
+
+    Order is preserved: the FIRST entry pairs with the first schedule to form the
+    spec that owns the unprefixed ``eval/...`` keys.
+    """
+    if eval_ws is None:
+        return [12.0]
+    if isinstance(eval_ws, (int, float)):
+        return [float(eval_ws)]
+    parts = [s.strip() for s in str(eval_ws).split(",") if s.strip()]
+    if not parts:
+        return [12.0]
+    return [float(p) for p in parts]
+
+
+def build_eval_specs(eval_wd_function, eval_ws="12") -> list:
+    """Cross (wd schedule x eval ws) into the ordered eval ladder.
+
+    Returns ``[(wd_name, ws, spec_name), ...]``, empty when no --eval_wd_function
+    was given (the caller then falls back to the single static-wd evaluator).
+
+    ``spec_name`` is the W&B namespace segment under ``eval/wd/``. With exactly one
+    requested wind speed it is the bare schedule name, making the key set
+    byte-identical to change_wd_2's; only when several speeds are requested does
+    the ``/ws<speed>`` segment appear. That asymmetry is deliberate -- it is the
+    one change here that could silently invalidate a cross-sweep comparison.
+
+    The first spec is (first schedule, first speed), and the caller additionally
+    writes the historical unprefixed ``eval/...`` keys from it.
+    """
+    if eval_wd_function is None or not str(eval_wd_function).strip():
+        return []
+    names = [s.strip() for s in str(eval_wd_function).split(",") if s.strip()]
+    if not names:
+        return []
+    for name in names:
+        get_wd_function(name)  # fail fast on a typo, before any env is built
+    ws_list = parse_eval_ws(eval_ws)
+    multi_ws = len(ws_list) > 1
+    return [
+        (wd, ws, f"{wd}/ws{ws:g}" if multi_ws else wd)
+        for wd in names
+        for ws in ws_list
+    ]
 
 
 def get_wd_function(name: str):

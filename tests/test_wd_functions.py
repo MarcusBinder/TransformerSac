@@ -18,9 +18,12 @@ import pytest
 from helpers.wd_functions import (
     WD_FUNCTIONS,
     TRAIN_WD_FACTORIES,
+    build_eval_specs,
     get_train_wd_factory,
     get_wd_function,
     make_dr_ramp,
+    parse_eval_ws,
+    static_315,
     step_ramp_270_315,
 )
 
@@ -176,6 +179,96 @@ def test_dr_ramp_narrow_never_reproduces_the_eval_schedule():
     for _ in range(10_000):
         wd = _trajectory(fn, base_wd=270.0, grid=eval_grid)
         assert not np.allclose(wd, target, atol=0.5)
+
+
+# ---------------------------------------------------------------------------
+# static_315 -- the control change_wd_2 was missing (change_wd_3)
+# ---------------------------------------------------------------------------
+
+def test_static_315_is_constant_for_scalar_t():
+    for t in (0.0, 1.0, 300.0, 1000.0, 5000.0):
+        assert float(static_315(t)) == pytest.approx(315.0)
+
+
+def test_static_315_is_constant_for_array_t():
+    wd = static_315(EPISODE_GRID)
+    assert wd.shape == EPISODE_GRID.shape
+    np.testing.assert_allclose(wd, 315.0)
+
+
+def test_static_315_matches_the_ramp_endpoint():
+    """The point of the control: it must sit exactly where the ramp settles."""
+    assert float(static_315(0.0)) == pytest.approx(float(step_ramp_270_315(1000.0)))
+
+
+def test_static_315_is_registered_as_an_eval_schedule():
+    assert WD_FUNCTIONS["static_315"] is static_315
+    assert get_wd_function("static_315") is static_315
+
+
+def test_static_315_is_not_a_training_schedule():
+    """The leakage guard: eval schedules must never be selectable for training."""
+    assert "static_315" not in TRAIN_WD_FACTORIES
+    with pytest.raises(ValueError, match="static_315"):
+        get_train_wd_factory("static_315", seed=0)
+
+
+# ---------------------------------------------------------------------------
+# Eval ladder: (wd schedule x eval ws) cross product and namespace back-compat
+# ---------------------------------------------------------------------------
+
+# The exact string change_wd_2 passed. Its key namespace is the compatibility
+# target: change_wd_3 must not move these keys, or the two sweeps stop being
+# comparable with no error raised anywhere.
+CHWD2_SCHEDULES = "step_ramp_270_315,static_270"
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("12", [12.0]),
+    ("12,10.5", [12.0, 10.5]),
+    (" 12 , 10.5 ", [12.0, 10.5]),
+    ("12,10.5,", [12.0, 10.5]),
+    (12, [12.0]),
+    (None, [12.0]),
+])
+def test_parse_eval_ws(raw, expected):
+    assert parse_eval_ws(raw) == expected
+
+
+def test_no_eval_wd_function_means_no_specs():
+    """Falls back to the single static-wd evaluator, which pins no wind at all."""
+    assert build_eval_specs(None, "12,10.5") == []
+    assert build_eval_specs("", "12") == []
+    assert build_eval_specs("  ", "12") == []
+
+
+def test_single_ws_namespace_is_byte_identical_to_change_wd_2():
+    specs = build_eval_specs(CHWD2_SCHEDULES, "12")
+    assert [name for _, _, name in specs] == ["step_ramp_270_315", "static_270"]
+    assert [ws for _, ws, _ in specs] == [12.0, 12.0]
+
+
+def test_multi_ws_builds_the_full_cross_product():
+    specs = build_eval_specs("step_ramp_270_315,static_270,static_315", "12,10.5")
+    assert len(specs) == 6
+    assert [name for _, _, name in specs] == [
+        "step_ramp_270_315/ws12", "step_ramp_270_315/ws10.5",
+        "static_270/ws12", "static_270/ws10.5",
+        "static_315/ws12", "static_315/ws10.5",
+    ]
+
+
+def test_first_spec_owns_the_unprefixed_keys():
+    """Spec 0 is (first schedule, first speed) -- the i == 0 branch in
+    run_all_evaluations writes the historical unprefixed eval/... keys from it."""
+    specs = build_eval_specs("step_ramp_270_315,static_270,static_315", "12,10.5")
+    wd, ws, _ = specs[0]
+    assert (wd, ws) == ("step_ramp_270_315", 12.0)
+
+
+def test_unknown_schedule_fails_before_any_env_is_built():
+    with pytest.raises(ValueError, match="static_999"):
+        build_eval_specs("static_999", "12")
 
 
 # ---------------------------------------------------------------------------

@@ -78,6 +78,44 @@ class Args:
     # When set, eval wind is pinned to wd_min=wd_max=wd_function(0) and ws=12 so the
     # burn-in matches the schedule's start. None = static eval wd (unchanged behavior).
     eval_wd_function: Optional[str] = None
+    # Comma-separated eval wind speeds (m/s). Every --eval_wd_function schedule is
+    # evaluated at EVERY listed speed, i.e. the eval ladder is the cross product
+    # (schedule x ws) and each cell gets its own evaluator namespaced
+    # eval/wd/<schedule>/ws<speed>/... . With a SINGLE speed (the default "12")
+    # the /ws<speed> segment is omitted entirely, so the key namespace is
+    # byte-identical to the pre-flag behaviour and change_wd_2 readers keep
+    # working. Only consulted when --eval_wd_function is set (the fallback
+    # static-wd evaluator does not pin wind at all).
+    eval_ws: str = "12"
+
+    # === Reward conditioning overrides (change_wd_3) ===
+    # All None = "don't override", so the value from --config's power_def wins and
+    # every pre-existing script keeps its exact behaviour. These exist because the
+    # change_wd_3 arms need arbitrary COMBINATIONS of (tau x Power_avg x
+    # Power_scaling x Power_reward), which as named ENV_CONFIGS presets would be a
+    # dozen near-duplicate dicts.
+    #
+    # reward_tau floors the Wake_recovery denominator:
+    #   r = (P_agent - P_greedy) / max(P_freestream - P_greedy, tau * P_freestream)
+    # so it only binds in states with little wake-steering headroom (below rated,
+    # or wd already aligned). Raising it DOWN-WEIGHTS those states relative to the
+    # productive ones. Contrast power_scaling, which multiplies the reward
+    # UNIFORMLY -- that difference is what makes power_scaling the magnitude
+    # control that renders a tau effect attributable.
+    reward_tau: Optional[float] = None      # power_def["tau"]; env default 0.02
+    power_reward: Optional[str] = None      # power_def["Power_reward"]: "Baseline" | "Wake_recovery" | ...
+    power_avg: Optional[int] = None         # power_def["Power_avg"]: reward power-averaging window
+    power_scaling: Optional[float] = None   # power_def["Power_scaling"]: uniform reward gain
+
+    # === Training wind-speed range override (change_wd_3) ===
+    # Override wind.ws_min / wind.ws_max for the TRAINING envs only; eval envs are
+    # always re-pinned to their own spec's ws afterwards, so these cannot leak into
+    # the eval condition. Motivation: DTU10MW rates near 11.4 m/s while hard_2 draws
+    # ws ~ U[10,14], leaving over half of training states with no wake-steering
+    # headroom at all. Narrowing the range is the "stop sampling dead states" arm,
+    # the alternative to reweighting them via reward_tau. None = use the config's range.
+    train_ws_min: Optional[float] = None
+    train_ws_max: Optional[float] = None
 
     # === Training wind-direction schedule ===
     # Named randomized wd schedule from the TRAIN registry (helpers/wd_functions.py
