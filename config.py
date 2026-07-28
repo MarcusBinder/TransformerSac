@@ -117,6 +117,43 @@ class Args:
     train_ws_min: Optional[float] = None
     train_ws_max: Optional[float] = None
 
+    # === Observation encoding (change_wd_4) ===
+    # The OBS_SCALING.md finding: every ws feature is affine-scaled from a HARDCODED
+    # 0-30 m/s (wind_farm_env.py:71-72 ctor defaults, never overridden anywhere),
+    # while training data lives in ~6-14 m/s — the signal uses ~13% of the [-1,1]
+    # axis. These flags are the change_wd_4 bake-off levers. All default to "off",
+    # so every pre-existing script keeps its exact behaviour.
+    #
+    # WARNING: every one of these changes the observation contract, so they
+    # invalidate all existing checkpoints, and the STANDALONE eval scripts
+    # (evaluate.py / eval_checkpoint.py / ...) do NOT apply them — checkpoints from
+    # runs using these flags are only comparable through the in-training eval until
+    # those scripts learn to read the flags back from checkpoint["args"].
+    #
+    # ws_scaling_min/max are WindFarmEnv CTOR KWARGS (not config-dict keys — see
+    # OBS_SCALING.md "Already ruled out"), forwarded via base_env_kwargs so train
+    # and eval envs stay consistent. None = leave the env default (0/30) untouched.
+    ws_scaling_min: Optional[float] = None
+    ws_scaling_max: Optional[float] = None
+    # Feature-map re-encodings of the ws columns, applied by ObsEncodingWrapper
+    # (helpers/obs_encoding.py) on the PER-TURBINE obs. Modes: rbf | pyramid | cdf
+    # | fourier | reldef | pcurve. Appending modes add features at the END of the
+    # per-turbine vector so indices 0..11 keep their meaning; cdf warps the ws
+    # columns in place. The wrapper reads the env's actual ws scaling range, so
+    # combining with --ws_scaling_* stays correct (but don't — one lever per arm).
+    obs_encoding: Optional[str] = None
+    obs_encoding_kwargs: str = "{}"   # JSON overrides of a mode's defaults (precedent: profile_encoder_kwargs)
+    # Agent-side running mean/std normalization (helpers/obs_norm.py), applied at
+    # act() time and on replay batches. Agent-side (not a per-env wrapper) because
+    # per-env statistics cannot sync across the 30 async workers and eval envs
+    # would start cold. State rides in the checkpoint (obs_norm_state).
+    obs_norm: bool = False
+    # "shared" = the usual single obs-encoder MLP over the full per-turbine vector.
+    # "per_sensor" = one small MLP per sensor group (ws/wd/yaw/power histories),
+    # concatenated — requires obs_dim_per_turbine == 4*history_length, so it
+    # hard-fails if combined with an expanding --obs_encoding (intended).
+    obs_encoder_mode: str = "shared"
+
     # === Training wind-direction schedule ===
     # Named randomized wd schedule from the TRAIN registry (helpers/wd_functions.py
     # TRAIN_WD_FACTORIES, e.g. "dr_ramp") applied to TRAINING envs. These schedules are

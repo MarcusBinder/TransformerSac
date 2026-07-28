@@ -533,6 +533,87 @@ class TransformerEncoder(nn.Module):
 
 
 # =============================================================================
+# PER-SENSOR OBSERVATION ENCODERS (change_wd_4, --obs_encoder_mode per_sensor)
+# =============================================================================
+# Hypothesis (Marcus): the shared obs-encoder MLP mixes the four sensor
+# histories (ws/wd/yaw/power) in its very first Linear, so a low-resolution ws
+# channel can be drowned by the wider-range channels before any nonlinearity.
+# Encoding each sensor group with its OWN small MLP forces the network to build
+# a per-sensor representation first; the groups only meet after concat.
+#
+# Contract: the per-turbine obs must be exactly 4 contiguous groups of
+# history_length ([ws x H, wd x H, yaw x H, power x H] — the hard_2 layout, no
+# probes/TI). The asserts below double as a guard against accidentally
+# combining per_sensor with an expanding --obs_encoding (desired hard failure).
+
+class PerSensorObsEncoder(nn.Module):
+    """4 per-sensor MLPs (H -> E/4 each), concatenated to E. Drop-in for the
+    shared obs_encoder: same input/output shapes, forward untouched."""
+
+    def __init__(self, obs_dim_per_turbine: int, embed_dim: int, history_length: int):
+        super().__init__()
+        assert obs_dim_per_turbine == 4 * history_length, (
+            f"per_sensor obs encoder expects obs_dim == 4*history_length "
+            f"(4 sensor groups), got obs_dim={obs_dim_per_turbine}, "
+            f"history_length={history_length}. Incompatible with expanding "
+            f"--obs_encoding modes."
+        )
+        assert embed_dim % 4 == 0, f"embed_dim must be divisible by 4, got {embed_dim}"
+        self.history_length = history_length
+        e4 = embed_dim // 4
+        self.sensor_mlps = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(history_length, e4),
+                nn.ReLU(),
+                nn.Linear(e4, e4),
+            )
+            for _ in range(4)
+        ])
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        # obs: (..., 4*H) -> 4 x (..., H) -> concat 4 x (..., E/4) = (..., E)
+        groups = obs.split(self.history_length, dim=-1)
+        return torch.cat([mlp(g) for mlp, g in zip(self.sensor_mlps, groups)], dim=-1)
+
+
+class PerSensorObsActionEncoder(nn.Module):
+    """Critic variant: input is already cat([obs, action], dim=-1). The 4 sensor
+    groups plus the action group each get their own MLP (-> E/4), then a final
+    Linear fuses the 5E/4 concat back to E."""
+
+    def __init__(self, obs_dim_per_turbine: int, action_dim_per_turbine: int,
+                 embed_dim: int, history_length: int):
+        super().__init__()
+        assert obs_dim_per_turbine == 4 * history_length, (
+            f"per_sensor obs-action encoder expects obs_dim == 4*history_length, "
+            f"got obs_dim={obs_dim_per_turbine}, history_length={history_length}."
+        )
+        assert embed_dim % 4 == 0, f"embed_dim must be divisible by 4, got {embed_dim}"
+        self.history_length = history_length
+        self.action_dim = action_dim_per_turbine
+        e4 = embed_dim // 4
+
+        def _mlp(in_dim):
+            return nn.Sequential(
+                nn.Linear(in_dim, e4),
+                nn.ReLU(),
+                nn.Linear(e4, e4),
+            )
+
+        self.sensor_mlps = nn.ModuleList([_mlp(history_length) for _ in range(4)])
+        self.action_mlp = _mlp(action_dim_per_turbine)
+        self.fuse = nn.Linear(5 * e4, embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (..., 4*H + A); split off the action tail, then the 4 sensor groups
+        obs, action = x.split([4 * self.history_length, self.action_dim], dim=-1)
+        groups = obs.split(self.history_length, dim=-1)
+        parts = [mlp(g) for mlp, g in zip(self.sensor_mlps, groups)]
+        parts.append(self.action_mlp(action))
+        return self.fuse(torch.cat(parts, dim=-1))
+
+
+# =============================================================================
 # ACTOR NETWORK
 # =============================================================================
 
@@ -689,12 +770,20 @@ class TransformerActor(nn.Module):
             self.profile_proj = nn.Linear(2 * embed_dim, embed_dim)
 
 
-        # Observation encoder (shared across turbines)
-        self.obs_encoder = nn.Sequential(
-            nn.Linear(obs_dim_per_turbine, embed_dim),
-            nn.ReLU(),
-            nn.Linear(embed_dim, embed_dim),
-        )
+        # Observation encoder (shared across turbines). change_wd_4: "per_sensor"
+        # swaps in one small MLP per sensor group (see PerSensorObsEncoder);
+        # forward() is untouched because the input/output shapes are identical.
+        if getattr(args, "obs_encoder_mode", "shared") == "per_sensor":
+            self.obs_encoder = PerSensorObsEncoder(
+                obs_dim_per_turbine, embed_dim,
+                history_length=int(getattr(args, "history_length")),
+            )
+        else:
+            self.obs_encoder = nn.Sequential(
+                nn.Linear(obs_dim_per_turbine, embed_dim),
+                nn.ReLU(),
+                nn.Linear(embed_dim, embed_dim),
+            )
 
         # Input projection: only needed when concatenating position embedding
         if self.embedding_mode == "concat":
@@ -991,11 +1080,19 @@ class TransformerCritic(nn.Module):
 
 
         # Observation + action encoder (no DroQ here — applied only in q_head per Hiraoka et al.)
-        self.obs_action_encoder = nn.Sequential(
-            nn.Linear(obs_dim_per_turbine + action_dim_per_turbine, embed_dim),
-            nn.ReLU(),
-            nn.Linear(embed_dim, embed_dim),
-        )
+        # change_wd_4 "per_sensor": per-sensor MLPs + a dedicated action MLP
+        # (see PerSensorObsActionEncoder); same input/output shapes, forward untouched.
+        if getattr(args, "obs_encoder_mode", "shared") == "per_sensor":
+            self.obs_action_encoder = PerSensorObsActionEncoder(
+                obs_dim_per_turbine, action_dim_per_turbine, embed_dim,
+                history_length=int(getattr(args, "history_length")),
+            )
+        else:
+            self.obs_action_encoder = nn.Sequential(
+                nn.Linear(obs_dim_per_turbine + action_dim_per_turbine, embed_dim),
+                nn.ReLU(),
+                nn.Linear(embed_dim, embed_dim),
+            )
 
         # Input projection: only needed when concatenating position embedding
         if self.embedding_mode == "concat":

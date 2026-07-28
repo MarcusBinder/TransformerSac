@@ -445,9 +445,14 @@ def save_checkpoint(
     log_alpha: Optional[torch.Tensor] = None,
     alpha_optimizer: Optional[optim.Optimizer] = None,
     tqc_critic: Optional[nn.Module] = None,
+    obs_norm_state: Optional[Dict[str, torch.Tensor]] = None,
 ) -> str:
     """
     Save training checkpoint.
+
+    Args:
+        obs_norm_state: ObsRunningNorm.state_dict() (CPU tensors) when --obs_norm
+            is on; the weights are meaningless without the matching statistics.
 
     Returns:
         Path to saved checkpoint
@@ -475,6 +480,8 @@ def save_checkpoint(
         checkpoint["log_alpha"] = log_alpha.detach().cpu()
     if alpha_optimizer is not None:
         checkpoint["alpha_optimizer_state_dict"] = alpha_optimizer.state_dict()
+    if obs_norm_state is not None:
+        checkpoint["obs_norm_state"] = obs_norm_state
 
     torch.save(checkpoint, checkpoint_path)
     print(f"Checkpoint saved to {checkpoint_path}")
@@ -546,6 +553,7 @@ def load_checkpoint(
     alpha_optimizer: Optional[optim.Optimizer] = None,
     tqc_critic: Optional[nn.Module] = None,
     tqc_critic_target: Optional[nn.Module] = None,
+    obs_normalizer=None,
 ) -> int:
     """
     Load training checkpoint.
@@ -564,6 +572,7 @@ def load_checkpoint(
         alpha_optimizer: Optional entropy optimizer
         tqc_critic: TQC critic (None for SAC)
         tqc_critic_target: TQC target critic (None for SAC)
+        obs_normalizer: Optional ObsRunningNorm to restore (--obs_norm runs)
 
     Returns:
         Step number from checkpoint
@@ -588,6 +597,8 @@ def load_checkpoint(
         log_alpha.data = checkpoint["log_alpha"].to(device)
     if alpha_optimizer is not None and "alpha_optimizer_state_dict" in checkpoint:
         alpha_optimizer.load_state_dict(checkpoint["alpha_optimizer_state_dict"])
+    if obs_normalizer is not None and "obs_norm_state" in checkpoint:
+        obs_normalizer.load_state_dict(checkpoint["obs_norm_state"])
 
     print(f"Loaded checkpoint from {checkpoint_path} at step {checkpoint['step']}")
 

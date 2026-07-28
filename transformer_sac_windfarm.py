@@ -383,7 +383,22 @@ def main():
         "dt_env": args.dt_env,
         "yaw_step_sim": args.yaw_step,
     }
-    
+
+    # change_wd_4: override the env's hardcoded 0-30 m/s obs-affine range
+    # (OBS_SCALING.md). These are WindFarmEnv CTOR kwargs, deliberately NOT
+    # config-dict keys — None means "omit", so the env default stays untouched.
+    # The eval factories spread {**base_env_kwargs, ...} below, so train and
+    # eval envs get the same scaling automatically.
+    if args.ws_scaling_min is not None:
+        base_env_kwargs["ws_scaling_min"] = float(args.ws_scaling_min)
+    if args.ws_scaling_max is not None:
+        base_env_kwargs["ws_scaling_max"] = float(args.ws_scaling_max)
+    if args.ws_scaling_min is not None or args.ws_scaling_max is not None:
+        print(f"ws obs scaling override: "
+              f"[{base_env_kwargs.get('ws_scaling_min', 0.0)}, "
+              f"{base_env_kwargs.get('ws_scaling_max', 30.0)}] m/s")
+
+
     def make_env_factory(env_kwargs: dict):
         """Build a WindFarmEnv factory bound to one set of env kwargs."""
         def _factory(x_pos: np.ndarray, y_pos: np.ndarray) -> gym.Env:
@@ -462,6 +477,14 @@ def main():
         env = PerTurbineObservationWrapper(env)
         if args.use_wd_deviation:
             env = EnhancedPerTurbineWrapper(env, wd_scale_range=args.wd_scale_range)
+        # change_wd_4: re-encode the ws columns (rbf/pyramid/cdf/fourier/reldef/
+        # pcurve). Must sit INSIDE TransformReward so MultiLayoutEnv's
+        # outermost-first _obs_dim_per_turbine probe finds the expanded dim.
+        if args.obs_encoding:
+            from helpers.obs_encoding import ObsEncodingWrapper
+            env = ObsEncodingWrapper(env, mode=args.obs_encoding,
+                                     turbine=wind_turbine,
+                                     **json.loads(args.obs_encoding_kwargs))
         # v9.1: scale the (tiny) Wake_recovery reward to probe optimization signal-to-noise.
         if args.reward_scale != 1.0:
             _scale = float(args.reward_scale)
@@ -532,7 +555,18 @@ def main():
     print(f"Obs dim per turbine: {obs_dim_per_turbine}")
     print(f"Action dim per turbine: {action_dim_per_turbine}")
     print(f"Rotor diameter: {rotor_diameter:.1f} m")
-    
+
+    # change_wd_4: agent-side running obs normalization. Constructed from the
+    # WRAPPED obs dim so it composes with --obs_encoding; applied at act() time
+    # (via the agent's BatchPreparer) and on replay batches after rb.sample.
+    # See helpers/obs_norm.py for why this is not a per-env wrapper.
+    obs_normalizer = None
+    if args.obs_norm:
+        from helpers.obs_norm import ObsRunningNorm
+        obs_normalizer = ObsRunningNorm(obs_dim_per_turbine, device)
+        print(f"ObsRunningNorm enabled ({obs_dim_per_turbine} features, "
+              f"updates from step 0, clip ±{obs_normalizer.clip})")
+
 
     # Create policy evaluators — one per eval wd schedule. Every evaluator shares the
     # same eval_seed, so the schedules are compared on PAIRED episodes.
@@ -796,6 +830,9 @@ def main():
         use_wind_relative=args.use_wind_relative_pos,
         use_profiles=use_profiles,
         rotate_profiles=args.rotate_profiles,
+        # The evaluators share this agent, so eval act() calls are normalized
+        # with the same (live) statistics as training — eval envs never go cold.
+        obs_normalizer=obs_normalizer,
     )
 
     # Update evaluator with actor reference
@@ -984,7 +1021,17 @@ def main():
                     print(f"✓ Loaded alpha optimizer state")
             else:
                 print(f"✓ Reset entropy coefficient (alpha={float(alpha):.4f})")
-       
+
+        # === Obs normalizer statistics (change_wd_4, --obs_norm) ===
+        if obs_normalizer is not None:
+            if "obs_norm_state" in checkpoint:
+                obs_normalizer.load_state_dict(checkpoint["obs_norm_state"])
+                print(f"✓ Loaded obs normalizer statistics "
+                      f"(count={float(obs_normalizer.count):.0f})")
+            else:
+                print("WARNING: --obs_norm set but checkpoint has no "
+                      "obs_norm_state — statistics start cold.")
+
         # === Resume step logic ===
         ## REMOVED FOR SIMPLICITY
         # Only resume from checkpoint step if keeping ALL optimizer states
@@ -1234,6 +1281,7 @@ def main():
         actor, qf1, qf2, actor_optimizer, q_optimizer,
         0, run_name, args, log_alpha, alpha_optimizer,
         tqc_critic=tqc_critic,
+        obs_norm_state=obs_normalizer.state_dict() if obs_normalizer is not None else None,
     )
 
 
@@ -1366,6 +1414,15 @@ def main():
         if args.log_timing:
             timing["env"] += time.perf_counter() - _t0
 
+        # change_wd_4: fold the fresh observations into the running obs stats.
+        # Masked so 0.0-pad rows don't drag the means; runs from step 0 (the
+        # random-exploration warmup is already on-distribution).
+        if obs_normalizer is not None:
+            obs_normalizer.update(
+                torch.as_tensor(next_obs, dtype=torch.float32, device=device),
+                torch.as_tensor(current_masks, device=device),
+            )
+
 
         # Get current layout names for each env. Under domain randomization the pool
         # is huge, so bucket every training layout under "dr_pool" for debug stats.
@@ -1467,6 +1524,13 @@ def main():
                 data = rb.sample(args.batch_size)
                 if args.log_timing:
                     timing["sample"] += _sync_timer() - _t0
+
+                # change_wd_4: the buffer stores RAW obs; normalizing at the
+                # single sample point covers critic, actor and every diagnostic
+                # that reuses `data`, always with the freshest statistics.
+                if obs_normalizer is not None:
+                    data["observations"] = obs_normalizer.normalize(data["observations"])
+                    data["next_observations"] = obs_normalizer.normalize(data["next_observations"])
 
                 _t_critic = _sync_timer()
 
@@ -1892,6 +1956,7 @@ def main():
                 actor, qf1, qf2, actor_optimizer, q_optimizer,
                 global_step, run_name, args, log_alpha, alpha_optimizer,
                 tqc_critic=tqc_critic,
+                obs_norm_state=obs_normalizer.state_dict() if obs_normalizer is not None else None,
             )
             next_save_step += args.save_interval
 
@@ -1937,6 +2002,7 @@ def main():
             actor, qf1, qf2, actor_optimizer, q_optimizer,
             global_step, run_name, args, log_alpha, alpha_optimizer,
             tqc_critic=tqc_critic,
+            obs_norm_state=obs_normalizer.state_dict() if obs_normalizer is not None else None,
         )
 
     if args.save_buffer_final or args.buffer_save_interval > 0:
