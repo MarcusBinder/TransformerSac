@@ -144,11 +144,15 @@ class MultiLayoutEnv(gym.Env):
         )
         
         # Define padded action space (1 action per turbine for yaw)
-        # Get action bounds from the wrapped env
+        # Get action bounds from the wrapped env. PerTurbineObservationWrapper
+        # may expose either the inherited flat (n_turb,) space or (since the
+        # derating merge) a 2-D (n_turb, act_var) space; .flat[0] gives the
+        # scalar bound in both cases. The wrapper accepts flat variable-grouped
+        # actions either way, so this flat padded space stays valid.
         base_action_space = self._current_env.action_space
         self.action_space = spaces.Box(
-            low=base_action_space.low[0],
-            high=base_action_space.high[0],
+            low=float(np.asarray(base_action_space.low).flat[0]),
+            high=float(np.asarray(base_action_space.high).flat[0]),
             shape=(self.max_turbines,),
             dtype=np.float32
         )

@@ -21,6 +21,7 @@ Positional encoding options (--pos_encoding_type):
 Author: Marcus Binder Nilsen (DTU Wind Energy)
 """
 
+import atexit
 import inspect
 import os
 import random
@@ -413,7 +414,29 @@ def main():
             f"veer range set to: [{args.veer_min}, {args.veer_max}] deg/100m, "
             f"tilt set to: {args.tilt} deg"
         )
-    
+
+    if args.htc_path is not None:
+        # HAWC2 fine-tuning path. Fail fast here instead of inside the 15
+        # AsyncVectorEnv workers, where the same errors surface as opaque
+        # worker tracebacks.
+        if args.tilt != 0:
+            raise ValueError(
+                "--htc_path requires --tilt 0: WindGym only supports farm tilt "
+                "on PyWake turbines (the htc model carries its own physical tilt)."
+            )
+        if "hawc2_yaw_mode" not in inspect.signature(WindFarmEnv.__init__).parameters:
+            raise RuntimeError(
+                "--htc_path requires the HAWC2-enabled WindGym "
+                "(hawc2_yaw_mode kwarg missing — windgym predates the "
+                "yaw_command/hawc2_adapter merge)."
+            )
+        if not os.path.isfile(args.htc_path):
+            raise FileNotFoundError(f"--htc_path not found: {args.htc_path}")
+        print(
+            f"HAWC2 turbines enabled: htc={args.htc_path}, "
+            f"yaw sensor mode={args.hawc2_yaw_mode}, slot={args.hawc2_yaw_slot}"
+        )
+
     mes_prefixes = {
         "ws_mes": "ws",
         "wd_mes": "wd",
@@ -446,7 +469,13 @@ def main():
         "ti_scaling_min": args.ti_scaling_min,
         "ti_scaling_max": args.ti_scaling_max,
     }
-    
+    if args.htc_path is not None:
+        # Only added when set so PyWake sweeps stay byte-identical (an older
+        # windgym without these kwargs would otherwise TypeError on every run).
+        base_env_kwargs["HTC_path"] = os.path.abspath(args.htc_path)
+        base_env_kwargs["hawc2_yaw_mode"] = args.hawc2_yaw_mode
+        base_env_kwargs["hawc2_yaw_slot"] = args.hawc2_yaw_slot
+
     def env_factory(x_pos: np.ndarray, y_pos: np.ndarray) -> gym.Env:
         """Create a base WindFarmEnv with given positions."""
         env = WindFarmEnv(x_pos=x_pos,
@@ -554,11 +583,20 @@ def main():
 
     # Create vectorized environments
     print(f"Creating {args.num_envs} parallel environment(s)...")
+    # HAWC2 envs spawn one MultiH2Lib subprocess per turbine inside each worker.
+    # Daemonic workers cannot have children ("daemonic processes are not allowed
+    # to have children"), so run them non-daemonic when --htc_path is set.
     envs = gym.vector.AsyncVectorEnv(
         [make_env_fn(args.seed + i, warmup_lengths[i]) for i in range(args.num_envs)],
         autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,
+        daemon=(args.htc_path is None),
     )
     envs = RecordEpisodeVals(envs)
+    # Non-daemonic workers won't auto-die with the parent, so make sure they
+    # (and their HAWC2 atexit handlers) are joined on normal exit and on
+    # unhandled errors. close() is idempotent, so the explicit call at the end
+    # of main() stays correct.
+    atexit.register(envs.close)
        
 
     n_turbines_max = envs.env.get_attr('max_turbines')[0]

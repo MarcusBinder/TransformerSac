@@ -72,6 +72,19 @@ class Args:
     # upward in DWM). Overrides the env config's farm tilt.
     tilt: float = 0.0
 
+    # === HAWC2 turbines (fine-tuning on the LEShawc2files model) ===
+    # Path to a HAWC2 htc file; None = PyWake turbines (all behaviour unchanged).
+    # Requires --tilt 0 (the htc model carries its own physical tilt) and an
+    # HAWC2-enabled windgym (yaw_command + hawc2_yaw_mode support).
+    htc_path: Optional[str] = None
+    # Yaw sensor wiring, must match the htc's servo DLL. "yaw_tilt" is the
+    # combination validated for LEShawc2files/htc/input_hawc_yaw_actuator_tipcorr.htc
+    # (getter wt.yaw_tilt()[0], setter general-variable slot 4, positive sign);
+    # "bearing2_slot" is windgym's legacy wiring (bearing2 getter, slot 1) for
+    # the DTU10MW/IEA22MW_yaw htc files.
+    hawc2_yaw_mode: str = "yaw_tilt"
+    hawc2_yaw_slot: int = 4
+
     # === Evaluation Settings ===
     eval_interval: int = 50000        # How often to evaluate (in env steps)
     eval_initial: bool = False        # Run evaluation before training starts
