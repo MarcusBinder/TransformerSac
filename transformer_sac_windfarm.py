@@ -25,6 +25,7 @@ import atexit
 import inspect
 import os
 import random
+import signal
 import time
 from typing import Optional, Tuple, List, Dict, Any, Union
 from collections import deque, defaultdict
@@ -996,16 +997,28 @@ def main():
                 f"Use --algorithm=tqc to resume this checkpoint."
             )
 
-        # Load network weights
+        # Load network weights. Target networks are restored from their own
+        # state dicts when present (checkpoints written by the current code);
+        # older checkpoints lack them, so fall back to copying the online
+        # weights (loses the Polyak lag — fine for fine-tuning).
         actor.load_state_dict(checkpoint["actor_state_dict"])
         if args.algorithm == "tqc":
             tqc_critic.load_state_dict(checkpoint["tqc_critic_state_dict"])
-            tqc_critic_target.load_state_dict(checkpoint["tqc_critic_state_dict"])
+            if "tqc_critic_target_state_dict" in checkpoint:
+                tqc_critic_target.load_state_dict(checkpoint["tqc_critic_target_state_dict"])
+                print("✓ Loaded target critic state (Polyak lag preserved)")
+            else:
+                tqc_critic_target.load_state_dict(checkpoint["tqc_critic_state_dict"])
         else:
             qf1.load_state_dict(checkpoint["qf1_state_dict"])
             qf2.load_state_dict(checkpoint["qf2_state_dict"])
-            qf1_target.load_state_dict(checkpoint["qf1_state_dict"])
-            qf2_target.load_state_dict(checkpoint["qf2_state_dict"])
+            if "qf1_target_state_dict" in checkpoint:
+                qf1_target.load_state_dict(checkpoint["qf1_target_state_dict"])
+                qf2_target.load_state_dict(checkpoint["qf2_target_state_dict"])
+                print("✓ Loaded target critic states (Polyak lag preserved)")
+            else:
+                qf1_target.load_state_dict(checkpoint["qf1_state_dict"])
+                qf2_target.load_state_dict(checkpoint["qf2_state_dict"])
         
         print(f"✓ Loaded network weights from step {checkpoint['step']}")
         
@@ -1037,15 +1050,9 @@ def main():
                 print(f"✓ Reset entropy coefficient (alpha={float(alpha):.4f})")
        
         # === Resume step logic ===
-        ## REMOVED FOR SIMPLICITY
-        # Only resume from checkpoint step if keeping ALL optimizer states
-        # if (not args.finetune_reset_actor_optimizer and 
-        #     not args.finetune_reset_critic_optimizer and
-        #     not args.finetune_reset_alpha):
-        #     start_step = checkpoint["step"]
-        #     print(f"✓ Resuming from step {start_step}")
-        # else:
-        #     print(f"✓ Starting from step 0 (fine-tuning mode)")
+        if args.resume_step_counter:
+            start_step = checkpoint["step"]
+            print(f"✓ Resuming step counter at {start_step} (total_timesteps is absolute)")
 
         # === Diagnostic: Check effective learning rates ===
         print(f"\n--- Optimizer State Diagnostics ---")
@@ -1302,8 +1309,10 @@ def main():
 
     save_checkpoint(
         actor, qf1, qf2, actor_optimizer, q_optimizer,
-        0, run_name, args, log_alpha, alpha_optimizer,
+        start_step, run_name, args, log_alpha, alpha_optimizer,
         tqc_critic=tqc_critic,
+        tqc_critic_target=tqc_critic_target,
+        qf1_target=qf1_target, qf2_target=qf2_target,
     )
 
 
@@ -1354,8 +1363,11 @@ def main():
         print(f"AMP enabled: bfloat16 autocast on {device.type}")
         print("  NOTE: on Sophia (Quadro RTX 4000 / Turing) the --amp flag is "
               "strictly slower -- Turing has no bf16 tensor cores. Disable it here.")
-    # Reset environments
-    obs, infos = envs.reset(seed=args.seed)
+    # Reset environments. Offsetting the seed by start_step keeps resets
+    # deterministic but distinct per continuation chunk — otherwise every
+    # resumed job would replay the same wind/DR episode sequence from scratch.
+    # Unchanged when start_step == 0.
+    obs, infos = envs.reset(seed=args.seed + start_step)
     
     # Tracking
     step_reward_window = deque(maxlen=1000)
@@ -1386,7 +1398,21 @@ def main():
     if start_step > 0:
         print(f"Resuming from step {start_step}, {remaining_timesteps} timesteps remaining")
         print(f"Will run {num_updates} more updates")
-    
+
+    # Graceful shutdown: SLURM (or a manual kill -TERM) requests a stop; we
+    # only set a flag here — never save from inside a signal handler, which
+    # can fire mid-backward. The loop breaks after the current iteration and
+    # the FINAL SAVE block writes a checkpoint + buffer at the same step.
+    stop_requested = False
+
+    def _request_stop(signum, frame):
+        nonlocal stop_requested
+        stop_requested = True
+        print(f"[signal] Received {signal.Signals(signum).name}; will save and exit "
+              f"after this iteration.", flush=True)
+
+    signal.signal(signal.SIGTERM, _request_stop)
+
     for update in range(num_updates + 2):
         global_step += args.num_envs
         
@@ -2032,6 +2058,8 @@ def main():
                 actor, qf1, qf2, actor_optimizer, q_optimizer,
                 global_step, run_name, args, log_alpha, alpha_optimizer,
                 tqc_critic=tqc_critic,
+                tqc_critic_target=tqc_critic_target,
+                qf1_target=qf1_target, qf2_target=qf2_target,
             )
             next_save_step += args.save_interval
 
@@ -2067,17 +2095,26 @@ def main():
                     print(f"    {layout}: {ratio:.4f}")
             
             next_eval_step += args.eval_interval
-        
+
+        # Graceful shutdown (SIGTERM): fall through to the FINAL SAVE block,
+        # which writes a checkpoint + buffer pair at this global_step and
+        # closes the envs (reaping the HAWC2 subprocesses).
+        if stop_requested:
+            print(f"[signal] Stopping at step {global_step} for graceful save.")
+            break
+
     # =========================================================================
-    
+
     # FINAL SAVE AND CLEANUP
     # =========================================================================
-    
+
     if args.save_model:
         save_checkpoint(
             actor, qf1, qf2, actor_optimizer, q_optimizer,
             global_step, run_name, args, log_alpha, alpha_optimizer,
             tqc_critic=tqc_critic,
+            tqc_critic_target=tqc_critic_target,
+            qf1_target=qf1_target, qf2_target=qf2_target,
         )
 
     if args.save_buffer_final or args.buffer_save_interval > 0:

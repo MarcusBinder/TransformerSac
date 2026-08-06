@@ -445,9 +445,16 @@ def save_checkpoint(
     log_alpha: Optional[torch.Tensor] = None,
     alpha_optimizer: Optional[optim.Optimizer] = None,
     tqc_critic: Optional[nn.Module] = None,
+    tqc_critic_target: Optional[nn.Module] = None,
+    qf1_target: Optional[nn.Module] = None,
+    qf2_target: Optional[nn.Module] = None,
 ) -> str:
     """
     Save training checkpoint.
+
+    Target networks are optional so old call sites keep working; when given,
+    they are stored under *_target_state_dict keys so a resumed run keeps the
+    Polyak lag instead of hard-copying online -> target.
 
     Returns:
         Path to saved checkpoint
@@ -467,9 +474,15 @@ def save_checkpoint(
 
     if tqc_critic is not None:
         checkpoint["tqc_critic_state_dict"] = tqc_critic.state_dict()
+        if tqc_critic_target is not None:
+            checkpoint["tqc_critic_target_state_dict"] = tqc_critic_target.state_dict()
     else:
         checkpoint["qf1_state_dict"] = qf1.state_dict()
         checkpoint["qf2_state_dict"] = qf2.state_dict()
+        if qf1_target is not None:
+            checkpoint["qf1_target_state_dict"] = qf1_target.state_dict()
+        if qf2_target is not None:
+            checkpoint["qf2_target_state_dict"] = qf2_target.state_dict()
 
     if log_alpha is not None:
         checkpoint["log_alpha"] = log_alpha.detach().cpu()

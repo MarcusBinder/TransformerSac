@@ -222,6 +222,9 @@ class Args:
     finetune_reset_actor_optimizer: int = 0     # If True, reset optimizers for fresh fine-tuning. If False, resume optimizer states too.
     finetune_reset_critic_optimizer: int = 0    # If True, reset optimizers for fresh fine-tuning. If False, resume optimizer states too.
     finetune_reset_alpha: int = 0               # If True, reset entropy coefficient. If False, keep from checkpoint.
+    resume_step_counter: int = 0  # If 1, restore global step from checkpoint["step"] on resume
+                                  # (total_timesteps then counts as ABSOLUTE, not additional).
+                                  # Use for continuing an interrupted run; leave 0 for fine-tuning.
 
     # === Initial Exploration Mode ===
     initial_exploration: str = "random"  # "random" = sample from action space, "policy" = use actor network (useful when resuming from checkpoint)
