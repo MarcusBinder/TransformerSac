@@ -55,7 +55,12 @@ class Args:
     # === Environment Settings ===
     backend: str = "dynamiks"  # Flow solver backend: "dynamiks" (default) or "pywake" (steady-state)
     turbtype: str = "IEA22"  # Wind turbine type
-    TI_type: str = "Random"   # Turbulence intensity sampling
+    TI_type: str = "Random"   # Turbulence sampling: MannLoad|MannGenerate|MannFixed|Random|None|Precursor
+    # Precursor .nc (with a unique converted sidecar next to it) or the sidecar
+    # .npy/.meta.npz path. Required when TI_type == "Precursor"; the one-time
+    # conversion (python -m dynamiks.sites.precursor convert ...) must have run
+    # already -- training never converts.
+    precursor_path: Optional[str] = None
     dt_sim: int = 5           # Simulation timestep (seconds)
     dt_env: int = 10          # Environment timestep (seconds)
     yaw_step: float = 5.0     # Max yaw change per sim step (degrees)

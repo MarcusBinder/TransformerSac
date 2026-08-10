@@ -451,10 +451,24 @@ def main():
         config[mes_type][f"{prefix}_window_length"] = args.window_length
 
     
+    if args.TI_type == "Precursor":
+        # Fail fast on the main process: every AsyncVectorEnv worker would
+        # otherwise raise the same error (or, worse, 30 workers would race to
+        # convert 37 GB). load_sidecar only opens the memmap lazily -- cheap.
+        if not args.precursor_path:
+            raise ValueError("--TI_type Precursor requires --precursor_path")
+        from dynamiks.sites.precursor import load_sidecar
+        _, _precursor_meta = load_sidecar(args.precursor_path)
+        print(f"[Precursor] {args.precursor_path}: "
+              f"U={float(_precursor_meta['advection_speed']):.2f} m/s, "
+              f"ti_hub={float(_precursor_meta['ti_hub']):.4f}, "
+              f"t_data={float(_precursor_meta['t_data_s']):.0f} s")
+
     base_env_kwargs = {
         "turbine": wind_turbine,
         "n_passthrough": args.max_eps,
-        "TurbBox": "./boxes/",  # Adjust path as needed
+        "TurbBox": (args.precursor_path if args.TI_type == "Precursor"
+                    else "./boxes/"),
         "config": config,
         "turbtype": args.TI_type,
         "backend": args.backend,
@@ -470,6 +484,14 @@ def main():
         "ti_scaling_min": args.ti_scaling_min,
         "ti_scaling_max": args.ti_scaling_max,
     }
+    if args.TI_type == "Precursor" and args.max_episode_steps is not None:
+        # Episode truncation normally lives in MultiLayoutEnv (step counting),
+        # so the inner WindFarmEnv keeps its passthrough-derived time_max
+        # (~8600 s) — which the Precursor branch would count against the box's
+        # ~5100 s of data and refuse. Forward the real episode length so the
+        # env's random-window budget matches what actually gets simulated.
+        base_env_kwargs["max_time_steps"] = int(args.max_episode_steps)
+
     if args.htc_path is not None:
         # Only added when set so PyWake sweeps stay byte-identical (an older
         # windgym without these kwargs would otherwise TypeError on every run).

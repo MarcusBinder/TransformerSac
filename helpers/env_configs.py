@@ -261,6 +261,23 @@ _deep_update(_les_curyaw_wr_wide, {"wind": {"wd_min": 260, "wd_max": 280}})
 ENV_CONFIGS["LES_curyaw_wr_wide"] = _les_curyaw_wr_wide
 
 
+# LESprecursor: current-yaw presets for LES-precursor training (--TI_type
+# Precursor). The wind values here are nominal placeholders only: WindFarmEnv
+# re-pins ws/wd/ti from the precursor sidecar metadata at every reset
+# (advection speed / 270 deg / measured hub TI), and veer must stay 0 (the
+# LES box carries the real shear/veer).
+_les_precursor_wind = {"ws_min": 9.19, "ws_max": 9.19,
+                       "wd_min": 270, "wd_max": 270,
+                       "TI_min": 0.038, "TI_max": 0.038}
+_les_precursor = deepcopy(_les_curyaw)
+_deep_update(_les_precursor, {"wind": dict(_les_precursor_wind)})
+ENV_CONFIGS["LES_precursor"] = _les_precursor              # Baseline reward
+
+_les_precursor_wr = deepcopy(_les_curyaw_wr)
+_deep_update(_les_precursor_wr, {"wind": dict(_les_precursor_wind)})
+ENV_CONFIGS["LES_precursor_wr"] = _les_precursor_wr        # Wake_recovery reward
+
+
 def make_env_config(name: str = "default") -> Dict[str, Any]:
     """Build an env config by name. Applies overrides on top of the base config."""
     if name not in ENV_CONFIGS:
