@@ -99,6 +99,8 @@ def build_delmax_env(
     args: dict,
     *,
     layout_name: str | None = None,
+    layout_positions: tuple | None = None,
+    layout_label: str | None = None,
     seed: int = 0,
     limit_mode: str = "train",
     fixed_limit: float | None = None,
@@ -111,6 +113,12 @@ def build_delmax_env(
         args: back-filled checkpoint args (from load_checkpoint).
         layout_name: layout to build; defaults to the checkpoint's first
             training layout. Must resolve via helpers.layouts.
+        layout_positions: optional explicit (x_pos, y_pos) arrays; bypasses
+            the named-layout lookup entirely. Needed for DR checkpoints whose
+            saved args["layouts"] is the pre-pool placeholder, not the
+            procedurally generated training pool.
+        layout_label: display name for layout_positions (defaults to
+            "custom"); ignored when layout_positions is None.
         seed: seeds the base env's action space + MultiLayoutEnv RNGs.
         limit_mode: "train" reproduces training limit behavior (randlim:
             U[lo,hi] per episode; plain delmax: fixed allowed_increase).
@@ -166,9 +174,15 @@ def build_delmax_env(
             lo_key, hi_key = wind_map[key]
             config["wind"][lo_key] = config["wind"][hi_key] = float(val)
 
-    if layout_name is None:
-        layout_name = str(args["layouts"]).split(",")[0].strip()
-    x_pos, y_pos = get_layout_positions(layout_name, wt)
+    if layout_positions is not None:
+        if layout_name is not None:
+            raise ValueError("Pass layout_name or layout_positions, not both")
+        x_pos, y_pos = (np.asarray(p, dtype=float) for p in layout_positions)
+        layout_name = layout_label or "custom"
+    else:
+        if layout_name is None:
+            layout_name = str(args["layouts"]).split(",")[0].strip()
+        x_pos, y_pos = get_layout_positions(layout_name, wt)
 
     if turbbox_path is None:
         turbbox_path = _default_turbbox()
