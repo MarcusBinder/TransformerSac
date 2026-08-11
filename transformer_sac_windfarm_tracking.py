@@ -228,13 +228,16 @@ def main():
     if _adam_fused:
         print("Optimizers: fused Adam enabled (CUDA)")
 
-    # Force math SDPA backend (avoids ROCm Flash/MemEfficient kernel bugs)
-    # ONLY RELEVANT FOR LUMI. TODO make it such this only works on lumi
-    # if device.type == "cuda":
-    #     torch.backends.cuda.enable_flash_sdp(False)
-    #     torch.backends.cuda.enable_mem_efficient_sdp(False)
-    #     torch.backends.cuda.enable_math_sdp(True)
-    #     print("Forced math SDPA backend")
+    # Force the math SDPA backend on ROCm, which has Flash/MemEfficient kernel
+    # bugs for our attention shapes. torch.version.hip is a version string on
+    # ROCm builds and None on CUDA builds, so this self-activates on LUMI's
+    # MI250X and stays dormant on Sophia -- no hostname sniffing, and nothing
+    # changes for existing CUDA runs.
+    if device.type == "cuda" and torch.version.hip is not None:
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+        print(f"ROCm detected (HIP {torch.version.hip}): forced math SDPA backend")
 
     # =========================================================================
     # ENVIRONMENT SETUP

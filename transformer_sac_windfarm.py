@@ -201,13 +201,16 @@ def main():
     if _adam_fused:
         print("Optimizers: fused Adam enabled (CUDA)")
 
-    # Force math SDPA backend (avoids ROCm Flash/MemEfficient kernel bugs)
-    # ONLY RELEVANT FOR LUMI. TODO make it such this only works on lumi
-    # if device.type == "cuda":
-    #     torch.backends.cuda.enable_flash_sdp(False)
-    #     torch.backends.cuda.enable_mem_efficient_sdp(False)
-    #     torch.backends.cuda.enable_math_sdp(True)
-    #     print("Forced math SDPA backend")
+    # Force the math SDPA backend on ROCm, which has Flash/MemEfficient kernel
+    # bugs for our attention shapes. torch.version.hip is a version string on
+    # ROCm builds and None on CUDA builds, so this self-activates on LUMI's
+    # MI250X and stays dormant on Sophia -- no hostname sniffing, and nothing
+    # changes for existing CUDA runs.
+    if device.type == "cuda" and torch.version.hip is not None:
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+        print(f"ROCm detected (HIP {torch.version.hip}): forced math SDPA backend")
 
     # =========================================================================
     # ENVIRONMENT SETUP
@@ -559,6 +562,24 @@ def main():
     print(f"Obs dim per turbine: {obs_dim_per_turbine}")
     print(f"Action dim per turbine: {action_dim_per_turbine}")
     print(f"Rotor diameter: {rotor_diameter:.1f} m")
+
+    # Which column of a per-turbine action row is yaw and which is derate, for
+    # the actions/* diagnostics. PerTurbineObservationWrapper emits ONE ROW PER
+    # TURBINE -- [yaw_i, derate_i] with both enabled, or the single enabled
+    # channel -- and transposes to the base env's variable-grouped
+    # [yaw_0..yaw_n | derate_0..derate_n] layout internally. So the column index
+    # here is NOT the base env's block offset; mixing the two up would silently
+    # mislabel yaw as derate.
+    _env_flags = make_env_config(args.config)
+    _yaw_on = bool(_env_flags.get("yaw_action", True))
+    _derate_on = bool(_env_flags.get("derate_action", False))
+    if action_dim_per_turbine >= 2:
+        _act_cols = {"yaw": 0, "derate": 1}
+    elif _derate_on and not _yaw_on:
+        _act_cols = {"derate": 0}
+    else:
+        _act_cols = {"yaw": 0}
+    print(f"Action columns (for actions/* logging): {_act_cols}")
     
 
     # Create policy evaluator
@@ -638,6 +659,17 @@ def main():
             monitor_gym=True,
             save_code=True,
         )
+
+        # Everything reaches W&B through sync_tensorboard, so the TB tag is the
+        # W&B key and the TB step arrives as "global_step". Declaring the groups
+        # explicitly makes each one chart against global_step instead of
+        # W&B's own monotonically-increasing _step, which otherwise spreads
+        # metrics logged at different frequencies (per-iteration perf/* vs
+        # per-episode del/*) across mismatched x-axes.
+        wandb.define_metric("global_step")
+        for _group in ("perf/*", "actions/*", "del/*", "losses/*",
+                       "charts/*", "entropy/*", "timing/*"):
+            wandb.define_metric(_group, step_metric="global_step")
 
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
@@ -1289,6 +1321,156 @@ def main():
     # burst (--async_overlap). hidden time = env_span - env.
     timing = {"env": 0.0, "env_span": 0.0, "sample": 0.0, "critic": 0.0, "actor": 0.0}
 
+    # -------------------------------------------------------------------------
+    # perf/* : cheap, always-on resource accounting.
+    #
+    # On a cluster billed by GPU-hour the question that matters is whether the
+    # GPU sits idle while the DWM env workers churn -- which is what sets both
+    # the wall clock and the right --cpus-per-task. torch's own counters cover
+    # the GPU; for CPU and memory we read the job's cgroup rather than this
+    # process, because the AsyncVectorEnv workers are separate processes and
+    # os.times()/RSS of the parent would miss all of their work.
+    #
+    # Preferred source is the job's cgroup, but /sys/fs/cgroup is NOT populated
+    # inside LUMI's Singularity container (measured: cpu.stat and
+    # memory.current are both absent), so fall back to walking /proc and
+    # summing over our PROCESS GROUP -- multiprocessing does not setpgrp, so
+    # the AsyncVectorEnv workers share our pgrp and are counted. Everything is
+    # best-effort: if both sources fail the metric is simply not logged.
+    _CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+
+    def _proc_stat_fields(pid="self"):
+        """Fields 3.. of /proc/<pid>/stat, 0-indexed so field N is at N-3.
+
+        Splits on the LAST ')': the comm field is parenthesised and may itself
+        contain spaces and parentheses (e.g. "(python3.12 (deleted))"), which
+        would misalign a naive .split().
+        """
+        with open(f"/proc/{pid}/stat") as fh:
+            return fh.read().rsplit(")", 1)[1].split()
+
+    def _read_cgroup_cpu_usec():
+        try:
+            with open("/sys/fs/cgroup/cpu.stat") as fh:
+                for line in fh:
+                    if line.startswith("usage_usec"):
+                        return int(line.split()[1])
+        except (OSError, ValueError, IndexError):
+            pass
+        # Fallback: utime+stime (fields 14,15) over our process group (field 5).
+        try:
+            pgrp = _proc_stat_fields()[2]
+        except (OSError, IndexError):
+            return None
+        ticks = 0
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                f = _proc_stat_fields(entry)
+                if f[2] != pgrp:
+                    continue
+                ticks += int(f[11]) + int(f[12])
+            except (OSError, IndexError, ValueError):
+                continue          # process exited mid-scan, or unreadable
+        return int(ticks / _CLK_TCK * 1e6)
+
+    def _read_cgroup_mem_bytes():
+        out = {}
+        for key, path in (("cur", "/sys/fs/cgroup/memory.current"),
+                          ("peak", "/sys/fs/cgroup/memory.peak")):
+            try:
+                with open(path) as fh:
+                    out[key] = int(fh.read().strip())
+            except (OSError, ValueError):
+                pass
+        if "cur" not in out:
+            # Fallback: summed RSS (field 24) over the process group. Shared
+            # pages are counted once per process, so this OVERSTATES real usage
+            # -- it is a trend line for --mem sizing, not an accounting figure.
+            try:
+                pgrp = _proc_stat_fields()[2]
+            except (OSError, IndexError):
+                return out
+            pages = 0
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                try:
+                    f = _proc_stat_fields(entry)
+                    if f[2] != pgrp:
+                        continue
+                    pages += int(f[21])
+                except (OSError, IndexError, ValueError):
+                    continue
+            out["rss_sum"] = pages * os.sysconf("SC_PAGE_SIZE")
+        return out
+
+    # Number of CPUs this job may actually use, so cpu_util is a percentage of
+    # the allocation rather than of the whole 128-core node.
+    try:
+        _n_cpu_alloc = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        _n_cpu_alloc = os.cpu_count() or 1
+
+    _perf_prev = {"t": time.time(), "cpu_usec": _read_cgroup_cpu_usec(),
+                  "step": global_step}
+
+    # Always-on env-vs-update wall-clock split, in HOST time with NO cuda sync.
+    #
+    # timing/* already reports a sync-accurate breakdown, but it costs a
+    # torch.cuda.synchronize() per bucket per gradient step, which is why it
+    # sits behind --log_timing -- and the production run scripts do not pass
+    # that flag. These two counters are four perf_counter() calls per iteration,
+    # so they can stay on always, and for this launch-bound update loop host
+    # time is the number that actually answers "is the GPU waiting on 30 DWM
+    # env workers?". Use --log_timing when you need GPU-inclusive attribution.
+    _perf_split = {"env": 0.0, "update": 0.0}
+
+    # -------------------------------------------------------------------------
+    # actions/* : exact mean/std/saturation per channel over each logging window.
+    #
+    # Running sums (not a deque of raw arrays) so the window statistics are
+    # exact rather than an average-of-per-step-averages, and so memory does not
+    # scale with num_envs * n_turbines.
+    #
+    # Actions live in the normalized [-1, 1] space of the wrapper's Box. Under
+    # the "yaw"/"step" action methods that value IS the fraction of the per-step
+    # slew budget, so |a| ~ 1 means the turbine is moving at its rate limit --
+    # a persistently high sat_frac says the slew limit, not the policy, is what
+    # is shaping behaviour.
+    _act_acc = {f"{ch}_{stat}": 0.0
+                for ch in _act_cols for stat in ("sum", "sq", "sat")}
+    _act_acc["n"] = 0.0
+
+    def _accumulate_actions(act, masks):
+        """Fold one step's actions into _act_acc. Cheap: ~num_envs*n_turb floats."""
+        a = np.asarray(act, dtype=np.float64)
+        if a.ndim == 2:                       # (num_envs, n_turb) -> single channel
+            a = a[..., None]
+        if a.ndim != 3:
+            return
+        # masks mark PADDED turbines (True = padding), matching the convention
+        # in the actor/critic (n_real = (~attention_mask).sum()). Excluding them
+        # keeps padded slots from dragging every statistic toward zero.
+        keep = None
+        if masks is not None:
+            m = np.asarray(masks)
+            if m.shape == a.shape[:2]:
+                keep = ~m.astype(bool)
+        for ch, col in _act_cols.items():
+            if col >= a.shape[2]:
+                continue
+            v = a[:, :, col]
+            v = v[keep] if keep is not None else v.reshape(-1)
+            if v.size == 0:
+                continue
+            _act_acc[f"{ch}_sum"] += float(v.sum())
+            _act_acc[f"{ch}_sq"] += float(np.square(v).sum())
+            _act_acc[f"{ch}_sat"] += float((np.abs(v) >= 0.99).sum())
+            if ch == next(iter(_act_cols)):
+                _act_acc["n"] += float(v.size)
+
     def _sync_timer():
         """Return perf_counter, syncing CUDA first so GPU work is included."""
         if args.log_timing and device.type == "cuda":
@@ -1343,6 +1525,13 @@ def main():
         _del_reward_channels = [
             _del_tset.canonical_channel(c) for c in _del_reward_channels
         ]
+
+    # del/*: per-channel load ratios. charts/del_agent_max collapses every
+    # channel into a single worst-case number, which tells you a limit is being
+    # approached but not WHICH load is doing it -- so the load story is
+    # unreadable from the charts alone. Keyed by channel name, created lazily
+    # from whatever info["del_ratio_by_channel"] actually reports.
+    del_channel_windows = {}
     # next_save_step = ((start_step // args.save_interval) + 1) * args.save_interval  # Account for resumed step
     next_save_step = start_step + args.save_interval
     # Replay buffer saving
@@ -1352,8 +1541,15 @@ def main():
     # logging drain. Avoids a per-grad-step .item() sync that would serialize this
     # launch-bound update loop. Counts track how many updates contributed each metric.
     _qf_keys = ['qf_loss'] if args.algorithm == "tqc" else ['qf1_loss', 'qf2_loss']
+    # q_mean / td_* / *_gnorm / target_entropy feed the losses/* panel. They are
+    # accumulated on-GPU like the rest and materialized once per logging window,
+    # so they cost no extra host syncs in the launch-bound update loop.
+    # td_abs/td_sq are SAC-only: TQC regresses a quantile distribution, so there
+    # is no single scalar TD error to spread.
     _acc_keys = _qf_keys + ['actor_loss', 'alpha_loss',
-                            'logpi_per_turbine', 'ent_term', 'q_term', 'n_real_mean']
+                            'logpi_per_turbine', 'ent_term', 'q_term', 'n_real_mean',
+                            'q_mean', 'td_abs', 'td_sq',
+                            'critic_gnorm', 'actor_gnorm', 'target_entropy']
 
     def _zero_losses():
         return {k: torch.zeros((), device=device) for k in _acc_keys}
@@ -1422,7 +1618,12 @@ def main():
         else:
             with torch.no_grad():
                 actions = agent.act(envs, obs, **act_state)
-        
+
+        # actions/* accounting. Before step_async, but it touches no env IPC --
+        # current_masks was prefetched above -- so it is safe under
+        # --async_overlap.
+        _accumulate_actions(actions, current_masks)
+
         # Step environment. The step is always dispatched async; the flag only
         # picks the blocking point. --async_overlap collects the result AFTER
         # the gradient burst (env workers simulate while the GPU trains);
@@ -1433,7 +1634,9 @@ def main():
         step_result = None
         if not args.async_overlap:
             _t0 = _sync_timer()
+            _t_env0 = time.perf_counter()
             step_result = envs.step_wait()
+            _perf_split["env"] += time.perf_counter() - _t_env0
             if args.log_timing:
                 _t_now = time.perf_counter()
                 timing["env"] += _t_now - _t0
@@ -1453,6 +1656,7 @@ def main():
         # worst the first burst happens one iteration later.
 
         if global_step > args.learning_starts and len(rb) >= args.batch_size:
+            _t_upd0 = time.perf_counter()
 
             # Calculate number of gradient updates for this iteration
             # This scales with num_envs to maintain consistent sample efficiency
@@ -1529,11 +1733,20 @@ def main():
 
                     q_optimizer.zero_grad(set_to_none=True)
                     qf_loss.backward()
-                    if args.grad_clip:
-                        torch.nn.utils.clip_grad_norm_(
-                            tqc_critic.parameters(),
-                            max_norm=args.grad_clip_max_norm,
-                        )
+                    # max_norm=inf makes this a pure measurement when clipping
+                    # is off (the clip coefficient is clamped to 1.0), so
+                    # losses/critic_grad_norm is populated on this branch too
+                    # rather than silently logging 0.
+                    _critic_gnorm = torch.nn.utils.clip_grad_norm_(
+                        tqc_critic.parameters(),
+                        max_norm=args.grad_clip_max_norm if args.grad_clip else float("inf"),
+                    )
+                    loss_accumulator['critic_gnorm'] += _critic_gnorm.detach()
+                    # Q level for TQC: mean over the predicted quantiles. No
+                    # td_* here -- quantile regression has no single scalar TD
+                    # error to take a spread of.
+                    with torch.no_grad():
+                        loss_accumulator['q_mean'] += current_q.detach().float().mean()
                     q_optimizer.step()
 
                     if debug_logger.should_log_gradients(total_gradient_steps):
@@ -1607,11 +1820,15 @@ def main():
 
                     q_optimizer.zero_grad(set_to_none=True)
                     qf_loss.backward()
-                    if args.grad_clip:
-                        torch.nn.utils.clip_grad_norm_(
-                            qf1_params + qf2_params + shared_encoder_params,
-                            max_norm=args.grad_clip_max_norm,
-                        )
+                    # clip_grad_norm_ RETURNS the pre-clip total norm, so this
+                    # is free when clipping is on; with max_norm=inf the clip
+                    # coefficient is clamped to 1.0, making it a pure
+                    # measurement. A rising critic grad norm alongside a rising
+                    # qf_loss is divergence rather than a hard task.
+                    _critic_gnorm = torch.nn.utils.clip_grad_norm_(
+                        qf1_params + qf2_params + shared_encoder_params,
+                        max_norm=args.grad_clip_max_norm if args.grad_clip else float("inf"),
+                    )
                     q_optimizer.step()
 
                     if debug_logger.should_log_gradients(total_gradient_steps):
@@ -1619,6 +1836,15 @@ def main():
 
                     loss_accumulator['qf1_loss'] += qf1_loss.detach()
                     loss_accumulator['qf2_loss'] += qf2_loss.detach()
+                    loss_accumulator['critic_gnorm'] += _critic_gnorm.detach()
+                    with torch.no_grad():
+                        # Q level and TD-error spread. A td_std that grows while
+                        # td_abs stays flat means a few transitions dominate the
+                        # loss -- the usual precursor to Q-value blow-up.
+                        _td = (qf1_value.detach().float() - target_q.float())
+                        loss_accumulator['q_mean'] += qf1_value.detach().float().mean()
+                        loss_accumulator['td_abs'] += _td.abs().mean()
+                        loss_accumulator['td_sq'] += _td.pow(2).mean()
                     n_critic_updates += 1
 
                 if args.log_timing:
@@ -1668,11 +1894,13 @@ def main():
                     # Update actor
                     actor_optimizer.zero_grad(set_to_none=True)
                     actor_loss.backward()
-                    if args.grad_clip:
-                        torch.nn.utils.clip_grad_norm_(
-                            actor.parameters(),
-                            max_norm=args.grad_clip_max_norm
-                        )
+                    # See the critic note: max_norm=inf makes this a pure
+                    # measurement when --grad_clip is off.
+                    _actor_gnorm = torch.nn.utils.clip_grad_norm_(
+                        actor.parameters(),
+                        max_norm=args.grad_clip_max_norm if args.grad_clip else float("inf"),
+                    )
+                    loss_accumulator['actor_gnorm'] += _actor_gnorm.detach()
                     actor_optimizer.step()
 
                     if debug_logger.should_log_gradients(total_gradient_steps):
@@ -1710,6 +1938,11 @@ def main():
                         
                         # Alpha loss
                         alpha_loss = (-log_alpha.exp() * (log_pi_detached + target_entropy_batch)).mean()
+                        # Target entropy is adaptive (it depends on how many
+                        # real turbines are in each batch element), so logging
+                        # it alongside the achieved entropy is the only way to
+                        # read whether alpha is tracking or saturated.
+                        loss_accumulator['target_entropy'] += target_entropy_batch.detach().float().mean()
                         
                         alpha_optimizer.zero_grad(set_to_none=True)
                         alpha_loss.backward()
@@ -1773,6 +2006,10 @@ def main():
 
                 total_gradient_steps += 1
 
+            # Host time in the whole gradient burst (sampling + critic + actor).
+            # Closed before the logging block so the logging cost is excluded.
+            _perf_split["update"] += time.perf_counter() - _t_upd0
+
             # -----------------------------------------------------------------
             # Logging
             # -----------------------------------------------------------------
@@ -1800,6 +2037,32 @@ def main():
 
                 writer.add_scalar("losses/actor_loss", mean_actor_loss, global_step)
                 writer.add_scalar("losses/alpha", alpha_val, global_step)
+
+                # --- losses/* : health of the value function and the updates ---
+                writer.add_scalar("losses/critic_grad_norm",
+                                  (loss_accumulator['critic_gnorm'] / _nc).item(), global_step)
+                writer.add_scalar("losses/actor_grad_norm",
+                                  (loss_accumulator['actor_gnorm'] / _na).item(), global_step)
+                writer.add_scalar("losses/q_mean",
+                                  (loss_accumulator['q_mean'] / _nc).item(), global_step)
+                if args.algorithm != "tqc":
+                    _td_abs = (loss_accumulator['td_abs'] / _nc).item()
+                    _td_ms = (loss_accumulator['td_sq'] / _nc).item()
+                    writer.add_scalar("losses/td_error_abs_mean", _td_abs, global_step)
+                    # sqrt(E[td^2] - E[|td|]^2) is a lower bound on the true
+                    # spread (it uses E|td| rather than E[td]); good enough as a
+                    # relative "are a few transitions dominating" signal.
+                    writer.add_scalar("losses/td_error_spread",
+                                      max(_td_ms - _td_abs * _td_abs, 0.0) ** 0.5, global_step)
+                if args.autotune:
+                    # entropy_gap > 0 => policy is MORE random than the target,
+                    # so alpha should be falling. Persistently large and positive
+                    # is the "stay diffuse" pathology.
+                    _tgt_ent = (loss_accumulator['target_entropy'] / _na).item()
+                    _ach_ent = -(loss_accumulator['logpi_per_turbine'] / _na).item()
+                    writer.add_scalar("losses/target_entropy", _tgt_ent, global_step)
+                    writer.add_scalar("losses/policy_entropy", _ach_ent, global_step)
+                    writer.add_scalar("losses/entropy_gap", _ach_ent - _tgt_ent, global_step)
 
                 # Entropy-scaling diagnostics (see actor-update block)
                 def _acc_mean(key):
@@ -1834,7 +2097,91 @@ def main():
                     print(f"  timing(s): " + ", ".join(f"{k}={v:.2f}" for k, v in timing.items()))
                     if args.async_overlap:
                         print(f"  overlap: hidden={_hidden:.2f}s, wait={timing['env']:.2f}s")
+                    # With --log_timing on, also publish the sync-accurate
+                    # per-bucket fractions under perf/ so the panel gains detail
+                    # rather than changing meaning.
+                    for k, v in timing.items():
+                        if k != "env_span":
+                            writer.add_scalar(f"perf/sync_{k}_frac", v / total_t, global_step)
                     timing = {k: 0.0 for k in timing}
+
+                # -------------------------------------------------------------
+                # perf/*: is the GPU idle while the DWM envs churn?
+                # -------------------------------------------------------------
+                _t_now_w = time.time()
+                _dt = max(_t_now_w - _perf_prev["t"], 1e-9)
+                _dsteps = global_step - _perf_prev["step"]
+                writer.add_scalar("perf/wall_sec_per_1k_steps",
+                                  1000.0 * _dt / max(_dsteps, 1), global_step)
+
+                # Always-on env-vs-update split (host time, no cuda sync). If
+                # env_frac sits near 1 the GPU is starved and more
+                # --cpus-per-task buys throughput; if update_frac dominates,
+                # more CPUs buy nothing.
+                _split_tot = _perf_split["env"] + _perf_split["update"]
+                if _split_tot > 0:
+                    writer.add_scalar("perf/env_frac",
+                                      _perf_split["env"] / _split_tot, global_step)
+                    writer.add_scalar("perf/update_frac",
+                                      _perf_split["update"] / _split_tot, global_step)
+                    writer.add_scalar("perf/env_sec", _perf_split["env"], global_step)
+                    writer.add_scalar("perf/update_sec", _perf_split["update"], global_step)
+                _perf_split = {"env": 0.0, "update": 0.0}
+
+                # CPU: cgroup usage covers the main process AND every env
+                # worker, expressed as a percentage of the cores this job was
+                # actually allocated. ~100% means the CPU side is saturated and
+                # more --cpus-per-task would buy throughput.
+                _cpu_now = _read_cgroup_cpu_usec()
+                if _cpu_now is not None and _perf_prev["cpu_usec"] is not None:
+                    _busy_cores = (_cpu_now - _perf_prev["cpu_usec"]) / 1e6 / _dt
+                    writer.add_scalar("perf/cpu_busy_cores", _busy_cores, global_step)
+                    writer.add_scalar("perf/cpu_util_pct",
+                                      100.0 * _busy_cores / max(_n_cpu_alloc, 1), global_step)
+                writer.add_scalar("perf/cpu_allocated", _n_cpu_alloc, global_step)
+
+                _mem = _read_cgroup_mem_bytes()
+                if "cur" in _mem:
+                    writer.add_scalar("perf/host_mem_gb", _mem["cur"] / 2**30, global_step)
+                if "peak" in _mem:
+                    writer.add_scalar("perf/host_mem_peak_gb", _mem["peak"] / 2**30, global_step)
+                if "rss_sum" in _mem:      # /proc fallback; see _read_cgroup_mem_bytes
+                    writer.add_scalar("perf/host_rss_sum_gb",
+                                      _mem["rss_sum"] / 2**30, global_step)
+
+                if device.type == "cuda":
+                    writer.add_scalar("perf/gpu_mem_alloc_gb",
+                                      torch.cuda.memory_allocated() / 2**30, global_step)
+                    writer.add_scalar("perf/gpu_mem_reserved_gb",
+                                      torch.cuda.memory_reserved() / 2**30, global_step)
+                    writer.add_scalar("perf/gpu_mem_peak_gb",
+                                      torch.cuda.max_memory_allocated() / 2**30, global_step)
+                    # Not implemented by every ROCm/CUDA build; never fatal.
+                    try:
+                        writer.add_scalar("perf/gpu_util_pct",
+                                          float(torch.cuda.utilization()), global_step)
+                    except Exception:  # noqa: BLE001 - diagnostic only
+                        pass
+
+                _perf_prev = {"t": _t_now_w, "cpu_usec": _cpu_now, "step": global_step}
+
+                # -------------------------------------------------------------
+                # actions/*: what is the policy actually commanding?
+                # A derate mean pinned near a constant with a small std is the
+                # "stuck at one derate level" failure; a sat_frac near 1 says
+                # the slew limit is binding rather than the policy choosing.
+                # -------------------------------------------------------------
+                if _act_acc["n"] > 0:
+                    _an = _act_acc["n"]
+                    for _ch in _act_cols:
+                        _mean = _act_acc[f"{_ch}_sum"] / _an
+                        _var = max(_act_acc[f"{_ch}_sq"] / _an - _mean * _mean, 0.0)
+                        writer.add_scalar(f"actions/{_ch}_mean", _mean, global_step)
+                        writer.add_scalar(f"actions/{_ch}_std", _var ** 0.5, global_step)
+                        writer.add_scalar(f"actions/{_ch}_sat_frac",
+                                          _act_acc[f"{_ch}_sat"] / _an, global_step)
+                    for _k in _act_acc:
+                        _act_acc[_k] = 0.0
 
                 print(f"Step {global_step}: SPS={sps}, qf_loss={mean_qf_loss:.4f}, "
                       f"actor_loss={mean_actor_loss:.4f}, alpha={alpha_val:.4f}, "
@@ -1914,7 +2261,12 @@ def main():
         # =====================================================================
         if step_result is None:  # overlap mode: workers simulated during the burst
             _t0 = _sync_timer()
+            _t_env0 = time.perf_counter()
             step_result = envs.step_wait()
+            # Under --async_overlap this is only the UNHIDDEN remainder of the
+            # env step (the workers ran during the burst), which is exactly what
+            # perf/env_frac should report.
+            _perf_split["env"] += time.perf_counter() - _t_env0
             if args.log_timing:
                 _t_now = time.perf_counter()
                 timing["env"] += _t_now - _t0
@@ -1976,6 +2328,37 @@ def main():
                         infos["del_binding_channel"], dtype=object
                     ).flatten() if ch is not None
                 )
+            # Per-channel ratios. The wrapper puts ONE DICT PER ENV in
+            # info["del_ratio_by_channel"], but gymnasium's VectorEnv._add_info
+            # RECURSES into dict-valued infos, so what arrives here is
+            # {channel: array-over-envs} -- plus a "_channel" boolean mask entry
+            # per key, which must be skipped. Older/other collations hand back an
+            # object array of dicts instead, so accept both shapes. Diagnostic
+            # only: never let it kill training.
+            try:
+                _by_ch = infos.get("del_ratio_by_channel")
+
+                def _push_del_ratio(_ch, _val):
+                    _fv = float(_val)
+                    if not np.isfinite(_fv):
+                        return
+                    if _ch not in del_channel_windows:
+                        del_channel_windows[_ch] = deque(maxlen=1000)
+                    del_channel_windows[_ch].append(_fv)
+
+                if isinstance(_by_ch, dict):
+                    for _ch, _arr in _by_ch.items():
+                        if _ch.startswith("_"):      # gymnasium's presence mask
+                            continue
+                        for _v in np.asarray(_arr, dtype=float).flatten():
+                            _push_del_ratio(_ch, _v)
+                elif _by_ch is not None:
+                    for _d in np.asarray(_by_ch, dtype=object).flatten():
+                        if isinstance(_d, dict):
+                            for _ch, _v in _d.items():
+                                _push_del_ratio(_ch, _v)
+            except (TypeError, ValueError):
+                pass
 
         # Log episode stats
         if "final_info" in infos:
@@ -2030,6 +2413,27 @@ def main():
                         writer.add_scalar(
                             f"charts/del_binding_frac/{_ch}",
                             _bind.count(_ch) / len(_bind), global_step)
+
+                # --- del/* : the per-channel load story ---
+                # Same numbers, but split by channel instead of collapsed into
+                # del_agent_max, plus the argmax identity mirrored into the same
+                # namespace so one panel shows which load binds and how hard.
+                # charts/* is left untouched so existing runs stay comparable.
+                for _ch, _win in del_channel_windows.items():
+                    if len(_win) > 0:
+                        writer.add_scalar(f"del/ratio/{_ch}",
+                                          float(np.mean(_win)), global_step)
+                if len(del_binding_window) > 0:
+                    _bind = list(del_binding_window)
+                    for _ch in _del_reward_channels:
+                        writer.add_scalar(f"del/binding_frac/{_ch}",
+                                          _bind.count(_ch) / len(_bind), global_step)
+                if len(del_agent_max_window) > 0:
+                    writer.add_scalar("del/agent_max",
+                                      float(np.mean(del_agent_max_window)), global_step)
+                if len(del_margin_window) > 0:
+                    writer.add_scalar("del/margin",
+                                      float(np.mean(del_margin_window)), global_step)
 
 
         # Handle final observations
