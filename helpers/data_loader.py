@@ -145,6 +145,12 @@ def rotate_profiles_numpy(
 # =============================================================================
 # DEFAULT SCALING LIMITS (matching WindFarmEnv constructor defaults)
 # =============================================================================
+# LOCKSTEP WARNING (change_wd_4): this table matches the env's DEFAULT scaling
+# only. Runs using --ws_scaling_min/max or --obs_encoding produce online obs
+# this table cannot un-scale — offline data would break SILENTLY. Only the
+# pretrain path (make_datasets.py buffers) reads it; that path is unused by the
+# change_wd_4 sweep, so it is deliberately NOT updated. Fix here first if the
+# pretrain path is ever revived alongside those flags.
 
 DEFAULT_SCALING = {
     "ws":    (0.0, 30.0),     # m/s  — WindFarmEnv: ws_scaling_min/max

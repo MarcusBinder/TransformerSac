@@ -21,6 +21,7 @@ Positional encoding options (--pos_encoding_type):
 Author: Marcus Binder Nilsen (DTU Wind Energy)
 """
 
+import copy
 import os
 import random
 import sys
@@ -77,7 +78,11 @@ from helpers.helper_funcs import (
     soft_update,
 )
 from helpers.layouts import get_layout_positions
-from helpers.env_configs import make_env_config
+from helpers.env_configs import (
+    make_env_config,
+    apply_config_overrides,
+    make_eval_wind_config,
+)
 
 # Receptivity profile computation
 from helpers.receptivity_profiles import compute_layout_profiles
@@ -390,7 +395,12 @@ def main():
         config[mes_type][f"{prefix}_history_N"] = args.history_length
         config[mes_type][f"{prefix}_history_length"] = args.history_length
 
-    
+    # change_wd_3 reward / training-wind overrides (all no-ops when unset).
+    # Applied HERE, before make_eval_env_factory deep-copies `config`, so the
+    # reward definition is shared by training and eval envs; the training-only
+    # ws range is then overwritten per eval spec below.
+    apply_config_overrides(config, args)
+
     base_env_kwargs = {
         "turbine": wind_turbine,
         "n_passthrough": args.max_eps,
@@ -423,15 +433,90 @@ def main():
         base_env_kwargs["Baseline_comp"] = True
         config["BaseController"] = "Global"
 
-    def env_factory(x_pos: np.ndarray, y_pos: np.ndarray) -> gym.Env:
-        """Create a base WindFarmEnv with given positions."""
-        env = WindFarmEnv(x_pos=x_pos,
-                          y_pos=y_pos,
-                          reset_init=False,  # Defer reset to training loop
-                          **base_env_kwargs)
-        env.action_space.seed(args.seed)
-        return env
-    
+    # change_wd_4: override the env's hardcoded 0-30 m/s obs-affine range
+    # (OBS_SCALING.md). These are WindFarmEnv CTOR kwargs, deliberately NOT
+    # config-dict keys — None means "omit", so the env default stays untouched.
+    # The eval factories spread {**base_env_kwargs, ...} below, so train and
+    # eval envs get the same scaling automatically.
+    if args.ws_scaling_min is not None:
+        base_env_kwargs["ws_scaling_min"] = float(args.ws_scaling_min)
+    if args.ws_scaling_max is not None:
+        base_env_kwargs["ws_scaling_max"] = float(args.ws_scaling_max)
+    if args.ws_scaling_min is not None or args.ws_scaling_max is not None:
+        print(f"ws obs scaling override: "
+              f"[{base_env_kwargs.get('ws_scaling_min', 0.0)}, "
+              f"{base_env_kwargs.get('ws_scaling_max', 30.0)}] m/s")
+
+
+    def make_env_factory(env_kwargs: dict):
+        """Build a WindFarmEnv factory bound to one set of env kwargs."""
+        def _factory(x_pos: np.ndarray, y_pos: np.ndarray) -> gym.Env:
+            env = WindFarmEnv(x_pos=x_pos,
+                              y_pos=y_pos,
+                              reset_init=False,  # Defer reset to training loop
+                              **env_kwargs)
+            env.action_space.seed(args.seed)
+            return env
+        return _factory
+
+    # Static-wd factory: the default for training, and the eval fallback when no
+    # --eval_wd_function is given. Deliberately carries NO wd_function, so a
+    # --train_wd_function can never leak into the eval envs.
+    env_factory = make_env_factory(base_env_kwargs)
+
+    # Eval-only env factories: when --eval_wd_function is set (comma-separated for
+    # several schedules), eval envs get a time-varying wd schedule (training envs are
+    # untouched by this path). The burn-in holds the per-reset base_wd, so wd is pinned
+    # to wd_function(0) — and ws to the spec's speed so all episodes in a cell share
+    # one condition — mirroring make_flow_gif.py.
+    #
+    # The ladder is the CROSS PRODUCT (schedule x --eval_ws), because the reward
+    # conditioning under test is largely a wind-SPEED story: DTU10MW rates near
+    # 11.4 m/s, so an eval pinned only at 12 m/s sits above rated and cannot show
+    # whether an arm gained anything below it. eval_specs entries are
+    # (wd_name, ws, spec_name); spec_name carries the /ws<speed> segment only when
+    # more than one speed is requested, keeping the single-speed namespace
+    # byte-identical to change_wd_2.
+    from helpers.wd_functions import build_eval_specs
+    eval_specs = build_eval_specs(args.eval_wd_function, args.eval_ws)
+    eval_spec_names = [name for _, _, name in eval_specs]
+
+    def make_eval_env_factory(wd_name: str, ws: float):
+        from helpers.wd_functions import get_wd_function
+        _wd_fn = get_wd_function(wd_name)
+        _wd0 = float(_wd_fn(0.0))
+        # Pins wd to the schedule's t=0 value and ws UNCONDITIONALLY — the latter
+        # is what keeps a --train_ws_min/max override out of the eval condition.
+        eval_config = make_eval_wind_config(config, _wd0, ws)
+        print(f"Eval wd_function: {wd_name} "
+              f"(eval wind pinned to wd={_wd0}, ws={float(ws)})")
+        return make_env_factory({**base_env_kwargs,
+                                 "config": eval_config,
+                                 "wd_function": _wd_fn})
+
+    eval_env_factories = ([make_eval_env_factory(wd, ws) for wd, ws, _ in eval_specs]
+                          if eval_specs else [env_factory])
+
+    # Training wd schedule (--train_wd_function). Unlike the eval path these are
+    # RELATIVE — wd(t) = base_wd + delta(t) — so wd_min/wd_max are deliberately NOT
+    # pinned and the config's per-episode wd randomization survives. The schedules are
+    # stateful (they re-draw every episode), so each vector-env slot builds its own
+    # instance seeded off that slot's seed; a single shared instance would make all
+    # num_envs envs walk one identical wd trajectory.
+    def make_train_env_factory(env_seed: int):
+        if args.train_wd_function is None:
+            return env_factory
+        from helpers.wd_functions import get_train_wd_factory
+        return make_env_factory({
+            **base_env_kwargs,
+            "wd_function": get_train_wd_factory(args.train_wd_function, seed=env_seed),
+        })
+
+    if args.train_wd_function is not None:
+        print(f"Train wd_function: {args.train_wd_function} "
+              f"(relative schedule; wd domain randomization preserved, "
+              f"per-env seeds {args.seed}..{args.seed + args.num_envs - 1})")
+
     def combined_wrapper(env: gym.Env) -> gym.Env:
         """
         Combined wrapper that:
@@ -492,6 +577,14 @@ def main():
                 n_r=3,
                 n_theta=12,
             )
+        # change_wd_4: re-encode the ws columns (rbf/pyramid/cdf/fourier/reldef/
+        # pcurve). Must sit INSIDE TransformReward so MultiLayoutEnv's
+        # outermost-first _obs_dim_per_turbine probe finds the expanded dim.
+        if args.obs_encoding:
+            from helpers.obs_encoding import ObsEncodingWrapper
+            env = ObsEncodingWrapper(env, mode=args.obs_encoding,
+                                     turbine=wind_turbine,
+                                     **json.loads(args.obs_encoding_kwargs))
         # v9.1: scale the (tiny) Wake_recovery reward to probe optimization signal-to-noise.
         if args.reward_scale != 1.0:
             _scale = float(args.reward_scale)
@@ -501,9 +594,11 @@ def main():
     def make_env_fn(seed, warmup_steps=None):
         """Factory function for vectorized environments."""
         def _init():
+            # Built inside _init so the (stateful) training wd schedule is
+            # constructed in this worker process, one instance per env slot.
             env = MultiLayoutEnv(
                 layouts=layouts,
-                env_factory=env_factory,
+                env_factory=make_train_env_factory(seed),
                 per_turbine_wrapper=combined_wrapper,  # Use combined wrapper
                 seed=seed,
                 shuffle=args.shuffle_turbs,  # Shuffle turbines within each layout
@@ -580,29 +675,73 @@ def main():
     else:
         _act_cols = {"yaw": 0}
     print(f"Action columns (for actions/* logging): {_act_cols}")
-    
 
-    # Create policy evaluator
-    evaluator = PolicyEvaluator(
-        agent=None,  # Will be set after actor is created
-        eval_layouts=eval_layout_names,
-        env_factory=env_factory,
-        combined_wrapper=combined_wrapper,
-        num_envs=args.num_envs,
-        num_eval_steps=args.num_eval_steps,
-        num_eval_episodes=args.num_eval_episodes,
-        device=device,
-        rotor_diameter=rotor_diameter,
-        wind_turbine=wind_turbine,
-        seed=args.eval_seed,
-        max_turbines=n_turbines_max,
-        deterministic=args.eval_deterministic,
-        use_profiles=use_profiles,  # NEW: Pass profile setting
-        n_profile_directions=args.n_profile_directions,  # NEW: Pass profile resolution
-        profile_source=args.profile_source,
-        profile_sigma_smooth=args.profile_sigma_smooth,
-        profile_geom_mode=args.profile_geom_mode,
-    )
+    # change_wd_4: agent-side running obs normalization. Constructed from the
+    # WRAPPED obs dim so it composes with --obs_encoding; applied at act() time
+    # (via the agent's BatchPreparer) and on replay batches after rb.sample.
+    # See helpers/obs_norm.py for why this is not a per-env wrapper.
+    obs_normalizer = None
+    if args.obs_norm:
+        from helpers.obs_norm import ObsRunningNorm
+        obs_normalizer = ObsRunningNorm(obs_dim_per_turbine, device)
+        print(f"ObsRunningNorm enabled ({obs_dim_per_turbine} features, "
+              f"updates from step 0, clip ±{obs_normalizer.clip})")
+
+
+    # Create policy evaluators — one per eval wd schedule. Every evaluator shares the
+    # same eval_seed, so the schedules are compared on PAIRED episodes.
+    evaluators = [
+        PolicyEvaluator(
+            agent=None,  # Will be set after actor is created
+            eval_layouts=eval_layout_names,
+            env_factory=_factory,
+            combined_wrapper=combined_wrapper,
+            num_envs=args.num_envs,
+            num_eval_steps=args.num_eval_steps,
+            num_eval_episodes=args.num_eval_episodes,
+            device=device,
+            rotor_diameter=rotor_diameter,
+            wind_turbine=wind_turbine,
+            seed=args.eval_seed,
+            max_turbines=n_turbines_max,
+            deterministic=args.eval_deterministic,
+            use_profiles=use_profiles,  # NEW: Pass profile setting
+            n_profile_directions=args.n_profile_directions,  # NEW: Pass profile resolution
+            profile_source=args.profile_source,
+            profile_sigma_smooth=args.profile_sigma_smooth,
+            profile_geom_mode=args.profile_geom_mode,
+        )
+        for _factory in eval_env_factories
+    ]
+
+    def run_all_evaluations():
+        """Evaluate on every eval wd schedule.
+
+        Returns (metrics_dict, primary_metrics). The FIRST spec additionally
+        writes the historical unprefixed eval/... keys so existing W&B panels and
+        paper_figures.ipynb readers keep working; every spec also writes
+        eval/wd/<spec>/... . Extra evaluators are closed after their pass —
+        each holds its own num_envs-wide AsyncVectorEnv, and leaving them resident
+        would multiply the sweep's worker-process count per extra spec. They
+        are recreated lazily on the next eval cycle.
+        """
+        metrics = {}
+        primary = None
+        for i, ev in enumerate(evaluators):
+            m = ev.evaluate()
+            if i == 0:
+                primary = m
+                metrics.update(m.to_dict())
+            if eval_spec_names:
+                metrics.update(m.to_dict(prefix=f"eval/wd/{eval_spec_names[i]}"))
+                print(f"  [{eval_spec_names[i]}] power ratio: {m.power_ratio:.4f}")
+            if i > 0:
+                ev.close()
+        return metrics, primary
+
+    def close_all_evaluators():
+        for ev in evaluators:
+            ev.close()
 
 
     # Action scaling
@@ -822,10 +961,14 @@ def main():
         use_wind_relative=args.use_wind_relative_pos,
         use_profiles=use_profiles,
         rotate_profiles=args.rotate_profiles,
+        # The evaluators share this agent, so eval act() calls are normalized
+        # with the same (live) statistics as training — eval envs never go cold.
+        obs_normalizer=obs_normalizer,
     )
 
     # Update evaluator with actor reference
-    evaluator.agent = agent
+    for _ev in evaluators:
+        _ev.agent = agent
 
     # Build critic-specific kwargs (DroQ params only go to critics, not actor)
     critic_kwargs = {**common_kwargs}
@@ -1027,7 +1170,17 @@ def main():
                     print(f"✓ Loaded alpha optimizer state")
             else:
                 print(f"✓ Reset entropy coefficient (alpha={float(alpha):.4f})")
-       
+
+        # === Obs normalizer statistics (change_wd_4, --obs_norm) ===
+        if obs_normalizer is not None:
+            if "obs_norm_state" in checkpoint:
+                obs_normalizer.load_state_dict(checkpoint["obs_norm_state"])
+                print(f"✓ Loaded obs normalizer statistics "
+                      f"(count={float(obs_normalizer.count):.0f})")
+            else:
+                print("WARNING: --obs_norm set but checkpoint has no "
+                      "obs_norm_state — statistics start cold.")
+
         # === Resume step logic ===
         ## REMOVED FOR SIMPLICITY
         # Only resume from checkpoint step if keeping ALL optimizer states
@@ -1280,6 +1433,7 @@ def main():
         actor, qf1, qf2, actor_optimizer, q_optimizer,
         0, run_name, args, log_alpha, alpha_optimizer,
         tqc_critic=tqc_critic,
+        obs_norm_state=obs_normalizer.state_dict() if obs_normalizer is not None else None,
     )
 
 
@@ -1289,12 +1443,11 @@ def main():
     # Initial evaluation
     if args.eval_initial:
         print("\nRunning initial evaluation before training...")
-        eval_metrics = evaluator.evaluate()
-        eval_dict = eval_metrics.to_dict()
-        
+        eval_dict, eval_metrics = run_all_evaluations()
+
         for name, value in eval_dict.items():
             writer.add_scalar(name, value, 0)
-        
+
         print(f"Initial eval - Mean reward: {eval_metrics.mean_reward:.4f}, "
               f"Power ratio: {eval_metrics.power_ratio:.4f}")
 
@@ -1642,6 +1795,15 @@ def main():
                 timing["env"] += _t_now - _t0
                 timing["env_span"] += _t_now - _t_async
 
+        # change_wd_4: fold the fresh observations into the running obs stats.
+        # Masked so 0.0-pad rows don't drag the means; runs from step 0 (the
+        # random-exploration warmup is already on-distribution).
+        if obs_normalizer is not None:
+            obs_normalizer.update(
+                torch.as_tensor(next_obs, dtype=torch.float32, device=device),
+                torch.as_tensor(current_masks, device=device),
+            )
+
 
         # =====================================================================
         # TRAINING
@@ -1674,6 +1836,13 @@ def main():
                 data = rb.sample(args.batch_size)
                 if args.log_timing:
                     timing["sample"] += _sync_timer() - _t0
+
+                # change_wd_4: the buffer stores RAW obs; normalizing at the
+                # single sample point covers critic, actor and every diagnostic
+                # that reuses `data`, always with the freshest statistics.
+                if obs_normalizer is not None:
+                    data["observations"] = obs_normalizer.normalize(data["observations"])
+                    data["next_observations"] = obs_normalizer.normalize(data["next_observations"])
 
                 _t_critic = _sync_timer()
 
@@ -2474,7 +2643,7 @@ def main():
             warmup_buffer_saved = True
             if args.buffer_only:
                 print("\n--buffer_only set: warmup buffer saved, exiting before training.")
-                evaluator.close()
+                close_all_evaluators()
                 envs.close()
                 writer.close()
                 return
@@ -2490,6 +2659,7 @@ def main():
                 actor, qf1, qf2, actor_optimizer, q_optimizer,
                 global_step, run_name, args, log_alpha, alpha_optimizer,
                 tqc_critic=tqc_critic,
+                obs_norm_state=obs_normalizer.state_dict() if obs_normalizer is not None else None,
             )
             next_save_step += args.save_interval
 
@@ -2508,9 +2678,8 @@ def main():
         
         if global_step >= next_eval_step:
             print(f"\nRunning evaluation at step {global_step}...")
-            eval_metrics = evaluator.evaluate()
-            eval_dict = eval_metrics.to_dict()
-            
+            eval_dict, eval_metrics = run_all_evaluations()
+
             # Log to tensorboard/wandb
             for name, value in eval_dict.items():
                 writer.add_scalar(name, value, global_step)
@@ -2536,6 +2705,7 @@ def main():
             actor, qf1, qf2, actor_optimizer, q_optimizer,
             global_step, run_name, args, log_alpha, alpha_optimizer,
             tqc_critic=tqc_critic,
+            obs_norm_state=obs_normalizer.state_dict() if obs_normalizer is not None else None,
         )
 
     if args.save_buffer_final or args.buffer_save_interval > 0:
@@ -2550,8 +2720,8 @@ def main():
     print("=" * 60)
     
 
-    # Close evaluator
-    evaluator.close()
+    # Close evaluators
+    close_all_evaluators()
 
     envs.close()
     writer.close()

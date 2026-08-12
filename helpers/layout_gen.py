@@ -65,6 +65,40 @@ def make_cluster(n_turbines, seed, D):
     return xy[:, 0].astype(float), xy[:, 1].astype(float)
 
 
+def make_grid(n_lo, n_hi, seed, D, spacing_lo_D=4.0, spacing_hi_D=7.0, jitter_D=0.0):
+    """One random rotated nx x ny grid layout with n_lo <= nx*ny <= n_hi turbines.
+
+    Regular-grid archetype for the change_wd sweep: real farms are mostly (rotated)
+    grids, and the held-out eval layout (square_5x5, 6D spacing) is one. The count
+    is set by sampling (nx, ny) directly — uniformly over all factor pairs with
+    nx, ny >= 2 whose product lies in [n_lo, n_hi] — NOT by factoring a pre-sampled
+    n (many n in the range are prime and have no >=2x>=2 factorization).
+    Per-axis spacing sx, sy ~ U[spacing_lo_D, spacing_hi_D] (in D, independent),
+    then the centred grid is rotated by theta ~ U[0, 2pi). ``jitter_D`` adds optional
+    per-turbine uniform jitter (default 0 = pure grids). With spacing >= 4D the
+    3D min-spacing constraint used elsewhere is always satisfied.
+    Returns ``(x_array, y_array)`` to mirror ``make_irregular``.
+    """
+    rng = np.random.default_rng(seed)
+    shapes = [(nx, ny) for nx in range(2, n_hi + 1) for ny in range(2, n_hi + 1)
+              if n_lo <= nx * ny <= n_hi]
+    if not shapes:
+        raise ValueError(f"no (nx>=2, ny>=2) grid with nx*ny in [{n_lo}, {n_hi}]")
+    nx, ny = shapes[rng.integers(len(shapes))]
+    sx = rng.uniform(spacing_lo_D, spacing_hi_D) * D
+    sy = rng.uniform(spacing_lo_D, spacing_hi_D) * D
+    gx, gy = np.meshgrid(np.arange(nx) * sx, np.arange(ny) * sy)
+    x, y = gx.ravel().astype(float), gy.ravel().astype(float)
+    x -= x.mean(); y -= y.mean()
+    theta = rng.uniform(0.0, 2.0 * np.pi)
+    c, s = np.cos(theta), np.sin(theta)
+    x, y = c * x - s * y, s * x + c * y
+    if jitter_D > 0.0:
+        x = x + rng.uniform(-jitter_D, jitter_D, size=x.shape) * D
+        y = y + rng.uniform(-jitter_D, jitter_D, size=y.shape) * D
+    return x, y
+
+
 # Operating wind rose for these experiments (matches layout_tools.WDIRS = 225..315),
 # sampled coarsely for the cheap geometric headroom screen.
 HEADROOM_WD = np.arange(225.0, 316.0, 15.0)
@@ -145,6 +179,9 @@ def generate_layout_pool(
         ``layout_tools.build_pool``. Names ``dr_n{n}_k{k}`` (unchanged for v8 back-compat).
       * ``"cluster"`` — PLayGen Poisson-disc clusters via ``make_cluster`` (own native
         spacing; ``min_dist_D``/spread ignored). Names ``drc_n{n}_k{k}``.
+      * ``"grid"`` — rotated regular grids via ``make_grid``; (nx, ny) is sampled
+        inside the generator so n_lo/n_hi bound nx*ny (the loop's per-entry n is
+        ignored; names use the actual count). Names ``drg_n{n}_k{k}``.
 
     Returns a list of ``(name, x_pos, y_pos)`` tuples with unique names. Profiles are
     intentionally NOT computed here — the caller attaches them (geometric or pywake)
@@ -152,9 +189,9 @@ def generate_layout_pool(
     """
     if n_lo > n_hi:
         raise ValueError(f"dr_n_lo ({n_lo}) must be <= dr_n_hi ({n_hi})")
-    if generator not in ("irregular", "cluster"):
-        raise ValueError(f"unknown generator '{generator}' (expected 'irregular' or 'cluster')")
-    name_prefix = "drc" if generator == "cluster" else "dr"
+    if generator not in ("irregular", "cluster", "grid"):
+        raise ValueError(f"unknown generator '{generator}' (expected 'irregular', 'cluster' or 'grid')")
+    name_prefix = {"cluster": "drc", "grid": "drg"}.get(generator, "dr")
     rng = np.random.default_rng(seed)
     pool: List[Tuple[str, np.ndarray, np.ndarray]] = []
     rejected = 0
@@ -167,6 +204,11 @@ def generate_layout_pool(
         layout_seed = int(rng.integers(0, 2**31 - 1))
         if generator == "cluster":
             x, y = make_cluster(n, layout_seed, D)
+        elif generator == "grid":
+            # make_grid samples (nx, ny) itself; the loop's n is ignored (grid counts
+            # are not uniform over [n_lo, n_hi] — they follow the factor-pair density).
+            x, y = make_grid(n_lo, n_hi, layout_seed, D)
+            n = len(x)
         else:
             sx, sy = 6.0 + 1.6 * n, 4.0 + 1.0 * n
             x, y = make_irregular(n, layout_seed, sx, sy, D, min_dist_D=min_dist_D)

@@ -85,6 +85,100 @@ class Args:
     eval_layouts: str = ""            # Comma-separated eval layouts (empty = use training layouts)
     eval_seed: int = 42               # Seed for evaluation environments
     eval_deterministic: bool = True   # Use the deterministic (mean) policy action during evaluation
+    # Named time-varying wd schedule(s) from the EVAL registry (helpers/wd_functions.py
+    # WD_FUNCTIONS), applied to eval envs only. Comma-separated for multiple schedules
+    # (e.g. "static_270,step_ramp_270_315"): each gets its own evaluator, and its
+    # metrics are namespaced eval/wd/<schedule>/... . The FIRST schedule additionally
+    # keeps the plain eval/... keys so existing W&B panels and readers still work.
+    # When set, eval wind is pinned to wd_min=wd_max=wd_function(0) and ws=12 so the
+    # burn-in matches the schedule's start. None = static eval wd (unchanged behavior).
+    eval_wd_function: Optional[str] = None
+    # Comma-separated eval wind speeds (m/s). Every --eval_wd_function schedule is
+    # evaluated at EVERY listed speed, i.e. the eval ladder is the cross product
+    # (schedule x ws) and each cell gets its own evaluator namespaced
+    # eval/wd/<schedule>/ws<speed>/... . With a SINGLE speed (the default "12")
+    # the /ws<speed> segment is omitted entirely, so the key namespace is
+    # byte-identical to the pre-flag behaviour and change_wd_2 readers keep
+    # working. Only consulted when --eval_wd_function is set (the fallback
+    # static-wd evaluator does not pin wind at all).
+    eval_ws: str = "12"
+
+    # === Reward conditioning overrides (change_wd_3) ===
+    # All None = "don't override", so the value from --config's power_def wins and
+    # every pre-existing script keeps its exact behaviour. These exist because the
+    # change_wd_3 arms need arbitrary COMBINATIONS of (tau x Power_avg x
+    # Power_scaling x Power_reward), which as named ENV_CONFIGS presets would be a
+    # dozen near-duplicate dicts.
+    #
+    # reward_tau floors the Wake_recovery denominator:
+    #   r = (P_agent - P_greedy) / max(P_freestream - P_greedy, tau * P_freestream)
+    # so it only binds in states with little wake-steering headroom (below rated,
+    # or wd already aligned). Raising it DOWN-WEIGHTS those states relative to the
+    # productive ones. Contrast power_scaling, which multiplies the reward
+    # UNIFORMLY -- that difference is what makes power_scaling the magnitude
+    # control that renders a tau effect attributable.
+    reward_tau: Optional[float] = None      # power_def["tau"]; env default 0.02
+    power_reward: Optional[str] = None      # power_def["Power_reward"]: "Baseline" | "Wake_recovery" | ...
+    power_avg: Optional[int] = None         # power_def["Power_avg"]: reward power-averaging window
+    power_scaling: Optional[float] = None   # power_def["Power_scaling"]: uniform reward gain
+
+    # === Training wind-speed range override (change_wd_3) ===
+    # Override wind.ws_min / wind.ws_max for the TRAINING envs only; eval envs are
+    # always re-pinned to their own spec's ws afterwards, so these cannot leak into
+    # the eval condition. Motivation: DTU10MW rates near 11.4 m/s while hard_2 draws
+    # ws ~ U[10,14], leaving over half of training states with no wake-steering
+    # headroom at all. Narrowing the range is the "stop sampling dead states" arm,
+    # the alternative to reweighting them via reward_tau. None = use the config's range.
+    train_ws_min: Optional[float] = None
+    train_ws_max: Optional[float] = None
+
+    # === Observation encoding (change_wd_4) ===
+    # The OBS_SCALING.md finding: every ws feature is affine-scaled from a HARDCODED
+    # 0-30 m/s (wind_farm_env.py:71-72 ctor defaults, never overridden anywhere),
+    # while training data lives in ~6-14 m/s — the signal uses ~13% of the [-1,1]
+    # axis. These flags are the change_wd_4 bake-off levers. All default to "off",
+    # so every pre-existing script keeps its exact behaviour.
+    #
+    # WARNING: every one of these changes the observation contract, so they
+    # invalidate all existing checkpoints, and the STANDALONE eval scripts
+    # (evaluate.py / eval_checkpoint.py / ...) do NOT apply them — checkpoints from
+    # runs using these flags are only comparable through the in-training eval until
+    # those scripts learn to read the flags back from checkpoint["args"].
+    #
+    # ws_scaling_min/max are WindFarmEnv CTOR KWARGS (not config-dict keys — see
+    # OBS_SCALING.md "Already ruled out"), forwarded via base_env_kwargs so train
+    # and eval envs stay consistent. None = leave the env default (0/30) untouched.
+    ws_scaling_min: Optional[float] = None
+    ws_scaling_max: Optional[float] = None
+    # Feature-map re-encodings of the ws columns, applied by ObsEncodingWrapper
+    # (helpers/obs_encoding.py) on the PER-TURBINE obs. Modes: rbf | pyramid | cdf
+    # | fourier | reldef | pcurve. Appending modes add features at the END of the
+    # per-turbine vector so indices 0..11 keep their meaning; cdf warps the ws
+    # columns in place. The wrapper reads the env's actual ws scaling range, so
+    # combining with --ws_scaling_* stays correct (but don't — one lever per arm).
+    obs_encoding: Optional[str] = None
+    obs_encoding_kwargs: str = "{}"   # JSON overrides of a mode's defaults (precedent: profile_encoder_kwargs)
+    # Agent-side running mean/std normalization (helpers/obs_norm.py), applied at
+    # act() time and on replay batches. Agent-side (not a per-env wrapper) because
+    # per-env statistics cannot sync across the 30 async workers and eval envs
+    # would start cold. State rides in the checkpoint (obs_norm_state).
+    obs_norm: bool = False
+    # "shared" = the usual single obs-encoder MLP over the full per-turbine vector.
+    # "per_sensor" = one small MLP per sensor group (ws/wd/yaw/power histories),
+    # concatenated — requires obs_dim_per_turbine == 4*history_length, so it
+    # hard-fails if combined with an expanding --obs_encoding (intended).
+    obs_encoder_mode: str = "shared"
+
+    # === Training wind-direction schedule ===
+    # Named randomized wd schedule from the TRAIN registry (helpers/wd_functions.py
+    # TRAIN_WD_FACTORIES, e.g. "dr_ramp") applied to TRAINING envs. These schedules are
+    # RELATIVE -- wd(t) = base_wd + delta(t) with delta(0) = 0 -- so unlike the eval
+    # path they do NOT pin wd_min/wd_max: the config's per-episode wd randomization is
+    # preserved and the schedule composes on top of it. Each vector env is seeded
+    # independently so the 30 envs do not share one wd trajectory. The train and eval
+    # registries are disjoint, so an eval schedule name is rejected here (and vice
+    # versa). None = static per-episode wd (unchanged behavior).
+    train_wd_function: Optional[str] = None
 
     # === Layout Settings ===
     # Comma-separated list of layouts. Single = single-layout, Multiple = multi-layout
@@ -106,7 +200,7 @@ class Args:
     dr_min_dist_D: float = 3.0       # minimum turbine spacing in rotor diameters
     dr_screen_headroom: bool = True  # reject generated layouts with no wake-steering headroom
     dr_min_involved_frac: float = 0.5  # min fraction of turbines in a wake interaction to keep a layout
-    dr_generator: str = "irregular"  # {"irregular","cluster"}: procedural pool generator (cluster = PLayGen Poisson-disc)
+    dr_generator: str = "irregular"  # {"irregular","cluster","grid"}: procedural pool generator (cluster = PLayGen Poisson-disc; grid = rotated regular grids, dr_n_lo/hi bound nx*ny)
 
     # === Observation Settings ===
     history_length: int = 15            # Number of timesteps of history per feature

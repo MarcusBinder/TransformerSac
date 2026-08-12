@@ -63,6 +63,7 @@ class BatchPreparer:
         use_wind_relative: bool = True,
         use_profiles: bool = False,
         rotate_profiles: bool = False,
+        obs_normalizer=None,
     ):
         """
         Args:
@@ -71,12 +72,16 @@ class BatchPreparer:
             use_wind_relative: Whether to transform positions to wind-relative frame
             use_profiles: Whether to include receptivity/influence profiles
             rotate_profiles: Whether to rotate profiles to wind-relative frame
+            obs_normalizer: Optional ObsRunningNorm (--obs_norm). Applied to the
+                obs tensor here so training AND eval act() calls are normalized
+                identically (PolicyEvaluator shares this agent).
         """
         self.device = device
         self.rotor_diameter = rotor_diameter
         self.use_wind_relative = use_wind_relative
         self.use_profiles = use_profiles
         self.rotate_profiles = rotate_profiles
+        self.obs_normalizer = obs_normalizer
     
     def from_envs(
         self,
@@ -120,6 +125,8 @@ class BatchPreparer:
         # Convert observations to tensor
         obs_tensor = torch.tensor(obs, dtype=torch.float32, device=self.device)
         mask_tensor = torch.tensor(masks, dtype=torch.bool, device=self.device)
+        if self.obs_normalizer is not None:
+            obs_tensor = self.obs_normalizer.normalize(obs_tensor)
         
         # Normalize positions by rotor diameter
         positions_norm = raw_positions / self.rotor_diameter
@@ -199,6 +206,7 @@ class WindFarmAgent:
         use_wind_relative: bool = True,
         use_profiles: bool = False,
         rotate_profiles: bool = False,
+        obs_normalizer=None,
     ):
         """
         Args:
@@ -208,16 +216,18 @@ class WindFarmAgent:
             use_wind_relative: Whether to transform positions to wind-relative frame
             use_profiles: Whether to use receptivity/influence profiles
             rotate_profiles: Whether to rotate profiles to wind-relative frame
+            obs_normalizer: Optional ObsRunningNorm (--obs_norm), see BatchPreparer
         """
         self.actor = actor
         self.device = device
-        
+
         self.batch_preparer = BatchPreparer(
             device=device,
             rotor_diameter=rotor_diameter,
             use_wind_relative=use_wind_relative,
             use_profiles=use_profiles,
             rotate_profiles=rotate_profiles,
+            obs_normalizer=obs_normalizer,
         )
     
     def act(
