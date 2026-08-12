@@ -262,8 +262,9 @@ ENV_CONFIGS["LES_curyaw_wr_wide"] = _les_curyaw_wr_wide
 
 # LES3X3pen: wr arm with the wd range widened further to 260-315 for the 3x3
 # layout sweep (ws 8-11 and TI 0.038 still inherited from LES).
+# TODO I flipped this. I thought it was 270 + some range, but it was minus. Now fixed but the name lives. 
 _les_curyaw_wr_wide315 = deepcopy(_les_curyaw_wr)
-_deep_update(_les_curyaw_wr_wide315, {"wind": {"wd_min": 260, "wd_max": 315}})
+_deep_update(_les_curyaw_wr_wide315, {"wind": {"wd_min": 225, "wd_max": 280}})
 ENV_CONFIGS["LES_curyaw_wr_wide315"] = _les_curyaw_wr_wide315
 
 
