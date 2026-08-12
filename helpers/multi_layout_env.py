@@ -499,6 +499,12 @@ class MultiLayoutEnv(gym.Env):
         return self.mean_wind_direction
 
     @property
+    def wd_est(self) -> float:
+        """Sensor-derived wd estimate from the active environment (only
+        available when it was built with wd_est_tau; --wd_source est)."""
+        return self._get_base_env().wd_est
+
+    @property
     def ws(self) -> float:
         """Current wind speed from the active environment."""
         return self._get_base_env().ws

@@ -367,9 +367,14 @@ class EnhancedPerTurbineWrapper(gym.Wrapper):
         return obs_transformed, reward, terminated, truncated, info
 
 
-def get_env_wind_directions(envs) -> np.ndarray:
-    """Get current wind direction from each environment."""
-    return np.array(envs.env.get_attr('wd'), dtype=np.float32)
+def get_env_wind_directions(envs, attr: str = 'wd') -> np.ndarray:
+    """Get current wind direction from each environment.
+
+    ``attr`` selects the source: 'wd' (privileged true value, default) or
+    'wd_est' (sensor-derived estimate, --wd_source est). The replay buffer
+    stores whatever this fetched, so buffer honesty follows automatically.
+    """
+    return np.array(envs.env.get_attr(attr), dtype=np.float32)
 
 
 def get_env_raw_positions(envs) -> np.ndarray:

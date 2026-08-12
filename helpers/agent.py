@@ -64,6 +64,7 @@ class BatchPreparer:
         use_profiles: bool = False,
         rotate_profiles: bool = False,
         obs_normalizer=None,
+        wd_attr: str = 'wd',
     ):
         """
         Args:
@@ -75,6 +76,10 @@ class BatchPreparer:
             obs_normalizer: Optional ObsRunningNorm (--obs_norm). Applied to the
                 obs tensor here so training AND eval act() calls are normalized
                 identically (PolicyEvaluator shares this agent).
+            wd_attr: env attribute fetched when wind_dirs is not passed in:
+                'wd' (privileged true value) or 'wd_est' (sensor-derived
+                estimate, --wd_source est). Covers every act() caller that
+                lets the agent fetch for itself — notably PolicyEvaluator.
         """
         self.device = device
         self.rotor_diameter = rotor_diameter
@@ -82,6 +87,7 @@ class BatchPreparer:
         self.use_profiles = use_profiles
         self.rotate_profiles = rotate_profiles
         self.obs_normalizer = obs_normalizer
+        self.wd_attr = wd_attr
     
     def from_envs(
         self,
@@ -116,7 +122,8 @@ class BatchPreparer:
 
         # Query environment state (skip the IPC for anything passed in)
         if wind_dirs is None:
-            wind_dirs = np.array(envs.env.get_attr('wd'), dtype=np.float32)
+            wind_dirs = np.array(envs.env.get_attr(self.wd_attr),
+                                 dtype=np.float32)
         if raw_positions is None:
             raw_positions = np.array(envs.env.get_attr('turbine_positions'), dtype=np.float32)
         if masks is None:
@@ -207,6 +214,7 @@ class WindFarmAgent:
         use_profiles: bool = False,
         rotate_profiles: bool = False,
         obs_normalizer=None,
+        wd_attr: str = 'wd',
     ):
         """
         Args:
@@ -217,6 +225,7 @@ class WindFarmAgent:
             use_profiles: Whether to use receptivity/influence profiles
             rotate_profiles: Whether to rotate profiles to wind-relative frame
             obs_normalizer: Optional ObsRunningNorm (--obs_norm), see BatchPreparer
+            wd_attr: wd source attribute ('wd' or 'wd_est'), see BatchPreparer
         """
         self.actor = actor
         self.device = device
@@ -228,6 +237,7 @@ class WindFarmAgent:
             use_profiles=use_profiles,
             rotate_profiles=rotate_profiles,
             obs_normalizer=obs_normalizer,
+            wd_attr=wd_attr,
         )
     
     def act(

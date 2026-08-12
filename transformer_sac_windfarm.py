@@ -413,6 +413,27 @@ def main():
         "yaw_step_sim": args.yaw_step,
     }
 
+    # WD-estimation ladder: swap the privileged env.wd for the sensor-derived
+    # estimate. The env computes it from measurements it already takes
+    # (core/wd_estimator.py); rollout fetch + agent fetch + replay buffer all
+    # read through wd_source_attr, so gradients never see the true wd.
+    assert args.wd_source in ("true", "est"), (
+        f"--wd_source must be 'true' or 'est', got {args.wd_source!r}")
+    if args.wd_source == "est":
+        if args.backend == "pywake":
+            raise ValueError(
+                "--wd_source est requires --backend dynamiks: pywake's "
+                "adapter hard-codes v=w=0, so a measured local wind "
+                "direction does not exist there (atan2(v,u) == 0).")
+        if args.wd_est_tau is None:
+            raise ValueError("--wd_source est requires --wd_est_tau")
+        base_env_kwargs["wd_est_tau"] = float(args.wd_est_tau)
+        base_env_kwargs["wd_est_consensus"] = args.wd_est_consensus
+        print(f"wd source: ESTIMATED (tau={args.wd_est_tau}s, "
+              f"consensus={args.wd_est_consensus}) — the policy never "
+              f"sees the privileged env.wd")
+    wd_source_attr = "wd" if args.wd_source == "true" else "wd_est"
+
     # DEL-constrained reward: DELRewardWrapper compares agent DELs against a
     # greedy baseline farm, which only exists when the env is built with
     # Baseline_comp=True. With Power_reward="Baseline" (the power-max presets)
@@ -964,6 +985,9 @@ def main():
         # The evaluators share this agent, so eval act() calls are normalized
         # with the same (live) statistics as training — eval envs never go cold.
         obs_normalizer=obs_normalizer,
+        # PolicyEvaluator lets the agent fetch wd itself, so the wd source
+        # follows the agent into every eval pass too.
+        wd_attr=wd_source_attr,
     )
 
     # Update evaluator with actor reference
@@ -1735,8 +1759,10 @@ def main():
             )
             print(f"\n[Step {global_step}] Unfroze pretrained encoder parameters")
         
-        # Get environment info (needed for replay buffer)
-        wind_dirs = get_env_wind_directions(envs)
+        # Get environment info (needed for replay buffer). Under
+        # --wd_source est this fetches wd_est, so the buffer stores (and the
+        # policy trains on) the estimate — buffer honesty is automatic.
+        wind_dirs = get_env_wind_directions(envs, attr=wd_source_attr)
         raw_positions = get_env_raw_positions(envs)
         current_masks = get_env_attention_masks(envs)
 

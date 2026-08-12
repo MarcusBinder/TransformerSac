@@ -180,6 +180,20 @@ class Args:
     # versa). None = static per-episode wd (unchanged behavior).
     train_wd_function: Optional[str] = None
 
+    # === Wind-direction source (WD-estimation ladder, T3) ===
+    # What feeds the agent's rotation machinery (wind-relative position
+    # transform + profile rotation) AND the replay buffer's wind_directions:
+    # "true" = the privileged env.wd scalar (historical behavior); "est" = the
+    # sensor-derived env.wd_est (per-turbine circular EWMA + consensus,
+    # WindGym/core/wd_estimator.py). "est" requires backend=dynamiks —
+    # pywake's adapter hard-codes v=w=0, so no measured local wd exists there.
+    wd_source: str = "true"
+    # Estimator EWMA time constant (s); forwarded to the env when
+    # wd_source="est". Pick from the T1 probe against the T0 error budget.
+    wd_est_tau: Optional[float] = None
+    # Cross-turbine consensus: median (robust default) / mean / front.
+    wd_est_consensus: str = "median"
+
     # === Layout Settings ===
     # Comma-separated list of layouts. Single = single-layout, Multiple = multi-layout
     layouts: str = "test_layout"  # e.g., "square_1,square_2,circular_1"
