@@ -279,11 +279,22 @@ def make_dr_ramp(
 # 0.1325 deg/s by roughly a factor of 2 on each side.
 # dr_ramp_narrow: a *family* around the eval instance (45 deg total at ~0.1
 # deg/s) -- never the instance itself; see the leakage test.
+# dr_ramp_slow: QUASI-STATIC drift (Marcus 2026-08-13). rate_hi is chosen
+# BELOW the wd_slow frame slew limit of the largest DR training farms
+# (max_wd_step = max_turb_move*360/(2*pi*max_dist) per sim step ~= 0.019
+# deg/s for 16-turbine grids at dt_sim=5), so on dynamiks the WHOLE
+# excursion is tracked by the frame rotation: wd_small stays ~0, the wd
+# change only moves the MEAN conditions, and no farm (baseline, exploring
+# agent) can be pushed toward cut-in by an untrackable inflow tilt. A full
+# 40-50 deg excursion takes 2700-10000 s, i.e. roughly one slow sweep per
+# 5000 s training episode.
 TRAIN_WD_FACTORIES = {
     "dr_ramp": partial(make_dr_ramp, rate_lo=0.02, rate_hi=0.25,
                        exc_lo=10.0, exc_hi=60.0),
     "dr_ramp_narrow": partial(make_dr_ramp, rate_lo=0.09, rate_hi=0.14,
                               exc_lo=40.0, exc_hi=50.0),
+    "dr_ramp_slow": partial(make_dr_ramp, rate_lo=0.005, rate_hi=0.015,
+                            exc_lo=40.0, exc_hi=50.0),
 }
 
 
