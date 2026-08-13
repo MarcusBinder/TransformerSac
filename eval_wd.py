@@ -77,8 +77,14 @@ def load_checkpoint(checkpoint_path: str, device: torch.device):
 
 
 def create_eval_env(layout: str, args: dict, cli, wd_fn, seed: int,
-                    n_envs: int):
-    """One AsyncVectorEnv of MultiLayoutEnv slots pinned to one wd/ws cell."""
+                    n_envs: int, vector_cls=None):
+    """One vector env of MultiLayoutEnv slots pinned to one wd/ws cell.
+
+    vector_cls defaults to AsyncVectorEnv (the harvest path, unchanged).
+    wd_ramp_gif.py passes SyncVectorEnv with n_envs=1 so the env stays
+    IN-PROCESS -- the flow field (`fs`) cannot be pickled back across an async
+    worker pipe -- while agent.act() still runs the exact same code path.
+    """
     if args["turbtype"] == "DTU10MW":
         from py_wake.examples.data.dtu10mw import DTU10MW as WT
     elif args["turbtype"] == "V80":
@@ -192,7 +198,7 @@ def create_eval_env(layout: str, args: dict, cli, wd_fn, seed: int,
             )
         return _init
 
-    env = gym.vector.AsyncVectorEnv(
+    env = (vector_cls or gym.vector.AsyncVectorEnv)(
         [make_env_fn(seed + i) for i in range(n_envs)],
         autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,
     )
