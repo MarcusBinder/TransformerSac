@@ -735,16 +735,29 @@ def main():
         for _factory in eval_env_factories
     ]
 
+    # FORK SAFETY: create every evaluator's AsyncVectorEnv NOW — before the
+    # networks initialize the GPU (HIP/CUDA context) and before any gradient
+    # burst spins up torch/OMP threads — and keep them RESIDENT for the whole
+    # run. Lazily forking eval workers at the first mid-training eval is a
+    # fork-after-threads deadlock: the child inherits a lock some torch thread
+    # holds and hangs in futex_do_wait while the parent blocks on the worker
+    # pipe (observed on local CPU and on LUMI/ROCm, where it froze all six T3
+    # runs at their first 50k eval for 10+ hours). The training envs never
+    # deadlock for exactly this reason — they fork at startup. Resident cost
+    # is num_specs x num_envs idle workers; the eval layouts are capped small
+    # (square_2x2), so this is noise next to the 30 training envs.
+    for _ev in evaluators:
+        _ = _ev.eval_envs  # property; triggers AsyncVectorEnv creation
+
     def run_all_evaluations():
         """Evaluate on every eval wd schedule.
 
         Returns (metrics_dict, primary_metrics). The FIRST spec additionally
         writes the historical unprefixed eval/... keys so existing W&B panels and
         paper_figures.ipynb readers keep working; every spec also writes
-        eval/wd/<spec>/... . Extra evaluators are closed after their pass —
-        each holds its own num_envs-wide AsyncVectorEnv, and leaving them resident
-        would multiply the sweep's worker-process count per extra spec. They
-        are recreated lazily on the next eval cycle.
+        eval/wd/<spec>/... . Evaluators are deliberately NOT closed between
+        passes — their envs must stay resident (see the fork-safety note at
+        creation above).
         """
         metrics = {}
         primary = None
@@ -756,8 +769,6 @@ def main():
             if eval_spec_names:
                 metrics.update(m.to_dict(prefix=f"eval/wd/{eval_spec_names[i]}"))
                 print(f"  [{eval_spec_names[i]}] power ratio: {m.power_ratio:.4f}")
-            if i > 0:
-                ev.close()
         return metrics, primary
 
     def close_all_evaluators():
