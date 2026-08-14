@@ -22,7 +22,9 @@ from helpers.wd_functions import (
     get_train_wd_factory,
     get_wd_function,
     make_dr_ramp,
+    make_hold_ramp,
     parse_eval_ws,
+    static_235,
     static_315,
     step_ramp_270_315,
 )
@@ -133,7 +135,8 @@ def test_wd_stays_inside_the_training_wd_domain(name):
 
 @pytest.mark.parametrize(
     "name, rate_lo, rate_hi",
-    [("dr_ramp", 0.02, 0.25), ("dr_ramp_narrow", 0.09, 0.14)],
+    [("dr_ramp", 0.02, 0.25), ("dr_ramp_narrow", 0.09, 0.14),
+     ("dr_ramp_les", 0.03, 0.08)],
 )
 def test_instantaneous_rate_never_exceeds_the_declared_band(name, rate_lo, rate_hi):
     fn = get_train_wd_factory(name, seed=5)
@@ -145,7 +148,8 @@ def test_instantaneous_rate_never_exceeds_the_declared_band(name, rate_lo, rate_
 
 @pytest.mark.parametrize(
     "name, rate_lo, rate_hi",
-    [("dr_ramp", 0.02, 0.25), ("dr_ramp_narrow", 0.09, 0.14)],
+    [("dr_ramp", 0.02, 0.25), ("dr_ramp_narrow", 0.09, 0.14),
+     ("dr_ramp_les", 0.03, 0.08)],
 )
 def test_every_episode_actually_ramps(name, rate_lo, rate_hi):
     """A hold-only episode would silently turn the arm into a static-wd control."""
@@ -282,3 +286,95 @@ def test_make_dr_ramp_honours_custom_wd_bounds():
         wd = _trajectory(fn, base_wd=270.0)
         assert wd.min() >= 260.0 - 1e-6
         assert wd.max() <= 280.0 + 1e-6
+
+
+# ---------------------------------------------------------------------------
+# LES-3x3 scenario family (make_hold_ramp + static_235) -- endpoint/rate
+# asserts mirroring the static_315 block
+# ---------------------------------------------------------------------------
+
+LES_RAMP_RATE = 35.0 / 600.0  # deg/s of the target scenario's transition
+
+
+def test_hold_ramp_270_235_endpoints_and_rate():
+    fn = get_wd_function("hold_ramp_270_235")
+    # Holds: exactly 270 through the pre-hold, exactly 235 after the ramp.
+    assert float(fn(0.0)) == pytest.approx(270.0)
+    assert float(fn(2044.9)) == pytest.approx(270.0)
+    assert float(fn(2045.0 + 600.0)) == pytest.approx(235.0)
+    assert float(fn(10_000.0)) == pytest.approx(235.0)
+    # Ramp midpoint and constant rate.
+    assert float(fn(2045.0 + 300.0)) == pytest.approx(252.5)
+    t = np.arange(2045.0, 2045.0 + 600.0 + 1.0, 1.0)
+    rates = np.diff(np.asarray(fn(t), dtype=float))
+    np.testing.assert_allclose(rates, -LES_RAMP_RATE, atol=1e-9)
+
+
+def test_hold_ramp_270_235_short_is_the_same_ramp_moved_earlier():
+    long = get_wd_function("hold_ramp_270_235")
+    short = get_wd_function("hold_ramp_270_235_short")
+    # Identical trajectory once the pre-holds are aligned (300 s vs 2045 s).
+    t = np.arange(0.0, 1500.0, 10.0)
+    np.testing.assert_allclose(
+        np.asarray(short(t), dtype=float),
+        np.asarray(long(t + (2045.0 - 300.0)), dtype=float),
+    )
+    # And it fits the 140-step in-training eval: settled well before 1400 s.
+    assert float(short(900.0)) == pytest.approx(235.0)
+
+
+def test_hold_ramp_270_305_is_the_rate_matched_veer_mirror():
+    down = get_wd_function("hold_ramp_270_235")
+    up = get_wd_function("hold_ramp_270_305")
+    t = EPISODE_GRID
+    d_down = np.asarray(down(t), dtype=float) - 270.0
+    d_up = np.asarray(up(t), dtype=float) - 270.0
+    np.testing.assert_allclose(d_up, -d_down)  # same timing, opposite sign
+
+
+def test_hold_ramp_schedules_accept_scalar_and_array_t():
+    fn = get_wd_function("hold_ramp_270_235")
+    scalar = float(fn(2345.0))
+    arr = np.asarray(fn(np.array([2345.0])), dtype=float)
+    assert scalar == pytest.approx(arr[0])
+
+
+def test_hold_ramp_270_315_is_untouched_by_the_factory():
+    """T3 provenance guard: the legacy schedule stays verbatim (600/1200 shape),
+    NOT a make_hold_ramp instance (2045/600 shape)."""
+    legacy = get_wd_function("hold_ramp_270_315")
+    assert float(legacy(0.0)) == pytest.approx(270.0)
+    assert float(legacy(600.0 + 1200.0)) == pytest.approx(315.0)
+    assert float(legacy(1200.0)) == pytest.approx(270.0 + 45.0 * (600.0 / 1200.0))
+
+
+def test_static_235_is_constant_and_matches_the_ramp_endpoint():
+    ramp = get_wd_function("hold_ramp_270_235")
+    for t in (0.0, 1.0, 300.0, 1000.0, 5000.0):
+        assert float(static_235(t)) == pytest.approx(235.0)
+    wd = static_235(EPISODE_GRID)
+    assert wd.shape == EPISODE_GRID.shape
+    np.testing.assert_allclose(wd, 235.0)
+    assert float(static_235(0.0)) == pytest.approx(float(ramp(5000.0)))
+
+
+def test_les_schedules_are_registered_as_eval_not_train():
+    for name in ("hold_ramp_270_235", "hold_ramp_270_235_short",
+                 "hold_ramp_270_305", "static_235"):
+        assert callable(get_wd_function(name))
+        assert name not in TRAIN_WD_FACTORIES
+    assert "dr_ramp_les" in TRAIN_WD_FACTORIES
+    assert "dr_ramp_les" not in WD_FUNCTIONS
+
+
+def test_dr_ramp_les_stays_below_the_mtm12_frame_slew_limit():
+    """The design invariant of the campaign: EVERY dr_ramp_les rate must be
+    trackable by the les_3x3 frame at max_turb_move=12 (slew limit
+    12*360/(2*pi*1533.8)/5 = 0.0897 deg/s), so wd_small == 0 throughout
+    training and env.wd is exact and causal."""
+    frame_slew = 12.0 * 360.0 / (2.0 * np.pi * 1533.8) / 5.0
+    fn = get_train_wd_factory("dr_ramp_les", seed=5)
+    for _ in range(50):
+        wd = _trajectory(fn)
+        rates = np.abs(np.diff(wd)) / DT_SIM
+        assert rates.max() < frame_slew

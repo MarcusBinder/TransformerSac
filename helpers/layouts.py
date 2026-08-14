@@ -31,6 +31,10 @@ def get_layout_positions(layout_type: str, wind_turbine) -> Tuple[np.ndarray, np
         "square_5x5": lambda: generate_square_grid(turbine=wind_turbine, nx=5, ny=5, xDist=6, yDist=6),
         "small_triangle": lambda: generate_right_triangle_grid(turbine=wind_turbine, nx=2, ny=3, xDist=5, yDist=5),
         "square_3x3": lambda: generate_square_grid(turbine=wind_turbine, nx=3, ny=3, xDist=5, yDist=5),
+        # LES-scenario farm (LESRL recipe): 3x3 at 7D streamwise x 5D lateral.
+        # For DTU10MW (D=178.3 m) the positions are identical to v4_lo_grid_4;
+        # the name pins the LES 270->235 campaign to a stable identifier.
+        "les_3x3": lambda: generate_square_grid(turbine=wind_turbine, nx=3, ny=3, xDist=7, yDist=5),
         "circular_6": lambda: generate_cirular_farm(n_list=[1, 5], turbine=wind_turbine, r_dist=5),
         "circular_10": lambda: generate_cirular_farm(n_list=[3, 7], turbine=wind_turbine, r_dist=5),
         "tri1": lambda: generate_right_triangle_grid(turbine=wind_turbine, nx=2, ny=2, xDist=5, yDist=5, orientation='lower_left'),

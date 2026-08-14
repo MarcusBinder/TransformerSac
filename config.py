@@ -74,6 +74,18 @@ class Args:
     # substep (mirrors yaw_step_sim; windgym config key "derate_step_sim").
     # None = setpoint applies instantly (windgym default).
     derate_step_sim: Optional[float] = None
+    # Max apparent turbine displacement per sim step (m) — dynamiks'
+    # max_turb_move, which is the SOLE input to the wd_slow frame slew limit
+    # (max_wd_step = max_turb_move*360/(2*pi*max_dist) per sim step; its only
+    # consumer in dynamiks). At the 2 m default a moving wd schedule mostly
+    # lands in wd_small (a lateral inflow tilt the yaw model cannot see);
+    # raising it until the clip never binds makes wd_slow == schedule exactly,
+    # wd_small == 0, and env.wd exact AND causal (the fwd/bwd smoothing
+    # degenerates to identity). LES-3x3 campaign trains at 12 (frame slew
+    # 0.0897 deg/s > every dr_ramp_les rate). None = env default (2 m).
+    # Forwarded as a WindFarmEnv ctor kwarg via base_env_kwargs, so train and
+    # eval envs stay consistent (eval_wd.py has the matching flag).
+    max_turb_move: Optional[float] = None
     max_eps: int = 20         # Number of flow passthroughs per episode
     num_envs: int = 1         # Number of parallel environments
 
@@ -121,6 +133,20 @@ class Args:
     power_reward: Optional[str] = None      # power_def["Power_reward"]: "Baseline" | "Wake_recovery" | ...
     power_avg: Optional[int] = None         # power_def["Power_avg"]: reward power-averaging window
     power_scaling: Optional[float] = None   # power_def["Power_scaling"]: uniform reward gain
+
+    # === Yaw-actuation penalty (LES-3x3 campaign) ===
+    # act_pen["action_penalty"] / ["action_penalty_type"] overrides. The windgym
+    # machinery (reward_calculator.py: "change" = penalty * mean(|delta yaw|)
+    # per env step, in raw degrees, subtracted from the reward) has always
+    # existed but every preset hardcodes 0.0 and no CLI flag reached it.
+    # LESRL swept {0.01, 0.05, 0.1} on the LES3X3 recipe: 0.05 was the Pareto
+    # point (peak energy, ~10x less yaw travel), directly addressing the
+    # HANDOVER 6.4 thrash finding (5-6 deg/step motion in dead-steady wind).
+    # Magnitude: max |delta yaw|/env step = 10 deg at yaw_step 5 -> penalty
+    # 0.05 caps at 0.5/step vs Wake_recovery's ~0.02-0.1/step reward.
+    # None = "don't override" -> the preset's value (0.0 everywhere) wins.
+    action_penalty: Optional[float] = None       # act_pen["action_penalty"]
+    action_penalty_type: Optional[str] = None    # act_pen["action_penalty_type"], e.g. "Change"
 
     # === Training wind-speed range override (change_wd_3) ===
     # Override wind.ws_min / wind.ws_max for the TRAINING envs only; eval envs are

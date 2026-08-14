@@ -413,6 +413,18 @@ def main():
         "yaw_step_sim": args.yaw_step,
     }
 
+    # LES-3x3 campaign: relax dynamiks' apparent-turbine-motion cap so the
+    # wd_slow frame can track a moving wd schedule (its ONLY consumer is the
+    # frame slew limit max_wd_step = max_turb_move*360/(2*pi*max_dist) per sim
+    # step). Large enough that the clip never binds => wd_slow == schedule,
+    # wd_small == 0, and env.wd is exact AND causal. Spread into all three env
+    # factories (train / in-training eval / train-wd) via base_env_kwargs, so
+    # train and eval physics stay consistent. None = env default (2 m).
+    if args.max_turb_move is not None:
+        base_env_kwargs["max_turb_move"] = float(args.max_turb_move)
+        print(f"max_turb_move set to: {base_env_kwargs['max_turb_move']} m "
+              f"(wd_slow frame slew limit scales with it)")
+
     # WD-estimation ladder: swap the privileged env.wd for the sensor-derived
     # estimate. The env computes it from measurements it already takes
     # (core/wd_estimator.py); rollout fetch + agent fetch + replay buffer all

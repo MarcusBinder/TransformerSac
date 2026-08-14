@@ -117,11 +117,72 @@ def hold_ramp_270_315(t):
     return wd
 
 
+def static_235(t):
+    """Constant 235 deg — static-wd control matching hold_ramp_270_235's END.
+
+    Same rationale as static_315: without the endpoint control, the
+    ramp-vs-static gap conflates "tracking a moving wd is hard" with "the
+    endpoint simply has less to gain". On les_3x3 (7D x 5D grid) this is
+    acute: atan2(891.5, 1248.1) = 35.5 deg puts 235 deg almost exactly on
+    the shallow-wake diagonal (234.5 deg), while 270 deg is deep-wake
+    row-aligned — the two endpoints have very different wake-steering
+    headroom, so the scenario metric must be whole-trajectory energy, not
+    an end-state ratio.
+    """
+    t = np.asarray(t)
+    return np.full_like(t, 235.0, dtype=float)
+
+
+def make_hold_ramp(wd_from: float, wd_to: float, t_hold_pre: float, t_ramp: float):
+    """Build a hold -> single linear ramp -> hold eval schedule, ``f(t) -> wd``.
+
+    Generalizes ``hold_ramp_270_315`` (kept verbatim above for T3 provenance):
+    ``wd_from`` until ``t_hold_pre``, then a linear ramp to ``wd_to`` over
+    ``t_ramp`` seconds, then ``wd_to`` forever. The trailing hold has no end —
+    the episode length decides how much of it is sampled.
+
+    Registered instances (LES-3x3 campaign): holds are sized as 6 flow
+    passthroughs of the les_3x3 farm (max pairwise extent 3067.6 m) at the
+    nominal 9 m/s -> 2045 s; the 35 deg / 600 s ramp is 0.0583 deg/s, which the
+    mean-flow frame tracks EXACTLY once max_turb_move raises the frame slew
+    limit above it (mtm=12 -> 0.0897 deg/s on les_3x3), so wd_small stays 0 and
+    env.wd is exact and causal — unlike hold_ramp_270_315 at the 2 m default.
+    """
+    wd_from, wd_to = float(wd_from), float(wd_to)
+    t_hold_pre, t_ramp = float(t_hold_pre), float(t_ramp)
+    if t_ramp <= 0:
+        raise ValueError(f"t_ramp must be > 0, got {t_ramp}")
+
+    def _hold_ramp(t):
+        t = np.asarray(t)
+        wd = np.full_like(t, wd_from, dtype=float)
+        ramping = (t >= t_hold_pre) & (t < t_hold_pre + t_ramp)
+        wd[ramping] = wd_from + (wd_to - wd_from) * ((t[ramping] - t_hold_pre) / t_ramp)
+        wd[t >= t_hold_pre + t_ramp] = wd_to
+        return wd
+
+    _hold_ramp.__name__ = f"hold_ramp_{wd_from:g}_{wd_to:g}"
+    _hold_ramp.__doc__ = (
+        f"{wd_from:g} deg for {t_hold_pre:g} s, linear ramp to {wd_to:g} deg over "
+        f"{t_ramp:g} s ({abs(wd_to - wd_from) / t_ramp:.4f} deg/s), then hold."
+    )
+    return _hold_ramp
+
+
 WD_FUNCTIONS = {
     "step_ramp_270_315": step_ramp_270_315,
     "hold_ramp_270_315": hold_ramp_270_315,
     "static_270": static_270,
     "static_315": static_315,
+    "static_235": static_235,
+    # --- LES-3x3 scenario family (les_3x3 layout, DTU10MW, see make_hold_ramp) ---
+    # The target scenario: 6 passthroughs @270 (deep-wake rows), 35 deg down-ramp
+    # in 600 s, then 235 (shallow-wake diagonal). 470 env steps @ dt_env=10.
+    "hold_ramp_270_235": make_hold_ramp(270.0, 235.0, 2045.0, 600.0),
+    # Short-hold variant that fits the 140-step in-training eval window.
+    "hold_ramp_270_235_short": make_hold_ramp(270.0, 235.0, 300.0, 600.0),
+    # Rate-matched VEER mirror (270 -> +35 deg) for the up/down asymmetry check.
+    "hold_ramp_270_305": make_hold_ramp(270.0, 305.0, 2045.0, 600.0),
 }
 
 
@@ -331,6 +392,16 @@ TRAIN_WD_FACTORIES = {
                               exc_lo=40.0, exc_hi=50.0),
     "dr_ramp_slow": partial(make_dr_ramp, rate_lo=0.005, rate_hi=0.015,
                             exc_lo=40.0, exc_hi=50.0),
+    # dr_ramp_les: LES-3x3 campaign DR. Brackets the target scenario's
+    # 0.0583 deg/s and 35 deg excursion (hold_ramp_270_235) without ever
+    # containing the instance. rate_hi = 0.08 is deliberately BELOW the
+    # les_3x3 frame slew limit at the campaign's max_turb_move=12
+    # (12*360/(2*pi*1533.8)/dt_sim=5 -> 0.0897 deg/s), so the ENTIRE
+    # training distribution is frame-tracked: wd_slow == schedule,
+    # wd_small == 0, and env.wd is exact and causal everywhere the
+    # policy trains.
+    "dr_ramp_les": partial(make_dr_ramp, rate_lo=0.03, rate_hi=0.08,
+                           exc_lo=25.0, exc_hi=45.0),
 }
 
 

@@ -268,6 +268,27 @@ ENV_CONFIGS: Dict[str, Dict[str, Any]] = {
     # default "Local" would chase wake-perturbed local wind directions and add
     # noise to both the reward and the DEL ratio. Fixed inflow (ws=10, wd=270,
     # TI=0.06) matches the power_tracking presets.
+    # LES-3x3 campaign (270 -> 235 scenario on les_3x3, no privileged wd).
+    # hard_2's reward (Wake_recovery, Power_avg 5) + the LESRL "good recipe"
+    # physical envelope: yaw band +-45 (hard_2's +-30 is tight against a 35 deg
+    # swing — nacelles are world-fixed under frame rotation, so frame-relative
+    # yaw drifts by the full 35 deg during the transition), ws 8-11 (brackets
+    # the scenario's nominal 9-10; DTU10MW rates at 11.4 so headroom exists
+    # everywhere), TI 0.038 fixed (LESRL value). wd domain stays [225, 315] so
+    # dr_* train schedules compose unchanged. The preset carries the physical
+    # envelope (no CLI flags exist for yaw band / TI); the campaign's CONTRAST
+    # levers stay CLI flags (--action_penalty, --max_turb_move,
+    # --train_wd_function, ws overrides).
+    "les_recipe": {
+        "power_def": {"Power_reward": "Wake_recovery", "Power_avg": 5, "Power_scaling": 1.0},
+        "farm": {"yaw_min": -45, "yaw_max": 45},
+        "wind": {
+            "wd_min": 225, "wd_max": 315,
+            "ws_min": 8, "ws_max": 11,
+            "TI_min": 0.038, "TI_max": 0.038,
+        },
+    },
+
     "power_max_derate": {
         "BaseController": "Global",
         "yaw_action": True,
@@ -338,6 +359,8 @@ _OVERRIDE_MAP = (
     ("power_scaling", "power_def", "Power_scaling"),
     ("train_ws_min",  "wind",      "ws_min"),
     ("train_ws_max",  "wind",      "ws_max"),
+    ("action_penalty",      "act_pen", "action_penalty"),
+    ("action_penalty_type", "act_pen", "action_penalty_type"),
 )
 
 
