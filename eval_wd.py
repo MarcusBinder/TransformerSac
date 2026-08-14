@@ -442,6 +442,14 @@ def main():
                              "(e.g. MannGenerate).")
     parser.add_argument("--dt_sim", type=int, default=None)
     parser.add_argument("--dt_env", type=int, default=None)
+    parser.add_argument("--max_turb_move", type=float, default=None,
+                        help="Override windgym's 2 m default. Nominally a DWM "
+                             "solver-stability knob, but MetmastSite derives "
+                             "the wd frame's rate limit from it "
+                             "(max_turb_move*360/(2*pi*max_dist) per sim "
+                             "step), so raising it lets the frame follow the "
+                             "schedule instead of leading/trailing it. "
+                             "Unset = the T3 harvest's behaviour.")
     parser.add_argument("--out", required=True)
     parser.add_argument("--num-episodes", type=int, default=None,
                         help="Default: one batch (= --num-envs).")
@@ -509,6 +517,10 @@ def main():
         "TI_type": cli.TI_type or args["TI_type"],
         "dt_sim": cli.dt_sim if cli.dt_sim is not None else args["dt_sim"],
         "dt_env": dt_env,
+        # -1 = not overridden, i.e. windgym's 2 m default (the T3 harvest).
+        # Recorded so cells from a max_turb_move sweep stay distinguishable.
+        "max_turb_move": (cli.max_turb_move if cli.max_turb_move is not None
+                          else -1.0),
         "num_episodes": cli.num_episodes,
         "num_steps": cli.num_steps,
         "seed": cli.seed,
