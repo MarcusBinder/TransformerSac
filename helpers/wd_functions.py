@@ -82,8 +82,44 @@ def static_315(t):
     return np.full_like(t, 315.0, dtype=float)
 
 
+def hold_ramp_270_315(t):
+    """Two steady states with one slow transition between them (Marcus).
+
+    270 deg for 600 s, a single linear 45 deg ramp over 1200 s
+    (0.0375 deg/s), then 315 deg for 600 s. Episode completes at t = 2400 s.
+
+    Why this exists alongside ``step_ramp_270_315``: that schedule packs TWO
+    ramps (270 -> 296.5 -> 315) with 300 s holds and 200 s transitions, i.e.
+    0.09-0.13 deg/s, which is 5-7x the wd_slow frame's rate limit and leaves
+    the policy no settled interval to be read off. This one isolates
+    steady -> transition -> steady.
+
+    NOTE the transition is still ~2x the frame's rate limit (0.0182 deg/s on
+    square_3x3 at dt_sim=5, = max_turb_move*360/(2*pi*max_dist)/dt_sim), so
+    ``env.wd`` will not track it exactly -- MetmastSite's wd_slow is the mean
+    of a FORWARD and a BACKWARD rate-limited pass, so it leads the ramp before
+    it starts and trails it after (see HANDOVER section 4 finding 1). The
+    residual goes into wd_small as inflow tilt, so the flow the rotors
+    actually see is always this schedule exactly. A ramp slower than
+    0.0182 deg/s (>= ~2475 s for 45 deg) would make wd_slow == this schedule
+    with wd_small == 0.
+    """
+    t = np.asarray(t)
+
+    wd_lo, wd_hi = 270.0, 315.0
+    t_hold = 600.0          # seconds at each steady direction
+    t_ramp = 1200.0         # seconds of transition -> 0.0375 deg/s
+
+    wd = np.full_like(t, wd_lo, dtype=float)
+    ramping = (t >= t_hold) & (t < t_hold + t_ramp)
+    wd[ramping] = wd_lo + (wd_hi - wd_lo) * ((t[ramping] - t_hold) / t_ramp)
+    wd[t >= t_hold + t_ramp] = wd_hi
+    return wd
+
+
 WD_FUNCTIONS = {
     "step_ramp_270_315": step_ramp_270_315,
+    "hold_ramp_270_315": hold_ramp_270_315,
     "static_270": static_270,
     "static_315": static_315,
 }
