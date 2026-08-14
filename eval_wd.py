@@ -154,6 +154,15 @@ def create_eval_env(layout: str, args: dict, cli, wd_fn, seed: int,
     for k in ("ws_scaling_min", "ws_scaling_max"):
         if args.get(k) is not None:
             base_env_kwargs[k] = float(args[k])
+    # Frame-rotation rate limit. max_turb_move is nominally a DWM solver
+    # stability knob (how far a turbine may move per timestep), but
+    # MetmastSite derives its wd_slow rate limit from it --
+    # max_turb_move*360/(2*pi*max_dist) per sim step -- so raising it lets the
+    # frame actually follow the wd schedule instead of leading/trailing it.
+    # Only forwarded when explicitly set, so the T3 harvest keeps windgym's
+    # default of 2 m.
+    if getattr(cli, "max_turb_move", None) is not None:
+        base_env_kwargs["max_turb_move"] = float(cli.max_turb_move)
     if cli.wd_source == "est":
         if backend == "pywake":
             raise SystemExit(
