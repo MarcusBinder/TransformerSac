@@ -289,6 +289,23 @@ ENV_CONFIGS: Dict[str, Dict[str, Any]] = {
         },
     },
 
+    # LES-3x3 Stage 3 narrow-band retreat: EXACT clone of les_recipe with the
+    # wd domain shrunk to [265, 275] (static wd ~ U[265, 275] per episode when
+    # no --train_wd_function is given). Nothing else differs, so Stage-2
+    # checkpoints (les_recipe) remain a clean control: eval_wd rebuilds the env
+    # from the checkpoint's preset, and the only knob that moves is the band.
+    # A separate preset is needed because no CLI flag overrides wd_min/wd_max
+    # (see _OVERRIDE_MAP) and dr_ramp_* schedules clamp to their OWN [225, 315].
+    "les_recipe_nb": {
+        "power_def": {"Power_reward": "Wake_recovery", "Power_avg": 5, "Power_scaling": 1.0},
+        "farm": {"yaw_min": -45, "yaw_max": 45},
+        "wind": {
+            "wd_min": 265, "wd_max": 275,
+            "ws_min": 8, "ws_max": 11,
+            "TI_min": 0.038, "TI_max": 0.038,
+        },
+    },
+
     "power_max_derate": {
         "BaseController": "Global",
         "yaw_action": True,

@@ -23,6 +23,7 @@ from helpers.wd_functions import (
     get_wd_function,
     make_dr_ramp,
     make_hold_ramp,
+    make_static,
     parse_eval_ws,
     static_235,
     static_315,
@@ -378,3 +379,56 @@ def test_dr_ramp_les_stays_below_the_mtm12_frame_slew_limit():
         wd = _trajectory(fn)
         rates = np.abs(np.diff(wd)) / DT_SIM
         assert rates.max() < frame_slew
+
+
+# ---------------------------------------------------------------------------
+# LES-3x3 Stage 3: narrow-band retreat (les_recipe_nb, wd in [265, 275])
+# ---------------------------------------------------------------------------
+
+NB_RAMP_RATE = 5.0 / 300.0  # deg/s of the in-band 5 deg / 300 s ramps
+
+
+def test_stage3_schedules_are_registered_as_eval_not_train():
+    for name in ("static_265", "static_275", "hold_ramp_270_275",
+                 "hold_ramp_270_265", "hold_ramp_270_275_short"):
+        assert callable(get_wd_function(name))
+        assert name not in TRAIN_WD_FACTORIES
+
+
+def test_make_static_is_constant_and_named():
+    fn = make_static(265.0)
+    assert fn.__name__ == "static_265"
+    wd = fn(EPISODE_GRID)
+    assert wd.shape == EPISODE_GRID.shape
+    np.testing.assert_allclose(wd, 265.0)
+    assert float(get_wd_function("static_275")(4321.0)) == pytest.approx(275.0)
+    assert float(get_wd_function("static_265")(0.0)) == pytest.approx(265.0)
+
+
+@pytest.mark.parametrize("name,wd_to", [("hold_ramp_270_275", 275.0),
+                                        ("hold_ramp_270_265", 265.0)])
+def test_nb_hold_ramps_endpoints_rate_and_band(name, wd_to):
+    fn = get_wd_function(name)
+    assert float(fn(0.0)) == pytest.approx(270.0)
+    assert float(fn(2044.0)) == pytest.approx(270.0)
+    assert float(fn(2045.0 + 300.0)) == pytest.approx(wd_to)
+    assert float(fn(5000.0)) == pytest.approx(wd_to)
+    wd = fn(EPISODE_GRID)
+    rates = np.abs(np.diff(wd)) / DT_SIM
+    assert rates.max() == pytest.approx(NB_RAMP_RATE)
+    # Whole trajectory stays inside the les_recipe_nb training band.
+    assert wd.min() >= 265.0 - 1e-9 and wd.max() <= 275.0 + 1e-9
+    # Static endpoint controls match the ramp endpoints exactly.
+    assert float(get_wd_function(f"static_{wd_to:g}")(0.0)) == pytest.approx(float(fn(5000.0)))
+    # 30 env steps (dt_env 10) of ramp -> windowable, unlike a 5 deg ramp at
+    # the 0.0583 deg/s scenario rate (~9 steps).
+    assert 300.0 / 10.0 == 30
+
+
+def test_hold_ramp_270_275_short_is_the_same_ramp_moved_earlier():
+    long = get_wd_function("hold_ramp_270_275")
+    short = get_wd_function("hold_ramp_270_275_short")
+    t = np.arange(0.0, 300.0 + 300.0 + 200.0, DT_SIM)
+    np.testing.assert_allclose(short(t), long(t + (2045.0 - 300.0)))
+    # Fits the 140-step (1400 s) in-training eval window with a trailing hold.
+    assert float(short(1399.0)) == pytest.approx(275.0)

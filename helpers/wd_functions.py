@@ -169,6 +169,23 @@ def make_hold_ramp(wd_from: float, wd_to: float, t_hold_pre: float, t_ramp: floa
     return _hold_ramp
 
 
+def make_static(wd: float):
+    """Build a constant-wd eval schedule ``f(t) -> wd`` (see static_270/235).
+
+    Registered instances (LES-3x3 Stage 3): the 265/275 endpoints of the
+    narrow-band retreat (les_recipe_nb, wd ~ U[265, 275]).
+    """
+    wd = float(wd)
+
+    def _static(t):
+        t = np.asarray(t)
+        return np.full_like(t, wd, dtype=float)
+
+    _static.__name__ = f"static_{wd:g}"
+    _static.__doc__ = f"Constant {wd:g} deg."
+    return _static
+
+
 WD_FUNCTIONS = {
     "step_ramp_270_315": step_ramp_270_315,
     "hold_ramp_270_315": hold_ramp_270_315,
@@ -183,6 +200,17 @@ WD_FUNCTIONS = {
     "hold_ramp_270_235_short": make_hold_ramp(270.0, 235.0, 300.0, 600.0),
     # Rate-matched VEER mirror (270 -> +35 deg) for the up/down asymmetry check.
     "hold_ramp_270_305": make_hold_ramp(270.0, 305.0, 2045.0, 600.0),
+    # --- LES-3x3 Stage 3: narrow-band retreat (les_recipe_nb, wd in [265, 275]) ---
+    # In-band statics at the band edges (270 is the centre, kept above).
+    "static_265": make_static(265.0),
+    "static_275": make_static(275.0),
+    # 5 deg in-band ramps at 0.0167 deg/s (300 s = 30 env steps @ dt_env=10):
+    # slow enough that the ramp is windowable; the scenario rate (0.0583 deg/s)
+    # would make a 5 deg ramp only ~9 steps. Same 2045 s pre-hold -> 470 steps.
+    "hold_ramp_270_275": make_hold_ramp(270.0, 275.0, 2045.0, 300.0),
+    "hold_ramp_270_265": make_hold_ramp(270.0, 265.0, 2045.0, 300.0),
+    # Short-hold variant for the 140-step in-training eval (300 s hold + 300 s ramp).
+    "hold_ramp_270_275_short": make_hold_ramp(270.0, 275.0, 300.0, 300.0),
 }
 
 
