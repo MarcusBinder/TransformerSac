@@ -361,6 +361,23 @@ class Args:
     del_limit_lo: float = 0.0
     del_limit_hi: float = 0.3
     del_limit_obs_ref: float = 0.3   # obs normalization denominator; keep fixed across checkpoints
+    # === Proxy-zoo load reward (alternative to the NN DEL surrogate) ===
+    # Set load_proxies (CSV of proxy_zoo registry names, e.g.
+    # "p20_ct,p12_thrust_std") to swap DELRewardWrapper for
+    # proxy_zoo.ProxyRewardWrapper at the same position in the stack: every
+    # listed proxy is computed per step (agent + baseline farm) and lands in
+    # info["loads"][name]; the penalty is computed on load_reward_proxies
+    # (default: all of load_proxies; several -> worst binds). Reuses
+    # del_penalty_scale / del_allowed_increase / del_limit_* / del_ti_window /
+    # del_log unchanged; incompatible with an explicit del_channels.
+    load_proxies: Optional[str] = None
+    load_reward_proxies: Optional[str] = None
+    # Comparison rule + penalty kind, applied to BOTH the surrogate and the
+    # proxy path (defaults reproduce the historical farm-max hinge):
+    #   compare: farm_max | farm_mean | per_turbine_max
+    #   penalty: hinge (baseline-relative) | absolute (reward -= lambda*agg)
+    load_compare: str = "farm_max"
+    load_penalty: str = "hinge"
 
     # === PPO Hyperparameters (transformer_ppo_windfarm.py only) ===
     # Reused existing fields: gamma, total_timesteps, num_envs, policy_lr,

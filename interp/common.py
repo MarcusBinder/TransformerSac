@@ -44,6 +44,7 @@ from helpers.helper_funcs import EnhancedPerTurbineWrapper
 from WindGym import WindFarmEnv
 from WindGym.wrappers import PerTurbineObservationWrapper
 from del_surrogate.reward_wrapper import DELRewardWrapper
+from helpers.load_reward import build_load_reward_wrapper
 from del_surrogate.model import DEFAULT_CHANNEL
 # prepare_batch/compute_profiles are the attention-eval rollout skeleton,
 # reused as-is (they only touch env attributes MultiLayoutEnv exposes).
@@ -211,24 +212,9 @@ def build_delmax_env(
         env = PerTurbineObservationWrapper(env)
         if args["use_wd_deviation"]:
             env = EnhancedPerTurbineWrapper(env, wd_scale_range=args["wd_scale_range"])
-        # DEL surrogate set follows the checkpoint's turbine (same derivation
-        # as the trainers); del_channels drives multi-channel penalties.
-        del_turbine = args.get("del_artifact_set") or {
-            "IEA34": "iea34", "DTU10MW": "dtu10mw",
-        }[args["turbtype"]]
-        del_channels = [
-            ch.strip() for ch in str(args["del_channels"]).split(",") if ch.strip()
-        ]
-        del_kwargs = dict(
-            turbine=del_turbine,
-            channels=del_channels,
-            reward_channels=del_channels,
-            penalty_scale=args["del_penalty_scale"],
-            allowed_increase=args["del_allowed_increase"],
-            ti_window=args["del_ti_window"],
-            n_r=3,
-            n_theta=12,
-        )
+        # DEL surrogate (default) or proxy zoo (load_proxies), same factory
+        # as the trainers; del_channels drives multi-channel penalties.
+        del_kwargs = {}
         if randlim:
             # limit_range switches the limit-obs column ON (obs width +1);
             # obs_ref must stay the training value or the column rescales.
@@ -238,7 +224,7 @@ def build_delmax_env(
             # fixed_limit pins the episode limit but leaves limit_obs alone,
             # so it is safe for both randlim and plain-delmax envs.
             del_kwargs["fixed_limit"] = float(fixed_limit)
-        return DELRewardWrapper(env, **del_kwargs)
+        return build_load_reward_wrapper(env, args, **del_kwargs)
 
     env = MultiLayoutEnv(
         layouts=[LayoutConfig(name=layout_name, x_pos=x_pos, y_pos=y_pos)],

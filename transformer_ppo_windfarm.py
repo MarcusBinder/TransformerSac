@@ -583,37 +583,19 @@ def main():
         # DEL hinge penalty BEFORE TransformReward (see the SAC trainer for the
         # ordering rationale — penalty is in pre-reward_scale units).
         if args.del_penalty_scale > 0 or args.del_log:
-            if _REPO_ROOT not in sys.path:
-                sys.path.insert(0, _REPO_ROOT)
-            from del_surrogate import DELRewardWrapper
-
-            # DEL surrogate set follows the turbine unless overridden.
-            del_turbine = args.del_artifact_set or {
-                "IEA34": "iea34", "DTU10MW": "dtu10mw",
-            }.get(args.turbtype)
-            if del_turbine is None:
-                raise ValueError(
-                    f"No DEL surrogate set for turbtype {args.turbtype!r}; "
-                    "pass --del_artifact_set explicitly."
-                )
-            del_channels = [
-                c.strip() for c in args.del_channels.split(",") if c.strip()
-            ]
-            env = DELRewardWrapper(
-                env,
-                turbine=del_turbine,
-                channels=del_channels,
-                reward_channels=del_channels,
-                penalty_scale=args.del_penalty_scale,
-                allowed_increase=args.del_allowed_increase,
+            # NN DEL surrogate (default) or proxy zoo (--load_proxies); the
+            # comparison rule / penalty kind come from --load_compare /
+            # --load_penalty. Goal-conditioned limit: per-episode uniform
+            # sample + one obs column per turbine (limit / del_limit_obs_ref).
+            # None keeps the fixed allowed_increase behavior bit-identical.
+            from helpers.load_reward import build_load_reward_wrapper
+            env = build_load_reward_wrapper(
+                env, args,
                 limit_range=(
                     (args.del_limit_lo, args.del_limit_hi)
                     if args.del_limit_random else None
                 ),
                 limit_obs_ref=args.del_limit_obs_ref,
-                ti_window=args.del_ti_window,
-                n_r=3,
-                n_theta=12,
             )
         if args.reward_scale != 1.0:
             _scale = float(args.reward_scale)
@@ -1014,19 +996,10 @@ def main():
     # Canonicalized ("wtow_H0FAMnt" -> "H0FAMnt") to match the names the
     # wrapper reports in info["del_binding_channel"].
     del_binding_window = deque(maxlen=1000)
-    _del_reward_channels = [
-        c.strip() for c in args.del_channels.split(",") if c.strip()
-    ]
+    _del_reward_channels = []
     if _del_active:
-        if _REPO_ROOT not in sys.path:
-            sys.path.insert(0, _REPO_ROOT)
-        from del_surrogate import get_set as _del_get_set
-        _del_tset = _del_get_set(args.del_artifact_set or {
-            "IEA34": "iea34", "DTU10MW": "dtu10mw",
-        }[args.turbtype])
-        _del_reward_channels = [
-            _del_tset.canonical_channel(c) for c in _del_reward_channels
-        ]
+        from helpers.load_reward import load_reward_channels
+        _del_reward_channels = load_reward_channels(args)
 
     # One-time sanity check: on the very first minibatch (before any gradient
     # step) the recomputed log-prob must equal the rollout one, i.e. ratio ≈ 1.
