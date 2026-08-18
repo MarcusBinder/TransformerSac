@@ -194,6 +194,18 @@ class Args:
     # concatenated — requires obs_dim_per_turbine == 4*history_length, so it
     # hard-fails if combined with an expanding --obs_encoding (intended).
     obs_encoder_mode: str = "shared"
+    # LES-3x3 Stage 4: replace the per-turbine [ws|wd|yaw|power] x H raw-sample
+    # vector with an aggregate scheme (helpers/obs_agg.py AGG_MODES: latest |
+    # mean_std | ema | trend | minmax | quantiles | raw15 | spectral |
+    # spatial_rel; raw3 is a seam test) computed over the env's L-long
+    # measurement deques. WARNING: like --obs_encoding this CHANGES THE OBS
+    # CONTRACT (width 4*K per turbine, fixed physical scales, no --obs_norm);
+    # the checkpoint carries both flags so eval_wd rebuilds the same wrapper.
+    # Mutually exclusive with --obs_encoding, --use_wd_deviation,
+    # --obs_encoder_mode per_sensor and the DEL wrapper. obs_agg_len also
+    # lengthens the reset burn-in to max(power_avg, obs_agg_len) env steps.
+    obs_agg: Optional[str] = None
+    obs_agg_len: int = 30
 
     # === Training wind-direction schedule ===
     # Named randomized wd schedule from the TRAIN registry (helpers/wd_functions.py

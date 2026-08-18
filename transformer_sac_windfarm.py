@@ -389,11 +389,38 @@ def main():
         "derate_mes": "derate",
     }
 
+    # LES-3x3 Stage 4 (--obs_agg): the ObsAggWrapper reduces the env's raw
+    # measurement deques itself, so only the DEQUE length grows to obs_agg_len
+    # (history_N, i.e. the base obs width the wrapper replaces, is unchanged).
+    # The env's reset burn-in follows max_hist(), so all L samples are filled
+    # before the first observation (+L-power_avg sim steps per reset).
+    mes_history_length = args.history_length
+    if args.obs_agg:
+        if args.obs_encoding:
+            raise ValueError("--obs_agg cannot be combined with --obs_encoding")
+        if args.use_wd_deviation:
+            raise ValueError("--obs_agg cannot be combined with --use_wd_deviation")
+        if args.obs_encoder_mode == "per_sensor":
+            raise ValueError("--obs_agg needs --obs_encoder_mode shared "
+                             "(per_sensor asserts obs_dim == 4*history_length)")
+        if args.del_penalty_scale > 0 or args.del_log:
+            raise ValueError("--obs_agg cannot be combined with the DEL wrapper "
+                             "(it appends a per-turbine column)")
+        from helpers.obs_agg import AGG_MODES
+        if args.obs_agg not in AGG_MODES:
+            raise ValueError(f"Unknown --obs_agg {args.obs_agg!r}; valid: "
+                             f"{sorted(AGG_MODES)}")
+        mes_history_length = max(args.history_length, args.obs_agg_len)
+        print(f"obs_agg: mode={args.obs_agg} K={AGG_MODES[args.obs_agg].K} "
+              f"L={args.obs_agg_len} ({AGG_MODES[args.obs_agg].doc}); "
+              f"measurement deques lengthened to {mes_history_length}, "
+              f"history_N stays {args.history_length}")
+
     for mes_type, prefix in mes_prefixes.items():
         if mes_type not in config:
             continue  # e.g. derate_mes is absent outside the derate presets
         config[mes_type][f"{prefix}_history_N"] = args.history_length
-        config[mes_type][f"{prefix}_history_length"] = args.history_length
+        config[mes_type][f"{prefix}_history_length"] = mes_history_length
 
     # change_wd_3 reward / training-wind overrides (all no-ops when unset).
     # Applied HERE, before make_eval_env_factory deep-copies `config`, so the
@@ -594,6 +621,13 @@ def main():
             env = ObsEncodingWrapper(env, mode=args.obs_encoding,
                                      turbine=wind_turbine,
                                      **json.loads(args.obs_encoding_kwargs))
+        # LES-3x3 Stage 4: aggregate scheme over the L-long deques (same slot
+        # as obs_encoding: inside TransformReward, before MultiLayoutEnv's
+        # shuffle/pad, so spatial_rel sees the true layout order).
+        if args.obs_agg:
+            from helpers.obs_agg import ObsAggWrapper
+            env = ObsAggWrapper(env, args.obs_agg, args.obs_agg_len,
+                                dt_env=args.dt_env)
         # v9.1: scale the (tiny) Wake_recovery reward to probe optimization signal-to-noise.
         if args.reward_scale != 1.0:
             _scale = float(args.reward_scale)

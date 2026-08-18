@@ -126,13 +126,20 @@ def create_eval_env(layout: str, args: dict, cli, wd_fn, seed: int,
     # Env config: the checkpoint's preset, mes histories, then the eval wind
     # pin — the same construction the trainer uses for its eval specs.
     config = make_env_config(args["config"])
+    # --obs_agg (LES-3x3 Stage 4): the deques grow to obs_agg_len while the
+    # base obs width (history_N) stays -- same rule as the trainer. Old
+    # checkpoints have obs_agg=None (Args() backfill) and rebuild unchanged.
+    obs_agg = args.get("obs_agg")
+    mes_history_length = args["history_length"]
+    if obs_agg:
+        mes_history_length = max(args["history_length"], int(args["obs_agg_len"]))
     for mes_type, prefix in (("ws_mes", "ws"), ("wd_mes", "wd"),
                              ("yaw_mes", "yaw"), ("power_mes", "power"),
                              ("derate_mes", "derate")):
         if mes_type not in config:
             continue
         config[mes_type][f"{prefix}_history_N"] = args["history_length"]
-        config[mes_type][f"{prefix}_history_length"] = args["history_length"]
+        config[mes_type][f"{prefix}_history_length"] = mes_history_length
     config = make_eval_wind_config(config, float(wd_fn(0.0)), float(cli.ws))
 
     backend = cli.backend or args["backend"]
@@ -192,6 +199,11 @@ def create_eval_env(layout: str, args: dict, cli, wd_fn, seed: int,
             env = ObsEncodingWrapper(
                 env, mode=args["obs_encoding"], turbine=wind_turbine,
                 **json.loads(args.get("obs_encoding_kwargs") or "{}"))
+        if obs_agg:
+            from helpers.obs_agg import ObsAggWrapper
+            # dt_env as RESOLVED for this eval env (cli override or checkpoint)
+            env = ObsAggWrapper(env, obs_agg, int(args["obs_agg_len"]),
+                                dt_env=float(base_env_kwargs["dt_env"]))
         return env
 
     def make_env_fn(env_seed):
