@@ -16,11 +16,14 @@ import numpy as np
 import pytest
 
 from helpers.wd_functions import (
+    ABSOLUTE_TRAIN_NAMES,
     WD_FUNCTIONS,
     TRAIN_WD_FACTORIES,
     build_eval_specs,
     get_train_wd_factory,
     get_wd_function,
+    make_cycle,
+    make_cycle_train,
     make_dr_ramp,
     make_hold_ramp,
     make_static,
@@ -37,11 +40,24 @@ EPISODE_SECONDS = 5000.0
 EPISODE_GRID = np.arange(0.0, EPISODE_SECONDS + DT_SIM, DT_SIM)
 
 TRAIN_NAMES = sorted(TRAIN_WD_FACTORIES)
+# Relative (f(t, base_wd)) vs absolute (f(t)) training families.
+RELATIVE_TRAIN_NAMES = sorted(set(TRAIN_WD_FACTORIES) - set(ABSOLUTE_TRAIN_NAMES))
+ABSOLUTE_NAMES = sorted(ABSOLUTE_TRAIN_NAMES)
+
+
+def _takes_base_wd(fn) -> bool:
+    return getattr(fn, "takes_base_wd", True)
 
 
 def _trajectory(fn, base_wd=270.0, grid=EPISODE_GRID):
-    """Sample a schedule the way make_wind_direction_list does: t ascending from 0."""
-    return np.array([float(fn(float(t), base_wd)) for t in grid])
+    """Sample a schedule the way make_wind_direction_list does: t ascending from 0.
+
+    Dispatches on the schedule family: relative schedules get ``base_wd``,
+    absolute ones (``takes_base_wd = False``) are called with ``t`` alone.
+    """
+    if _takes_base_wd(fn):
+        return np.array([float(fn(float(t), base_wd)) for t in grid])
+    return np.array([float(fn(float(t))) for t in grid])
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +88,7 @@ def test_get_train_wd_factory_returns_a_callable(name):
 # Relative schedules: no jump at the burn-in boundary
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("name", TRAIN_NAMES)
+@pytest.mark.parametrize("name", RELATIVE_TRAIN_NAMES)
 @pytest.mark.parametrize("base_wd", [225.0, 250.0, 270.0, 300.0, 315.0])
 def test_delta_at_t0_is_zero(name, base_wd):
     """wd(0) must equal base_wd -- Phase 1 of the wd list holds base_wd."""
@@ -432,3 +448,142 @@ def test_hold_ramp_270_275_short_is_the_same_ramp_moved_earlier():
     np.testing.assert_allclose(short(t), long(t + (2045.0 - 300.0)))
     # Fits the 140-step (1400 s) in-training eval window with a trailing hold.
     assert float(short(1399.0)) == pytest.approx(275.0)
+
+
+# ---------------------------------------------------------------------------
+# LES-3x3 Stage 5: train ON the transition -- cyclic 270 <-> 235 schedules
+# ---------------------------------------------------------------------------
+
+CYC_RATE = 35.0 / 200.0  # 0.175 deg/s (200 s ramps)
+LES3X3_MAX_DIST = 1533.8  # m, max pairwise distance on les_3x3
+DT_SIM_LES = 5.0
+
+
+def _frame_slew(mtm: float) -> float:
+    """Mean-flow frame slew limit on les_3x3 (deg/s) for max_turb_move=mtm."""
+    return mtm * 360.0 / (2.0 * np.pi * LES3X3_MAX_DIST) / DT_SIM_LES
+
+
+def test_cycle_270_235_shape_period_and_rate():
+    fn = get_wd_function("cycle_270_235")
+    assert fn.period == pytest.approx(2400.0)
+    # hold1 / ramp / hold2 / ramp_up within one period
+    assert float(fn(0.0)) == pytest.approx(270.0)
+    assert float(fn(999.0)) == pytest.approx(270.0)
+    assert float(fn(1100.0)) == pytest.approx(252.5)  # ramp midpoint
+    assert float(fn(1200.0)) == pytest.approx(235.0)
+    assert float(fn(2199.0)) == pytest.approx(235.0)
+    assert float(fn(2300.0)) == pytest.approx(252.5)  # up-ramp midpoint
+    assert float(fn(2400.0)) == pytest.approx(270.0)  # period closes
+    # periodicity
+    t = np.arange(0.0, 2400.0, 1.0)
+    np.testing.assert_allclose(fn(t), fn(t + 2400.0))
+    np.testing.assert_allclose(fn(t), fn(t + 3 * 2400.0))
+    # rate is exactly +-0.175 deg/s on the ramps, 0 on the holds
+    rates = np.diff(np.asarray(fn(np.arange(0.0, 4800.0 + 1.0, 1.0)), dtype=float))
+    assert np.abs(rates).max() == pytest.approx(CYC_RATE)
+    assert set(np.round(np.abs(rates), 9)) == {0.0, round(CYC_RATE, 9)}
+    # range
+    assert fn(t).min() == pytest.approx(235.0) and fn(t).max() == pytest.approx(270.0)
+
+
+def test_cycle_accepts_scalar_and_array_t_and_phase_shifts():
+    fn = get_wd_function("cycle_270_235")
+    assert float(fn(1100.0)) == pytest.approx(np.asarray(fn(np.array([1100.0])))[0])
+    shifted = make_cycle(270.0, 235.0, 1000.0, 200.0, phase=700.0)
+    t = np.arange(0.0, 5000.0, 10.0)
+    np.testing.assert_allclose(shifted(t), fn(t + 700.0))
+
+
+def test_cycle_270_235_short_fits_the_140_step_eval_window():
+    short = get_wd_function("cycle_270_235_short")
+    assert short.period == pytest.approx(1400.0)  # == 140 steps x dt_env 10
+    assert float(short(0.0)) == pytest.approx(270.0)
+    assert float(short(600.0)) == pytest.approx(252.5)
+    assert float(short(700.0)) == pytest.approx(235.0)
+    assert float(short(1199.0)) == pytest.approx(235.0)
+    assert float(short(1400.0)) == pytest.approx(270.0)
+    rates = np.diff(np.asarray(short(np.arange(0.0, 1400.0 + 1.0, 1.0)), dtype=float))
+    assert np.abs(rates).max() == pytest.approx(CYC_RATE)
+
+
+def test_cycle_schedules_are_registered_as_eval_not_train():
+    for name in ("cycle_270_235", "cycle_270_235_short"):
+        assert callable(get_wd_function(name))
+        assert name not in TRAIN_WD_FACTORIES
+    assert "cycle_270_235_phase" in TRAIN_WD_FACTORIES
+    assert "cycle_270_235_phase" not in WD_FUNCTIONS
+    assert ABSOLUTE_TRAIN_NAMES <= set(TRAIN_WD_FACTORIES)
+    assert set(ABSOLUTE_TRAIN_NAMES) & set(WD_FUNCTIONS) == set()
+
+
+def test_cycle_train_schedule_is_absolute_for_the_wind_manager():
+    """The env classifies the schedule by arity: one positional arg => absolute."""
+    from WindGym.core.wind_manager import WindManager
+    fn = get_train_wd_factory("cycle_270_235_phase", seed=0)
+    assert fn.takes_base_wd is False
+    assert WindManager._wd_function_takes_base_wd(fn) is False
+    # and every relative schedule still reads as relative
+    for name in RELATIVE_TRAIN_NAMES:
+        assert WindManager._wd_function_takes_base_wd(get_train_wd_factory(name, seed=0)) is True
+
+
+def test_cycle_train_starts_in_the_270_hold_every_episode_and_phases_vary():
+    """Phase rule: phase ~ U[0, t_hold) so f(0) == 270 == the pinned burn-in wd
+    (no jump at t=0), while the first ramp starts anywhere in [0, 1000] s."""
+    fn = get_train_wd_factory("cycle_270_235_phase", seed=5)
+    base = get_wd_function("cycle_270_235")
+    phases = []
+    for _ in range(100):
+        wd = _trajectory(fn)
+        assert wd[0] == pytest.approx(270.0)
+        phase = fn.phase
+        assert 0.0 <= phase < 1000.0
+        phases.append(phase)
+        # the whole episode is the fixed cycle shifted by that phase
+        np.testing.assert_allclose(wd, np.asarray(base(EPISODE_GRID + phase), dtype=float))
+        # first ramp starts within the first 1000 s
+        first_move = EPISODE_GRID[np.nonzero(np.abs(wd - 270.0) > 1e-9)[0][0]]
+        assert first_move <= 1000.0 + DT_SIM
+    phases = np.asarray(phases)
+    assert phases.std() > 100.0  # genuinely spread over [0, 1000)
+    assert len(np.unique(np.round(phases, 3))) > 90
+
+
+def test_cycle_train_phase_is_drawn_only_at_t0():
+    fn = get_train_wd_factory("cycle_270_235_phase", seed=5)
+    _trajectory(fn)
+    p = fn.phase
+    _trajectory(fn, grid=EPISODE_GRID[1:])
+    assert fn.phase == p
+    _trajectory(fn)
+    assert fn.phase != p
+
+
+def test_cycle_train_phase_max_must_stay_inside_the_first_hold():
+    with pytest.raises(ValueError, match="phase_max"):
+        make_cycle_train(270.0, 235.0, 1000.0, 200.0, seed=0, phase_max=1200.0)
+    # exactly t_hold is allowed (U[0, t_hold) never reaches it)
+    make_cycle_train(270.0, 235.0, 1000.0, 200.0, seed=0, phase_max=1000.0)
+
+
+def test_cycle_rate_vs_frame_slew_limit():
+    """0.175 deg/s ramp: NOT trackable at the Stage-2/4 mtm=12 (0.0897 deg/s),
+    trackable at the Stage-5 choice mtm=25 (0.1868 deg/s). 23.4 is the threshold."""
+    assert CYC_RATE > _frame_slew(12.0)
+    assert CYC_RATE > _frame_slew(23.0)
+    assert CYC_RATE < _frame_slew(24.0)
+    assert CYC_RATE < _frame_slew(25.0)
+    fn = get_train_wd_factory("cycle_270_235_phase", seed=5)
+    for _ in range(10):
+        wd = _trajectory(fn)
+        rates = np.abs(np.diff(wd)) / DT_SIM
+        assert rates.max() == pytest.approx(CYC_RATE)
+        assert rates.max() < _frame_slew(25.0)
+
+
+def test_cycle_train_stays_inside_the_band235_control_band():
+    fn = get_train_wd_factory("cycle_270_235_phase", seed=1)
+    for _ in range(10):
+        wd = _trajectory(fn)
+        assert wd.min() >= 235.0 - 1e-9 and wd.max() <= 270.0 + 1e-9

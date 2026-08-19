@@ -67,10 +67,29 @@ def test_no_flags_leaves_the_preset_untouched():
     assert overridden == make_env_config("hard_2")
 
 
-@pytest.mark.parametrize("preset", ["hard", "hard_2", "hard_2_nowd", "default"])
+@pytest.mark.parametrize("preset", ["hard", "hard_2", "hard_2_nowd", "default",
+                                    "les_recipe", "les_recipe_nb",
+                                    "les_recipe_pin270", "les_recipe_band235"])
 def test_no_flags_is_a_no_op_for_every_preset_the_sweep_uses(preset):
     _, overridden = build_config(preset=preset)
     assert overridden == make_env_config(preset)
+
+
+@pytest.mark.parametrize("preset, wd_min, wd_max", [
+    ("les_recipe_nb", 265, 275),
+    ("les_recipe_pin270", 270, 270),
+    ("les_recipe_band235", 235, 270),
+])
+def test_les_recipe_clones_differ_from_les_recipe_only_in_wd(preset, wd_min, wd_max):
+    """Stage-3/5 presets are clean controls only if NOTHING but the wd band moves."""
+    base = make_env_config("les_recipe")
+    clone = make_env_config(preset)
+    assert clone["wind"]["wd_min"] == wd_min and clone["wind"]["wd_max"] == wd_max
+    base_wind = {k: v for k, v in base["wind"].items() if k not in ("wd_min", "wd_max")}
+    clone_wind = {k: v for k, v in clone["wind"].items() if k not in ("wd_min", "wd_max")}
+    assert base_wind == clone_wind
+    assert {k: v for k, v in base.items() if k != "wind"} == \
+        {k: v for k, v in clone.items() if k != "wind"}
 
 
 # ---------------------------------------------------------------------------

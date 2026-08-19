@@ -573,9 +573,29 @@ def main():
         })
 
     if args.train_wd_function is not None:
-        print(f"Train wd_function: {args.train_wd_function} "
-              f"(relative schedule; wd domain randomization preserved, "
-              f"per-env seeds {args.seed}..{args.seed + args.num_envs - 1})")
+        from helpers.wd_functions import ABSOLUTE_TRAIN_NAMES, get_train_wd_factory
+        if args.train_wd_function in ABSOLUTE_TRAIN_NAMES:
+            # ABSOLUTE training schedule (LES-3x3 Stage 5 cycle): the burn-in
+            # holds the drawn base_wd and wd_list[0] = base_wd, so the preset's
+            # wd band MUST be pinned to f(0) or every episode starts with a wd
+            # jump that the backward wd_slow pass smears non-causally into the
+            # burn-in. Fail loudly instead of training on that silently.
+            _probe = get_train_wd_factory(args.train_wd_function, seed=args.seed)
+            _f0 = float(_probe(0.0))
+            _wd_lo, _wd_hi = float(config["wind"]["wd_min"]), float(config["wind"]["wd_max"])
+            if not (_wd_lo == _wd_hi == _f0):
+                raise ValueError(
+                    f"--train_wd_function {args.train_wd_function} is ABSOLUTE "
+                    f"(f(0)={_f0}); --config {args.config} must pin wd_min=wd_max={_f0} "
+                    f"(got [{_wd_lo}, {_wd_hi}]; use e.g. les_recipe_pin270)"
+                )
+            print(f"Train wd_function: {args.train_wd_function} "
+                  f"(ABSOLUTE; phase-randomised per episode; wd pinned by preset "
+                  f"to {_f0}; per-env seeds {args.seed}..{args.seed + args.num_envs - 1})")
+        else:
+            print(f"Train wd_function: {args.train_wd_function} "
+                  f"(relative schedule; wd domain randomization preserved, "
+                  f"per-env seeds {args.seed}..{args.seed + args.num_envs - 1})")
 
     def combined_wrapper(env: gym.Env) -> gym.Env:
         """

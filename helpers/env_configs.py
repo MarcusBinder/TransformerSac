@@ -306,6 +306,35 @@ ENV_CONFIGS: Dict[str, Dict[str, Any]] = {
         },
     },
 
+    # LES-3x3 Stage 5 (train ON the 270 <-> 235 transition): EXACT clone of
+    # les_recipe with wd PINNED to 270. Required by the ABSOLUTE training
+    # schedule cycle_270_235_phase (f(0) == 270): the burn-in holds the drawn
+    # base_wd and wd_list[0] = base_wd, so any band other than {270} would put
+    # a wd jump at t=0. The trainer hard-errors if an absolute schedule is
+    # paired with an unpinned preset.
+    "les_recipe_pin270": {
+        "power_def": {"Power_reward": "Wake_recovery", "Power_avg": 5, "Power_scaling": 1.0},
+        "farm": {"yaw_min": -45, "yaw_max": 45},
+        "wind": {
+            "wd_min": 270, "wd_max": 270,
+            "ws_min": 8, "ws_max": 11,
+            "TI_min": 0.038, "TI_max": 0.038,
+        },
+    },
+
+    # LES-3x3 Stage 5 static-band CONTROL: les_recipe with static wd ~ U[235, 270]
+    # per episode (no --train_wd_function) -- the same wd support the cycle arms
+    # sweep through, but never a transition inside an episode.
+    "les_recipe_band235": {
+        "power_def": {"Power_reward": "Wake_recovery", "Power_avg": 5, "Power_scaling": 1.0},
+        "farm": {"yaw_min": -45, "yaw_max": 45},
+        "wind": {
+            "wd_min": 235, "wd_max": 270,
+            "ws_min": 8, "ws_max": 11,
+            "TI_min": 0.038, "TI_max": 0.038,
+        },
+    },
+
     "power_max_derate": {
         "BaseController": "Global",
         "yaw_action": True,

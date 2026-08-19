@@ -19,6 +19,16 @@ Two registries live here and are deliberately kept disjoint:
     list once per reset, always sweeping t upward from 0, so that edge is a
     reliable one-per-episode hook.
 
+A THIRD family lives inside ``TRAIN_WD_FACTORIES`` but is ABSOLUTE
+(LES-3x3 Stage 5, ``cycle_270_235_phase``): ``wd_function(t) -> wd`` like an
+eval schedule, seeded, and re-drawing only a random START PHASE at ``t == 0.0``.
+The shape (270 hold / ramp / 235 hold / ramp back) is fixed and the schedule
+never composes with the env's wd band -- instead the preset must pin
+``wd_min = wd_max = f(0)`` exactly as an eval schedule would (``les_recipe_pin270``),
+and the trainer hard-errors otherwise. Names of this family are listed in
+``ABSOLUTE_TRAIN_NAMES``; ``WindManager._wd_function_takes_base_wd`` sees the
+one-argument ``__call__`` and treats them as absolute automatically.
+
 Keeping the registries separate is a leakage guard -- an eval schedule name can
 never be selected for training and vice versa (asserted in
 tests/test_wd_functions.py, which also checks that the training family never
@@ -186,6 +196,50 @@ def make_static(wd: float):
     return _static
 
 
+def make_cycle(wd_a: float, wd_b: float, t_hold: float, t_ramp: float, phase: float = 0.0):
+    """Build a periodic hold/ramp/hold/ramp-back eval schedule ``f(t) -> wd``.
+
+    One period (``2 * (t_hold + t_ramp)`` s) is: hold ``wd_a`` for ``t_hold``,
+    linear ramp to ``wd_b`` over ``t_ramp``, hold ``wd_b`` for ``t_hold``, linear
+    ramp back to ``wd_a`` over ``t_ramp``; then repeat. ``tau = (t + phase) %
+    period`` selects the segment, so ``phase`` shifts where t=0 lands in the
+    cycle (``f(0) == wd_a`` for any ``0 <= phase < t_hold``).
+
+    LES-3x3 Stage 5 trains ON the 270 <-> 235 transition: 1000 s holds and 200 s
+    ramps (0.175 deg/s) -- the ramp is faster than the Stage-2/3 scenario ramp
+    (600 s, 0.0583 deg/s) and needs ``max_turb_move >= 23.4`` for the mean-flow
+    frame to track it (campaign choice mtm=25 -> 0.1868 deg/s slew limit).
+    """
+    wd_a, wd_b = float(wd_a), float(wd_b)
+    t_hold, t_ramp, phase = float(t_hold), float(t_ramp), float(phase)
+    if t_ramp <= 0 or t_hold < 0:
+        raise ValueError(f"need t_ramp > 0 and t_hold >= 0, got {t_ramp}, {t_hold}")
+    period = 2.0 * (t_hold + t_ramp)
+
+    def _cycle(t):
+        t = np.asarray(t, dtype=float)
+        tau = np.mod(t + phase, period)
+        wd = np.full_like(t, wd_a, dtype=float)
+        # ramp a -> b
+        m = (tau >= t_hold) & (tau < t_hold + t_ramp)
+        wd[m] = wd_a + (wd_b - wd_a) * ((tau[m] - t_hold) / t_ramp)
+        # hold b
+        m = (tau >= t_hold + t_ramp) & (tau < 2.0 * t_hold + t_ramp)
+        wd[m] = wd_b
+        # ramp b -> a
+        m = tau >= 2.0 * t_hold + t_ramp
+        wd[m] = wd_b + (wd_a - wd_b) * ((tau[m] - (2.0 * t_hold + t_ramp)) / t_ramp)
+        return wd
+
+    _cycle.__name__ = f"cycle_{wd_a:g}_{wd_b:g}"
+    _cycle.__doc__ = (
+        f"Periodic {wd_a:g} <-> {wd_b:g} deg: {t_hold:g} s holds, {t_ramp:g} s ramps "
+        f"({abs(wd_b - wd_a) / t_ramp:.4f} deg/s), period {period:g} s, phase {phase:g} s."
+    )
+    _cycle.period = period
+    return _cycle
+
+
 WD_FUNCTIONS = {
     "step_ramp_270_315": step_ramp_270_315,
     "hold_ramp_270_315": hold_ramp_270_315,
@@ -211,6 +265,14 @@ WD_FUNCTIONS = {
     "hold_ramp_270_265": make_hold_ramp(270.0, 265.0, 2045.0, 300.0),
     # Short-hold variant for the 140-step in-training eval (300 s hold + 300 s ramp).
     "hold_ramp_270_275_short": make_hold_ramp(270.0, 275.0, 300.0, 300.0),
+    # --- LES-3x3 Stage 5: train ON the transition (cyclic 270 <-> 235) ---
+    # Deterministic eval instance of the training cycle (phase 0): 1000 s holds,
+    # 200 s ramps (0.175 deg/s; needs max_turb_move >= 23.4 -> campaign mtm=25),
+    # period 2400 s. Two periods = 4800 s = 480 env steps @ dt_env=10 (harvest
+    # uses 490 steps, which is < the ws-10 eval env time_max of 6136 s).
+    "cycle_270_235": make_cycle(270.0, 235.0, 1000.0, 200.0),
+    # 500 s holds -> period 1400 s = exactly the 140-step in-training eval window.
+    "cycle_270_235_short": make_cycle(270.0, 235.0, 500.0, 200.0),
 }
 
 
@@ -400,6 +462,55 @@ def make_dr_ramp(
     )
 
 
+class _CycleTrainSchedule:
+    """ABSOLUTE cyclic training schedule with a per-episode random start phase.
+
+    Callable as ``schedule(t) -> wd`` -- ONE positional argument, so
+    ``WindManager._wd_function_takes_base_wd`` classifies it as absolute and the
+    env never hands it ``base_wd``. ``takes_base_wd = False`` documents this.
+
+    At every call with ``t == 0.0`` (once per reset, see module docstring) a new
+    ``phase ~ U[0, phase_max)`` is drawn; the episode then returns
+    ``make_cycle(...)(t + phase)``. With ``phase_max <= t_hold`` the episode
+    always starts in the ``wd_a`` hold, so ``f(0) == wd_a`` and the burn-in
+    (which holds the preset's pinned wd) hands over without a jump.
+    """
+
+    takes_base_wd = False
+
+    def __init__(self, seed: int, wd_a: float, wd_b: float, t_hold: float,
+                 t_ramp: float, phase_max: float):
+        phase_max = float(phase_max)
+        if not (0.0 <= phase_max <= float(t_hold)):
+            raise ValueError(
+                f"phase_max must lie in [0, t_hold={t_hold}] so that f(0) == wd_a "
+                f"(no jump at the burn-in boundary); got {phase_max}"
+            )
+        self._rng = np.random.default_rng(seed)
+        self._wd_a, self._wd_b = float(wd_a), float(wd_b)
+        self._t_hold, self._t_ramp = float(t_hold), float(t_ramp)
+        self._phase_max = phase_max
+        self._base = make_cycle(wd_a, wd_b, t_hold, t_ramp)
+        self.period = self._base.period
+        self.phase = 0.0
+
+    def _draw(self) -> None:
+        self.phase = float(self._rng.uniform(0.0, self._phase_max)) if self._phase_max > 0 else 0.0
+
+    def __call__(self, t):
+        t = float(t)
+        if t == 0.0:
+            self._draw()
+        return float(self._base(t + self.phase))
+
+
+def make_cycle_train(wd_a: float, wd_b: float, t_hold: float, t_ramp: float,
+                     seed: int, phase_max: float):
+    """Build a seeded ABSOLUTE cyclic training schedule, ``f(t) -> wd``."""
+    return _CycleTrainSchedule(seed=seed, wd_a=wd_a, wd_b=wd_b, t_hold=t_hold,
+                               t_ramp=t_ramp, phase_max=phase_max)
+
+
 # dr_ramp: broad DR. The rate band brackets the eval schedule's 0.0925 and
 # 0.1325 deg/s by roughly a factor of 2 on each side.
 # dr_ramp_narrow: a *family* around the eval instance (45 deg total at ~0.1
@@ -430,7 +541,23 @@ TRAIN_WD_FACTORIES = {
     # policy trains.
     "dr_ramp_les": partial(make_dr_ramp, rate_lo=0.03, rate_hi=0.08,
                            exc_lo=25.0, exc_hi=45.0),
+    # cycle_270_235_phase: LES-3x3 Stage 5 -- train ON the 270 <-> 235
+    # transition. ABSOLUTE (see module docstring / ABSOLUTE_TRAIN_NAMES): the
+    # fixed cycle of WD_FUNCTIONS["cycle_270_235"] with a per-episode random
+    # start phase ~ U[0, 1000) s. Phase rule: phase_max = t_hold, so every
+    # episode starts INSIDE the 270 hold (f(0) == 270 == burn-in wd, no jump at
+    # t=0; a full-period phase would start ~58 % of episodes with a <= 35 deg
+    # jump that the backward wd_slow pass smears non-causally into the
+    # burn-in). The ramp timing is still unlearnable: there is no clock in the
+    # observation and the first ramp starts anywhere in [0, 1000] s.
+    "cycle_270_235_phase": partial(make_cycle_train, 270.0, 235.0, 1000.0, 200.0,
+                                   phase_max=1000.0),
 }
+
+# Training schedules that are ABSOLUTE (1-arg ``f(t)``): the preset's wd band
+# must be pinned to ``f(0)`` (checked by the trainer) and the env's wd domain
+# randomization is replaced, not composed with.
+ABSOLUTE_TRAIN_NAMES = frozenset({"cycle_270_235_phase"})
 
 
 def get_train_wd_factory(name: str, seed: int):
