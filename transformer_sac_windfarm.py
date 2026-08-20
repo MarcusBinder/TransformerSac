@@ -238,13 +238,8 @@ def main():
             args.turbtype, iea34_variant=args.iea34_variant
         )
     else:
-        if args.turbtype == "DTU10MW":
-            from py_wake.examples.data.dtu10mw import DTU10MW as WT
-        elif args.turbtype == "V80":
-            from py_wake.examples.data.hornsrev1 import V80 as WT
-        else:
-            raise ValueError(f"Unknown turbine type: {args.turbtype}")
-        wind_turbine = WT()
+        from helpers.plain_turbines import make_plain_turbine
+        wind_turbine = make_plain_turbine(args.turbtype)
     
     # Create layout configurations
     print("Setting up layouts...")

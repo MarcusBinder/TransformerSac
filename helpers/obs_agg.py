@@ -220,6 +220,21 @@ def _f_raw15(buf, ctx):
     return _level(ctx, tail).T                        # (n, 15) oldest..newest
 
 
+def _f_raw15span(buf, ctx):
+    """15 evenly-spaced samples SPANNING the whole L-buffer (newest included).
+
+    Stage 6 (IEA22): with --obs_agg_len 60 the raw window covers 600 s at a
+    40-s spacing while the obs width stays 15. A NEW registry name -- existing
+    raw15 checkpoints (last 15 samples, 150 s) stay bit-reproducible. With
+    L == 15 the linspace indices are 0..14, so it is index-identical to raw15
+    (asserted in tests/test_obs_agg.py).
+    """
+    L = int(ctx["L"])
+    tail = _pad_oldest(buf, L)                        # (L, n) chronological
+    idx = np.round(np.linspace(0, L - 1, N_RAW)).astype(int)
+    return _level(ctx, tail[idx]).T                   # (n, 15) oldest..newest
+
+
 def _f_spectral(buf, ctx):
     L = int(ctx["L"])
     d = buf - buf.mean(axis=0)
@@ -258,6 +273,9 @@ AGG_MODES: Dict[str, AggSpec] = {
     "quantiles": AggSpec(_f_quantiles, ("level",) * 3, "[q10_L, q50_L, q90_L]"),
     "raw15": AggSpec(_f_raw15, ("level",) * N_RAW,
                      "last 15 raw samples, chronological"),
+    "raw15span": AggSpec(_f_raw15span, ("level",) * N_RAW,
+                         "15 samples evenly spanning the L-buffer, "
+                         "chronological (== raw15 when L == 15)"),
     "spectral": AggSpec(_f_spectral, ("level", "level") + ("amp",) * N_SPECTRAL,
                         "[t, mean_L, |F_1|, |F_2|, |F_3|] (periods L/1, L/2, L/3)"),
     "spatial_rel": AggSpec(_f_spatial_rel, ("level", "rel", "rel"),

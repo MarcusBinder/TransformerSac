@@ -196,8 +196,8 @@ class Args:
     obs_encoder_mode: str = "shared"
     # LES-3x3 Stage 4: replace the per-turbine [ws|wd|yaw|power] x H raw-sample
     # vector with an aggregate scheme (helpers/obs_agg.py AGG_MODES: latest |
-    # mean_std | ema | trend | minmax | quantiles | raw15 | spectral |
-    # spatial_rel; raw3 is a seam test) computed over the env's L-long
+    # mean_std | ema | trend | minmax | quantiles | raw15 | raw15span |
+    # spectral | spatial_rel; raw3 is a seam test) computed over the env's L-long
     # measurement deques. WARNING: like --obs_encoding this CHANGES THE OBS
     # CONTRACT (width 4*K per turbine, fixed physical scales, no --obs_norm);
     # the checkpoint carries both flags so eval_wd rebuilds the same wrapper.

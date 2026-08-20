@@ -273,6 +273,22 @@ WD_FUNCTIONS = {
     "cycle_270_235": make_cycle(270.0, 235.0, 1000.0, 200.0),
     # 500 s holds -> period 1400 s = exactly the 140-step in-training eval window.
     "cycle_270_235_short": make_cycle(270.0, 235.0, 500.0, 200.0),
+    # --- LES-3x3 Stage 6: IEA 22 MW "real" case (_slow family) ---
+    # The Stage-5 cycle scaled 1.6x in TIME (advection-equivalent at the IEA22
+    # D=284 m: D-ratio 284/178.3 = 1.593): 1600 s holds, 320 s ramps
+    # (0.1094 deg/s), period 3840 s. The suffix is RATE-descriptive, not
+    # turbine-specific -- any farm whose frame slew limit exceeds 0.109 deg/s
+    # can track it (IEA22 les_3x3 needs max_turb_move >= 23.4; campaign mtm=30
+    # -> 0.1407 deg/s, 29 % margin). Two periods = 768 env steps @ dt_env=10.
+    "cycle_270_235_slow": make_cycle(270.0, 235.0, 1600.0, 320.0),
+    # 800 s holds -> period 2240 s = exactly the 224-step in-training eval
+    # window (--num_eval_steps 224).
+    "cycle_270_235_slow_short": make_cycle(270.0, 235.0, 800.0, 320.0),
+    # Rate-transfer hold/ramp at the _slow ramp rate: 6 flow passthroughs of
+    # the IEA22 les_3x3 max pairwise extent (4886.1 m) at the nominal 9 m/s
+    # -> 3257 s pre-hold, then the 35 deg / 320 s ramp. 470-step cell like
+    # hold_ramp_270_235.
+    "hold_ramp_270_235_slow": make_hold_ramp(270.0, 235.0, 3257.0, 320.0),
 }
 
 
@@ -552,12 +568,20 @@ TRAIN_WD_FACTORIES = {
     # observation and the first ramp starts anywhere in [0, 1000] s.
     "cycle_270_235_phase": partial(make_cycle_train, 270.0, 235.0, 1000.0, 200.0,
                                    phase_max=1000.0),
+    # cycle_270_235_slow_phase: Stage 6 (IEA22) training schedule -- the _slow
+    # cycle (1600 s holds, 320 s ramps, period 3840 s) with a per-episode
+    # random start phase ~ U[0, 1600) s. Same hold1-only phase rule as
+    # cycle_270_235_phase: phase_max = t_hold, so f(0) == 270 == the pinned
+    # burn-in wd (les_recipe_pin270) and there is never a jump at t=0.
+    "cycle_270_235_slow_phase": partial(make_cycle_train, 270.0, 235.0, 1600.0,
+                                        320.0, phase_max=1600.0),
 }
 
 # Training schedules that are ABSOLUTE (1-arg ``f(t)``): the preset's wd band
 # must be pinned to ``f(0)`` (checked by the trainer) and the env's wd domain
 # randomization is replaced, not composed with.
-ABSOLUTE_TRAIN_NAMES = frozenset({"cycle_270_235_phase"})
+ABSOLUTE_TRAIN_NAMES = frozenset({"cycle_270_235_phase",
+                                  "cycle_270_235_slow_phase"})
 
 
 def get_train_wd_factory(name: str, seed: int):

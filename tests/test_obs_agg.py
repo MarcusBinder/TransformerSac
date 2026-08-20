@@ -21,7 +21,7 @@ from helpers.obs_agg import (  # noqa: E402
 )
 
 TRAINED_MODES = ["latest", "mean_std", "ema", "trend", "minmax", "quantiles",
-                 "raw15", "spectral", "spatial_rel"]
+                 "raw15", "raw15span", "spectral", "spatial_rel"]
 ALL_MODES = ["raw3"] + TRAINED_MODES
 RANGES = {"ws": (0.0, 30.0), "wd": (0.0, 360.0), "yaw": (-45.0, 45.0),
           "power": (0.0, 10e6)}
@@ -40,8 +40,8 @@ def test_registry_matches_plan():
     assert set(AGG_MODES) == set(ALL_MODES)
     K = {m: AGG_MODES[m].K for m in AGG_MODES}
     assert K == {"raw3": 3, "latest": 1, "mean_std": 3, "ema": 4, "trend": 4,
-                 "minmax": 4, "quantiles": 3, "raw15": 15, "spectral": 5,
-                 "spatial_rel": 3}
+                 "minmax": 4, "quantiles": 3, "raw15": 15, "raw15span": 15,
+                 "spectral": 5, "spatial_rel": 3}
 
 
 @pytest.mark.parametrize("mode", ALL_MODES)
@@ -164,7 +164,7 @@ def test_circular_wd_across_the_wrap():
     ema = reduce_quantity("ema", "wd", ramp, L=L, dt_env=DT, front=0)
     assert np.all((ema[0] > 350.0) | (ema[0] < 10.5))
     # levels are in [0, 360) and env-scale like today
-    for m in ["latest", "quantiles", "raw15", "spectral"]:
+    for m in ["latest", "quantiles", "raw15", "raw15span", "spectral"]:
         g = reduce_quantity(m, "wd", buf, L=L, dt_env=DT, front=0)
         lv = [k for k, kind in enumerate(AGG_MODES[m].kinds) if kind == "level"]
         assert np.all(g[:, lv] >= 0) and np.all(g[:, lv] < 360)
@@ -180,9 +180,52 @@ def test_short_buffers():
     one = _buf(rng, m=1)
     r15 = reduce_quantity("raw15", "ws", one, L=L, dt_env=DT, front=0)
     assert np.allclose(r15, one[0][:, None])               # oldest repeated
+    r15s = reduce_quantity("raw15span", "ws", one, L=L, dt_env=DT, front=0)
+    assert np.allclose(r15s, one[0][:, None])              # oldest repeated
     tr = reduce_quantity("trend", "ws", one, L=L, dt_env=DT, front=0)
     assert np.allclose(tr[:, 2:], 0.0)                     # m<2 -> slope 0
     assert reduce_quantity("spectral", "ws", one, L=L, dt_env=DT, front=0).shape == (4, 5)
+
+
+# ---------------------------------------------------------------------------
+# (a') raw15span (Stage 6: 15 samples spanning the whole L-buffer)
+# ---------------------------------------------------------------------------
+
+def test_raw15span_takes_linspace_indices_over_the_buffer():
+    Lspan = 60
+    buf = np.arange(Lspan, dtype=float)[:, None] * np.ones((1, 3))  # 0..59 ramp
+    f = reduce_quantity("raw15span", "ws", buf, L=Lspan, dt_env=DT, front=0)
+    idx = np.round(np.linspace(0, Lspan - 1, N_RAW)).astype(int)
+    assert np.allclose(f[0], idx.astype(float))            # chronological
+    assert f[0, -1] == 59.0                                # newest included
+    assert f[0, 0] == 0.0                                  # oldest included
+    # with obs_agg_len 60 @ dt_env 10 the window spans 600 s at ~40-s spacing
+    assert np.all(np.diff(idx) >= 4)
+
+
+def test_raw15span_equals_raw15_at_L15():
+    """The design invariant that lets raw15 checkpoints stay bit-reproducible:
+    at L == 15 the linspace indices are 0..14, so the two modes coincide."""
+    rng = np.random.default_rng(6)
+    for q in QUANTITIES:
+        lo, hi = RANGES[q]
+        for m in (1, 3, 15, 20):
+            buf = _buf(rng, m=m, lo=lo + 0.3 * (hi - lo), hi=lo + 0.4 * (hi - lo))
+            a = reduce_quantity("raw15", q, buf, L=15, dt_env=DT, front=0)
+            b = reduce_quantity("raw15span", q, buf, L=15, dt_env=DT, front=0)
+            np.testing.assert_array_equal(a, b)
+
+
+def test_raw15span_short_buffer_pads_with_the_oldest_sample():
+    Lspan = 60
+    m = 10
+    buf = np.arange(m, dtype=float)[:, None] * np.ones((1, 2)) + 3.0  # 3..12
+    f = reduce_quantity("raw15span", "ws", buf, L=Lspan, dt_env=DT, front=0)
+    # padded buffer = [3]*50 + [3..12]; linspace indices < 50 all hit the pad
+    idx = np.round(np.linspace(0, Lspan - 1, N_RAW)).astype(int)
+    padded = np.concatenate([np.full(Lspan - m, 3.0), np.arange(m) + 3.0])
+    assert np.allclose(f[0], padded[idx])
+    assert f[0, -1] == 12.0                                # newest still last
 
 
 # ---------------------------------------------------------------------------

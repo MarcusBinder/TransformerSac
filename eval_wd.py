@@ -85,13 +85,8 @@ def create_eval_env(layout: str, args: dict, cli, wd_fn, seed: int,
     IN-PROCESS -- the flow field (`fs`) cannot be pickled back across an async
     worker pipe -- while agent.act() still runs the exact same code path.
     """
-    if args["turbtype"] == "DTU10MW":
-        from py_wake.examples.data.dtu10mw import DTU10MW as WT
-    elif args["turbtype"] == "V80":
-        from py_wake.examples.data.hornsrev1 import V80 as WT
-    else:
-        raise ValueError(f"Unknown turbine type: {args['turbtype']}")
-    wind_turbine = WT()
+    from helpers.plain_turbines import make_plain_turbine
+    wind_turbine = make_plain_turbine(args["turbtype"])
 
     layouts = []
     for name in [s.strip() for s in layout.split(",") if s.strip()]:
@@ -224,6 +219,22 @@ def create_eval_env(layout: str, args: dict, cli, wd_fn, seed: int,
         autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,
     )
     return RecordEpisodeVals(env), wind_turbine
+
+
+def layout_frame_max_dist(x_pos, y_pos, rotor_diameter: float) -> float:
+    """Max turbine distance from the layout's bbox center [m].
+
+    EXACTLY windgym's TurbulenceManager formula (core/turbulence_manager.py):
+    the frame's wd rate limit is max_turb_move*360/(2*pi*max_dist) per sim
+    step with THIS max_dist. Recorded in every cell's .nc attrs as
+    `frame_max_dist` so collectors classify tracked/untracked cells without
+    hard-coding one farm's geometry (DTU les_3x3 = 1533.8 m; IEA22 = 2443.1 m).
+    """
+    pos = np.stack([np.asarray(x_pos, dtype=float),
+                    np.asarray(y_pos, dtype=float)], axis=1)
+    center = (pos.max(0) + pos.min(0)) / 2.0
+    d = float(np.sqrt(((pos - center) ** 2).sum(axis=1)).max())
+    return max(d, float(rotor_diameter) / 2.0)
 
 
 def build_agent(args: dict, env, device: torch.device, checkpoint):
@@ -498,8 +509,13 @@ def main():
           f"episodes={cli.num_episodes} steps={cli.num_steps} "
           f"envs={cli.num_envs} seed={cli.seed} device={device}")
 
-    env, _ = create_eval_env(cli.eval_layout, args, cli, wd_fn,
-                             seed=cli.seed, n_envs=cli.num_envs)
+    env, wind_turbine = create_eval_env(cli.eval_layout, args, cli, wd_fn,
+                                        seed=cli.seed, n_envs=cli.num_envs)
+    # Frame-slew geometry of the (first) eval layout, for the .nc attrs.
+    first_layout = [s.strip() for s in cli.eval_layout.split(",") if s.strip()][0]
+    _x_pos, _y_pos = get_layout_positions(first_layout, wind_turbine)
+    frame_max_dist = layout_frame_max_dist(_x_pos, _y_pos,
+                                           float(wind_turbine.diameter()))
     actor, agent = build_agent(args, env, device, checkpoint)
     actor.load_state_dict(checkpoint["actor_state_dict"])
     actor.eval()
@@ -533,6 +549,12 @@ def main():
         # Recorded so cells from a max_turb_move sweep stay distinguishable.
         "max_turb_move": (cli.max_turb_move if cli.max_turb_move is not None
                           else -1.0),
+        # Stage 6 (IEA22): turbine identity + frame-slew geometry. Cells from
+        # Stages 1-5 predate these attrs -- collectors must fall back to the
+        # DTU10MW les_3x3 constants when absent (byte-identical outputs).
+        "turbtype": args["turbtype"],
+        "rotor_diameter": float(wind_turbine.diameter()),
+        "frame_max_dist": frame_max_dist,
         "num_episodes": cli.num_episodes,
         "num_steps": cli.num_steps,
         "seed": cli.seed,

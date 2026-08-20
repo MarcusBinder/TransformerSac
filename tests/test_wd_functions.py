@@ -587,3 +587,131 @@ def test_cycle_train_stays_inside_the_band235_control_band():
     for _ in range(10):
         wd = _trajectory(fn)
         assert wd.min() >= 235.0 - 1e-9 and wd.max() <= 270.0 + 1e-9
+
+
+# ---------------------------------------------------------------------------
+# LES-3x3 Stage 6: IEA 22 MW "real" case -- the _slow (1.6x-scaled) family
+# ---------------------------------------------------------------------------
+
+SLOW_RATE = 35.0 / 320.0  # 0.109375 deg/s (320 s ramps)
+# Max turbine distance from the bbox center of les_3x3 at D=284 m (IEA22):
+# spacing 7D x 5D = 1988 x 1420 m -> half-diagonal sqrt(1988^2 + 1420^2).
+IEA22_MAX_DIST = 2443.06  # m
+
+
+def _frame_slew_iea22(mtm: float) -> float:
+    """Mean-flow frame slew limit on the IEA22 les_3x3 (deg/s) at max_turb_move=mtm."""
+    return mtm * 360.0 / (2.0 * np.pi * IEA22_MAX_DIST) / DT_SIM_LES
+
+
+def test_cycle_270_235_slow_shape_period_and_rate():
+    fn = get_wd_function("cycle_270_235_slow")
+    assert fn.period == pytest.approx(3840.0)
+    # hold1 / ramp / hold2 / ramp_up within one period
+    assert float(fn(0.0)) == pytest.approx(270.0)
+    assert float(fn(1599.0)) == pytest.approx(270.0)
+    assert float(fn(1760.0)) == pytest.approx(252.5)  # ramp midpoint
+    assert float(fn(1920.0)) == pytest.approx(235.0)
+    assert float(fn(3519.0)) == pytest.approx(235.0)
+    assert float(fn(3680.0)) == pytest.approx(252.5)  # up-ramp midpoint
+    assert float(fn(3840.0)) == pytest.approx(270.0)  # period closes
+    # periodicity
+    t = np.arange(0.0, 3840.0, 1.0)
+    np.testing.assert_allclose(fn(t), fn(t + 3840.0))
+    np.testing.assert_allclose(fn(t), fn(t + 3 * 3840.0))
+    # rate is exactly +-0.109375 deg/s on the ramps, 0 on the holds
+    rates = np.diff(np.asarray(fn(np.arange(0.0, 7680.0 + 1.0, 1.0)), dtype=float))
+    assert np.abs(rates).max() == pytest.approx(SLOW_RATE)
+    assert set(np.round(np.abs(rates), 9)) == {0.0, round(SLOW_RATE, 9)}
+    # band
+    assert fn(t).min() == pytest.approx(235.0) and fn(t).max() == pytest.approx(270.0)
+    # two periods = 768 env steps @ dt_env=10 (the harvest cell length)
+    assert 2 * fn.period / 10.0 == 768
+
+
+def test_cycle_270_235_slow_short_fits_the_224_step_eval_window():
+    short = get_wd_function("cycle_270_235_slow_short")
+    assert short.period == pytest.approx(2240.0)  # == 224 steps x dt_env 10
+    assert float(short(0.0)) == pytest.approx(270.0)
+    assert float(short(960.0)) == pytest.approx(252.5)
+    assert float(short(1120.0)) == pytest.approx(235.0)
+    assert float(short(1919.0)) == pytest.approx(235.0)
+    assert float(short(2240.0)) == pytest.approx(270.0)
+    rates = np.diff(np.asarray(short(np.arange(0.0, 2240.0 + 1.0, 1.0)), dtype=float))
+    assert np.abs(rates).max() == pytest.approx(SLOW_RATE)
+
+
+def test_hold_ramp_270_235_slow_endpoints_and_rate():
+    """The Stage-6 rate-transfer cell: 6 passthroughs of the IEA22 les_3x3 max
+    pairwise extent (4886.1 m) at 9 m/s -> 3257 s pre-hold, then 35 deg over
+    320 s. 470-step cell (4700 s) leaves 1123 s of trailing hold."""
+    fn = get_wd_function("hold_ramp_270_235_slow")
+    assert float(fn(0.0)) == pytest.approx(270.0)
+    assert float(fn(3256.0)) == pytest.approx(270.0)
+    assert float(fn(3257.0 + 160.0)) == pytest.approx(252.5)  # ramp midpoint
+    assert float(fn(3257.0 + 320.0)) == pytest.approx(235.0)
+    assert float(fn(4700.0)) == pytest.approx(235.0)
+    grid = np.arange(0.0, 4700.0 + 1.0, 1.0)
+    rates = np.abs(np.diff(np.asarray(fn(grid), dtype=float)))
+    assert rates.max() == pytest.approx(SLOW_RATE)
+    assert fn(grid).min() == pytest.approx(235.0)
+    assert fn(grid).max() == pytest.approx(270.0)
+
+
+def test_slow_schedules_are_registered_as_eval_not_train():
+    for name in ("cycle_270_235_slow", "cycle_270_235_slow_short",
+                 "hold_ramp_270_235_slow"):
+        assert callable(get_wd_function(name))
+        assert name not in TRAIN_WD_FACTORIES
+    assert "cycle_270_235_slow_phase" in TRAIN_WD_FACTORIES
+    assert "cycle_270_235_slow_phase" not in WD_FUNCTIONS
+    assert "cycle_270_235_slow_phase" in ABSOLUTE_TRAIN_NAMES
+
+
+def test_slow_cycle_train_is_absolute_starts_in_hold1_and_phases_vary():
+    """Same phase rule as Stage 5: phase ~ U[0, t_hold=1600) so f(0) == 270 ==
+    the pinned burn-in wd (les_recipe_pin270), no jump at t=0."""
+    from WindGym.core.wind_manager import WindManager
+    fn = get_train_wd_factory("cycle_270_235_slow_phase", seed=5)
+    assert fn.takes_base_wd is False
+    assert WindManager._wd_function_takes_base_wd(fn) is False
+    base = get_wd_function("cycle_270_235_slow")
+    phases = []
+    for _ in range(100):
+        wd = _trajectory(fn)
+        assert wd[0] == pytest.approx(270.0)
+        phase = fn.phase
+        assert 0.0 <= phase < 1600.0
+        phases.append(phase)
+        # the whole episode is the fixed slow cycle shifted by that phase
+        np.testing.assert_allclose(wd, np.asarray(base(EPISODE_GRID + phase), dtype=float))
+        # first ramp starts within the first 1600 s
+        first_move = EPISODE_GRID[np.nonzero(np.abs(wd - 270.0) > 1e-9)[0][0]]
+        assert first_move <= 1600.0 + DT_SIM
+        # band
+        assert wd.min() >= 235.0 - 1e-9 and wd.max() <= 270.0 + 1e-9
+    phases = np.asarray(phases)
+    assert phases.std() > 160.0  # genuinely spread over [0, 1600)
+    assert len(np.unique(np.round(phases, 3))) > 90
+
+
+def test_slow_cycle_rate_vs_iea22_frame_slew_limit():
+    """0.109375 deg/s ramp on the IEA22 farm: threshold mtm 23.32 -- mtm 23
+    fails, 24/25/30 track (mtm 25 -> 7 % margin, campaign mtm 30 -> 29 %).
+    The DTU constants (LES3X3_MAX_DIST, CYC_RATE thresholds) are untouched."""
+    assert SLOW_RATE > _frame_slew_iea22(12.0)
+    assert SLOW_RATE > _frame_slew_iea22(23.0)
+    assert SLOW_RATE < _frame_slew_iea22(24.0)
+    assert SLOW_RATE < _frame_slew_iea22(25.0)
+    assert SLOW_RATE < _frame_slew_iea22(30.0)
+    # margins quoted in the campaign notes
+    assert _frame_slew_iea22(25.0) / SLOW_RATE == pytest.approx(1.072, abs=0.005)
+    assert _frame_slew_iea22(30.0) / SLOW_RATE == pytest.approx(1.287, abs=0.005)
+    # rate invariance: the _slow schedule is exactly trackable wherever the
+    # Stage-5 cycle was at the DTU scale (both rate and farm scaled by 1.593x)
+    fn = get_train_wd_factory("cycle_270_235_slow_phase", seed=5)
+    for _ in range(10):
+        wd = _trajectory(fn)
+        rates = np.abs(np.diff(wd)) / DT_SIM
+        assert rates.max() == pytest.approx(SLOW_RATE)
+        assert rates.max() < _frame_slew_iea22(30.0)

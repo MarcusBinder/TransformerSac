@@ -49,14 +49,8 @@ def create_eval_env(layout: str, args: dict, seed: int = 42):
     """Create evaluation environment for a single layout."""
 
     # Get wind turbine
-    if args["turbtype"] == "DTU10MW":
-        from py_wake.examples.data.dtu10mw import DTU10MW as WT
-    elif args["turbtype"] == "V80":
-        from py_wake.examples.data.hornsrev1 import V80 as WT
-    else:
-        raise ValueError(f"Unknown turbine type: {args['turbtype']}")
-
-    wind_turbine = WT()
+    from helpers.plain_turbines import make_plain_turbine
+    wind_turbine = make_plain_turbine(args["turbtype"])
 
     layout_names = [l.strip() for l in layout.split(",")]
     layouts = []
