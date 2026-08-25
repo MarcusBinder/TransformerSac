@@ -5,7 +5,7 @@ All CLI arguments are defined here via a tyro-compatible dataclass.
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 
 @dataclass
@@ -88,6 +88,35 @@ class Args:
     max_turb_move: Optional[float] = None
     max_eps: int = 20         # Number of flow passthroughs per episode
     num_envs: int = 1         # Number of parallel environments
+
+    # Wind veer, sampled U[veer_min, veer_max] per episode (deg per 100 m,
+    # pinned to 0 at hub height, positive = wd increases with height).
+    # Overrides the env config's wind veer keys; composes with a time-varying
+    # wd via MetmastSite (Stage 7). Veer only produces a yaw-sign asymmetry
+    # when tilt != 0.
+    veer_min: float = 0.0
+    veer_max: float = 0.0
+    # Fixed rotor tilt for all turbines (deg; positive deflects the wake
+    # upward in DWM). Overrides the env config's farm tilt.
+    tilt: float = 0.0
+
+    # === Domain randomization (DWM closure + Mann-box posterior) ===
+    # Path to a calibrated posterior .npz with `samples` (N, d) and
+    # `param_names` (d,) arrays (LESRL calibration pipeline). When set, each
+    # parallel TRAINING env draws DWM parameters from the posterior on every
+    # reset via DWMRandomizationWrapper; in-training eval envs and eval_wd
+    # harvests stay on the nominal calibrated defaults (no per-reset draws).
+    # When None (default) DR is disabled. Requires --backend dynamiks.
+    dr_posterior_path: Optional[str] = None
+    # Subset of `param_names` to actually feed into the env. Must be a subset
+    # of the posterior columns. Joint structure is preserved across all
+    # calibrated dimensions even if only a subset is exposed (row-bootstrap).
+    # The Mann subset (`mann_L`, `mann_GAMMA`, `mann_AE`) only takes effect when
+    # the env is built with `turbtype="MannGenerate"` — under MannLoad/MannFixed
+    # the env raises rather than silently ignoring per-episode Mann statistics.
+    dr_keys: Tuple[str, ...] = (
+        "k1", "k2", "d_particle", "mann_L", "mann_GAMMA", "mann_AE",
+    )
 
     # === Evaluation Settings ===
     eval_interval: int = 50000        # How often to evaluate (in env steps)

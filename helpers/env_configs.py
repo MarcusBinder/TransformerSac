@@ -455,3 +455,33 @@ def make_eval_wind_config(config: Dict[str, Any], wd0: float, ws: float) -> Dict
     eval_config["wind"]["wd_min"] = eval_config["wind"]["wd_max"] = float(wd0)
     eval_config["wind"]["ws_min"] = eval_config["wind"]["ws_max"] = float(ws)
     return eval_config
+
+
+def obs_dim_per_turbine(config: Dict[str, Any], history_N: int) -> int:
+    """Per-turbine observation size produced by WindGym's FarmMes for this config.
+
+    Mirrors TurbMes.observed_variables(): the ws/wd/power channels are gated by
+    the mes_level turb_* flags (FarmMes ANDs them into the per-channel
+    current/rolling settings), yaw is never gated, and turb_TI adds one value.
+    history_N is the number of rolling means per channel (the *_history_N the
+    caller writes into every channel dict) — obs width does NOT depend on
+    history_length (deque size) or window_length (samples per mean).
+    (Ported from the LES branch for RunPretrainedAgentLES_emlhversionTEST.py;
+    NOT valid for --obs_agg checkpoints, whose width is 4*AGG_MODES[mode].K.)
+    """
+    mes = config["mes_level"]
+    H = int(history_N)
+
+    def n(prefix: str, enabled: bool = True) -> int:
+        c = config[f"{prefix}_mes"]
+        return int(enabled) * (
+            int(c[f"{prefix}_current"]) + int(c[f"{prefix}_rolling_mean"]) * H
+        )
+
+    return (
+        n("ws", mes["turb_ws"])
+        + n("wd", mes["turb_wd"])
+        + n("yaw")
+        + n("power", mes["turb_power"])
+        + int(mes["turb_TI"])
+    )

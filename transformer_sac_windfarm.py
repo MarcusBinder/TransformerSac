@@ -22,6 +22,7 @@ Author: Marcus Binder Nilsen (DTU Wind Energy)
 """
 
 import copy
+import inspect
 import os
 import random
 import sys
@@ -53,7 +54,52 @@ from torch.utils.tensorboard import SummaryWriter
 
 # WindGym imports (adjust path as needed for your setup)
 from WindGym import WindFarmEnv
-from WindGym.wrappers import RecordEpisodeVals, PerTurbineObservationWrapper
+from WindGym.wrappers import (
+    RecordEpisodeVals,
+    PerTurbineObservationWrapper,
+)
+
+# Stage-7 DR wrapper: absent on pre-lesrl-merge windgym. Import lazily so the
+# trainer still runs (DR off) against an older windgym, and the DR guard below
+# can raise a version-skew message instead of a bare module ImportError.
+try:
+    from WindGym.wrappers import DWMRandomizationWrapper
+except ImportError:  # pragma: no cover - only on outdated windgym checkouts
+    DWMRandomizationWrapper = None
+
+
+def validate_dr_setup(args, dr_posterior):
+    """Fail fast on DR configurations that would train wrong physics silently.
+
+    Module-level (not inline in the training loop) so tests/test_dr_wiring.py
+    can exercise the guards without entering the trainer. No-op when DR is off
+    (dr_posterior is None).
+    """
+    if dr_posterior is None:
+        return
+    if DWMRandomizationWrapper is None:
+        raise RuntimeError(
+            "--dr_posterior_path requested but this WindGym has no "
+            "DWMRandomizationWrapper (needs proj/wdest >= the Stage-7 "
+            "lesrl merge)."
+        )
+    if args.backend == "pywake":
+        raise ValueError(
+            "--dr_posterior_path requires --backend dynamiks: the DWM "
+            "closure params (k1, k2, d_particle) and Mann-box statistics "
+            "have no counterpart in the pywake_steady adapter."
+        )
+    mann_in_dr = tuple(
+        k for k in args.dr_keys if k in WindFarmEnv._MANN_PARAM_KEYS
+    )
+    if mann_in_dr and args.TI_type != "MannGenerate":
+        raise ValueError(
+            f"dr_keys includes Mann-box keys {mann_in_dr} but "
+            f"TI_type={args.TI_type!r} does not regenerate the box from "
+            "those statistics. Either pass --TI_type MannGenerate, or "
+            f"remove {mann_in_dr} from --dr_keys."
+        )
+from helpers.dr_posterior import load_posterior, make_dr_sampler
 from helpers.agent import WindFarmAgent
 
 # Logging utilities for multi-layout training
@@ -423,6 +469,24 @@ def main():
     # ws range is then overwritten per eval spec below.
     apply_config_overrides(config, args)
 
+    # Wind veer range + rotor tilt from args (defaults 0 = off). Applied before
+    # the eval deep-copies so eval episodes sample the same veer band as
+    # training (veer is part of the physical scenario, unlike DR which stays
+    # training-only). An outdated windgym would silently drop these keys.
+    config["wind"]["veer_min"] = args.veer_min
+    config["wind"]["veer_max"] = args.veer_max
+    config["farm"]["tilt"] = args.tilt
+    if args.veer_min != 0 or args.veer_max != 0 or args.tilt != 0:
+        if "tilt" not in inspect.signature(WindFarmEnv.__init__).parameters:
+            raise RuntimeError(
+                "veer/tilt requested but this WindGym predates veer+tilt "
+                "support (needs proj/wdest >= the Stage-7 lesrl merge)."
+            )
+        print(
+            f"veer range set to: [{args.veer_min}, {args.veer_max}] deg/100m, "
+            f"tilt set to: {args.tilt} deg"
+        )
+
     base_env_kwargs = {
         "turbine": wind_turbine,
         "n_passthrough": args.max_eps,
@@ -649,6 +713,21 @@ def main():
             env = gym.wrappers.TransformReward(env, lambda r: r * _scale)
         return env
     
+    # Domain randomization: per-reset DWM parameter draws from a calibrated
+    # posterior. TRAINING envs only — the in-training eval envs (and eval_wd
+    # harvests) run the nominal calibrated defaults so eval curves aren't
+    # DR-noised. Disabled when args.dr_posterior_path is None.
+    _dr_posterior = (
+        load_posterior(args.dr_posterior_path) if args.dr_posterior_path else None
+    )
+    validate_dr_setup(args, _dr_posterior)
+    if _dr_posterior is not None:
+        print(
+            f"[DR] loaded posterior with {len(_dr_posterior['samples'])} samples "
+            f"over {_dr_posterior['names']}; randomizing keys {tuple(args.dr_keys)} "
+            f"(turbtype={args.TI_type})"
+        )
+
     def make_env_fn(seed, warmup_steps=None):
         """Factory function for vectorized environments."""
         def _init():
@@ -664,6 +743,13 @@ def main():
                 max_episode_steps=args.max_episode_steps,
                 warmup_episode_steps=warmup_steps,
             )
+            # DR wrapper sits OUTSIDE MultiLayoutEnv so its RNG survives layout
+            # changes (MultiLayoutEnv reconstructs the inner WindFarmEnv on
+            # layout change, which would reset any wrapper installed via
+            # per_turbine_wrapper and silently break reproducibility).
+            if _dr_posterior is not None:
+                sampler = make_dr_sampler(_dr_posterior, keys=tuple(args.dr_keys))
+                env = DWMRandomizationWrapper(env, sampler=sampler, seed=seed)
             return env
         return _init
 
