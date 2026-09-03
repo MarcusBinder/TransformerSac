@@ -207,6 +207,46 @@ ENV_CONFIGS: Dict[str, Dict[str, Any]] = {
             "wd_min": 250, "wd_max": 290,
         },
     },
+
+    # --- VENDORED from the `tracking` branch @ 84d450a (helpers/env_configs.py
+    # :282-323), where the `change_wd_*.pt` checkpoints were trained. Needed
+    # because make_env_config() resolves the preset name stored in each
+    # checkpoint. NB: the parent preset `les_recipe` these two are described as
+    # cloning is NOT ported -- both blocks below are flat literal overrides that
+    # stand alone, and their resolved dicts are asserted equal to the training
+    # repo's. Do NOT port further `les_recipe*` presets by analogy: the two
+    # branches' _base_config() differ in yaw_min/max, ws_min/max, TI_min/max and
+    # wd_min/max, and it is only because these two presets override every one of
+    # those keys that the divergence is masked.
+
+    # LES-3x3 Stage 5 (train ON the 270 <-> 235 transition): EXACT clone of
+    # les_recipe with wd PINNED to 270. Required by the ABSOLUTE training
+    # schedule cycle_270_235_phase (f(0) == 270): the burn-in holds the drawn
+    # base_wd and wd_list[0] = base_wd, so any band other than {270} would put
+    # a wd jump at t=0. The trainer hard-errors if an absolute schedule is
+    # paired with an unpinned preset.
+    "les_recipe_pin270": {
+        "power_def": {"Power_reward": "Wake_recovery", "Power_avg": 5, "Power_scaling": 1.0},
+        "farm": {"yaw_min": -45, "yaw_max": 45},
+        "wind": {
+            "wd_min": 270, "wd_max": 270,
+            "ws_min": 8, "ws_max": 11,
+            "TI_min": 0.038, "TI_max": 0.038,
+        },
+    },
+
+    # LES-3x3 Stage 5 static-band CONTROL: les_recipe with static wd ~ U[235, 270]
+    # per episode (no --train_wd_function) -- the same wd support the cycle arms
+    # sweep through, but never a transition inside an episode.
+    "les_recipe_band235": {
+        "power_def": {"Power_reward": "Wake_recovery", "Power_avg": 5, "Power_scaling": 1.0},
+        "farm": {"yaw_min": -45, "yaw_max": 45},
+        "wind": {
+            "wd_min": 235, "wd_max": 270,
+            "ws_min": 8, "ws_max": 11,
+            "TI_min": 0.038, "TI_max": 0.038,
+        },
+    },
 }
 
 
