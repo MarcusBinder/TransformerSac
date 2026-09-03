@@ -689,7 +689,14 @@ class TransformerActor(nn.Module):
             self.profile_proj = nn.Linear(2 * embed_dim, embed_dim)
 
 
-        # Observation encoder (shared across turbines)
+        # Observation encoder (shared across turbines). The tracking branch
+        # also has --obs_encoder_mode per_sensor (PerSensorObsEncoder, one MLP
+        # per sensor group); this checkout does not, so refuse such checkpoints
+        # here instead of failing at load_state_dict with a key-mismatch error.
+        assert getattr(args, "obs_encoder_mode", "shared") == "shared", (
+            f"obs_encoder_mode={getattr(args, 'obs_encoder_mode')!r} is not "
+            "supported by this TransformerSac checkout (only 'shared'); load "
+            "the checkpoint with the tracking branch")
         self.obs_encoder = nn.Sequential(
             nn.Linear(obs_dim_per_turbine, embed_dim),
             nn.ReLU(),
@@ -991,6 +998,11 @@ class TransformerCritic(nn.Module):
 
 
         # Observation + action encoder (no DroQ here — applied only in q_head per Hiraoka et al.)
+        # Same guard as TransformerActor: no per_sensor encoder in this checkout.
+        assert getattr(args, "obs_encoder_mode", "shared") == "shared", (
+            f"obs_encoder_mode={getattr(args, 'obs_encoder_mode')!r} is not "
+            "supported by this TransformerSac checkout (only 'shared'); load "
+            "the checkpoint with the tracking branch")
         self.obs_action_encoder = nn.Sequential(
             nn.Linear(obs_dim_per_turbine + action_dim_per_turbine, embed_dim),
             nn.ReLU(),
