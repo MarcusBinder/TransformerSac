@@ -286,6 +286,8 @@ def main():
     else:
         from helpers.plain_turbines import make_plain_turbine
         wind_turbine = make_plain_turbine(args.turbtype)
+    # Greppable smoke gate: which turbine class the --turbtype string resolved to.
+    print(f"Turbine: --turbtype {args.turbtype} -> {wind_turbine.name()}")
     
     # Create layout configurations
     print("Setting up layouts...")

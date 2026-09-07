@@ -30,6 +30,37 @@ def test_iea22_geometry_and_power():
     assert 0.0 < ct9 < 1.2
 
 
+def test_iea22_unchanged():
+    # Stage-8 anchor: the 1-D H2S curve must not move when the surrogate lands
+    # (P(9.2, yaw=0) from the paper-derating .venv, py_wake 2.6.20).
+    wt = make_plain_turbine("IEA22")
+    assert float(np.ravel(wt.power(9.2))[0]) == pytest.approx(14.155e6, rel=0.01)
+
+
+def test_iea22h2_surrogate():
+    # Lowercase is what the Stage-8 launcher passes (LESRL harnesses compare
+    # turbtype.lower()); the upper alias must map to the same class.
+    wt = make_plain_turbine("iea22h2")
+    assert type(make_plain_turbine("IEA22H2")) is type(wt)
+    assert str(wt.name()) == "IEA_22MW_280_RWT_HAWC2S"
+    assert float(wt.diameter()) == pytest.approx(284.0)
+    assert float(wt.hub_height()) == pytest.approx(170.0)
+    # HAWC2 aero power at the precursor hub speed, zero yaw.
+    p0 = float(np.ravel(wt.power(9.2, yaw=0.0))[0])
+    assert p0 == pytest.approx(13.663e6, rel=0.01)
+    # The table carries the yaw loss (cos^1.65-ish, NOT PyWake's cos^2.9).
+    p20 = float(np.ravel(wt.power(9.2, yaw=20.0))[0])
+    assert p20 / p0 == pytest.approx(0.908, abs=0.01)
+    assert float(np.ravel(wt.ct(9.2, yaw=0.0))[0]) == pytest.approx(0.7525, rel=0.01)
+    # yaw is an OPTIONAL input with default 0 -> dynamiks forwards the sensor.
+    pcm = wt.powerCtFunction
+    assert pcm.default_value_dict == {"yaw": 0.0}
+    assert "yaw" in pcm.optional_inputs
+    # Aero power_max 23.1 MW (windgym maxturbpower; IEA22 electrical is 22.0).
+    pmax = float(np.max(wt.power(np.arange(10.0, 25.0), yaw=0.0)))
+    assert pmax == pytest.approx(23.1e6, rel=0.01)
+
+
 def test_dtu10mw_unchanged():
     wt = make_plain_turbine("DTU10MW")
     assert float(wt.diameter()) == pytest.approx(178.3)

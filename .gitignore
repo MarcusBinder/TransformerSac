@@ -9,6 +9,8 @@ windgym*
 
 # Data files
 *.nc
+# Stage 8: the IEA22 HAWC2 (ws,yaw) surrogate table must ship with the code (helpers/iea_22_rwt.py reads it).
+!helpers/iea22_hawc2_ws_yaw_surrogate.nc
 
 # Training artifacts
 /wandb
