@@ -230,6 +230,8 @@ def main():
         from py_wake.examples.data.hornsrev1 import V80 as WT
     elif args.turbtype.lower() == "iea22":
         from iea_22_rwt import IEA_22MW_H2S as WT
+    elif args.turbtype.lower() == "iea22h2":
+        from iea_22_rwt import IEA_22MW_HAWC2Surrogate as WT  # HAWC2 (ws, yaw) table
     else:
         raise ValueError(f"Unknown turbine type: {args.turbtype}")
     

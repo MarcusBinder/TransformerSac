@@ -9,6 +9,8 @@ windgym*
 
 # Data files
 *.nc
+# the IEA22 HAWC2 (ws, yaw) surrogate table is source data for IEA_22MW_HAWC2Surrogate (68 kB)
+!iea22_hawc2_ws_yaw_surrogate.nc
 
 # Training artifacts
 /wandb
