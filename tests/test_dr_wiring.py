@@ -159,3 +159,25 @@ def test_guard_turbine_only_allows_mannload(trainer):
 
 def test_guard_turb_dr_two_arg_call_still_works(trainer):
     trainer.validate_dr_setup(_args(), None)
+
+
+# ---- DWM speed-up flags (interpolation / lateral cutoff) ---------------------
+
+def test_dwm_speedup_args_default_to_env_defaults():
+    """None = WindFarmEnv default. On windgym proj/wdest (Stages 6-8) that was
+    linear / 1.5; on dev_dynamiks it is dynamiks' pchip / no cutoff, so the
+    flags exist to pin one physics explicitly."""
+    import tyro
+    from config import Args
+    a = Args()
+    assert a.dwm_interpolation is None and a.dwm_lateral_cutoff is None
+    b = tyro.cli(Args, args=["--dwm_interpolation", "linear", "--dwm_lateral_cutoff", "1.5"])
+    assert b.dwm_interpolation == "linear" and b.dwm_lateral_cutoff == 1.5
+
+
+def test_dwm_speedup_kwargs_helper(trainer):
+    assert trainer.dwm_speedup_kwargs(_args(dwm_interpolation=None, dwm_lateral_cutoff=None)) == {}
+    assert trainer.dwm_speedup_kwargs(_args(dwm_interpolation="linear", dwm_lateral_cutoff=1.5)) == {
+        "interpolation": "linear", "lateral_cutoff": 1.5}
+    with pytest.raises(ValueError, match="pchip"):
+        trainer.dwm_speedup_kwargs(_args(dwm_interpolation="cubic", dwm_lateral_cutoff=None))

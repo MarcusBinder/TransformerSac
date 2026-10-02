@@ -92,6 +92,17 @@ class Args:
     # Forwarded as a WindFarmEnv ctor kwarg via base_env_kwargs, so train and
     # eval envs stay consistent (eval_wd.py has the matching flag).
     max_turb_move: Optional[float] = None
+    # DWM solver speed-ups (WindFarmEnv ctor kwargs, forwarded only when set).
+    # None = the env's default, which CHANGED between windgym pins: proj/wdest
+    # (Stages 6-8, paper-derating until 2026-10) defaulted to linear / 1.5,
+    # dev_dynamiks (windgym 410ddc6+) defaults to dynamiks' original pchip /
+    # no cutoff = the physics the LES calibration ran and every LESRL eval
+    # uses. Greedy 3x3 energy differs by ~0.3-0.5 % between the two (yaw
+    # identical). Pin one explicitly so train and eval physics are a choice,
+    # not a pin accident: --dwm_interpolation linear --dwm_lateral_cutoff 1.5
+    # reproduces the Stage-8 training physics bitwise.
+    dwm_interpolation: Optional[str] = None   # "linear" | "pchip"
+    dwm_lateral_cutoff: Optional[float] = None  # e.g. 1.5; None = no cutoff
     max_eps: int = 20         # Number of flow passthroughs per episode
     num_envs: int = 1         # Number of parallel environments
 

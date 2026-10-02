@@ -120,6 +120,28 @@ def validate_dr_setup(args, dr_posterior, turb_ranges=None):
                 f"{sorted(unknown_to_env)} in dwm_params (needs windgym "
                 "dev_dynamiks with turbine-parameter DR)."
             )
+
+
+def dwm_speedup_kwargs(args) -> dict:
+    """WindFarmEnv kwargs for --dwm_interpolation / --dwm_lateral_cutoff.
+
+    Only set values are forwarded, so the default (both None) leaves the env's
+    own defaults untouched (pchip / no cutoff on windgym dev_dynamiks).
+    """
+    out = {}
+    interp = getattr(args, "dwm_interpolation", None)
+    cutoff = getattr(args, "dwm_lateral_cutoff", None)
+    if interp is not None:
+        if interp not in ("linear", "pchip"):
+            raise ValueError(f"--dwm_interpolation must be 'linear' or 'pchip', got {interp!r}")
+        out["interpolation"] = interp
+    if cutoff is not None:
+        if float(cutoff) <= 0:
+            raise ValueError(f"--dwm_lateral_cutoff must be > 0, got {cutoff}")
+        out["lateral_cutoff"] = float(cutoff)
+    return out
+
+
 from helpers.dr_posterior import load_posterior, make_dr_sampler
 from helpers.dr_turbine import (
     combine_samplers,
@@ -634,6 +656,15 @@ def main():
         base_env_kwargs["max_turb_move"] = float(args.max_turb_move)
         print(f"max_turb_move set to: {base_env_kwargs['max_turb_move']} m "
               f"(wd_slow frame slew limit scales with it)")
+
+    # DWM solver speed-ups: pin the physics explicitly (see config.py). The
+    # env defaults differ between windgym pins (proj/wdest linear / 1.5 vs
+    # dev_dynamiks pchip / none), so the line below is the greppable record
+    # of what this run actually simulated.
+    _speedups = dwm_speedup_kwargs(args)
+    base_env_kwargs.update(_speedups)
+    print(f"DWM solver        : interpolation={_speedups.get('interpolation', 'env default')}, "
+          f"lateral_cutoff={_speedups.get('lateral_cutoff', 'env default')}")
 
     # WD-estimation ladder: swap the privileged env.wd for the sensor-derived
     # estimate. The env computes it from measurements it already takes
