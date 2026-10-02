@@ -5,6 +5,10 @@ from typing import Dict, Any
 def _base_config() -> Dict[str, Any]:
     """Base environment configuration for transformer-based control."""
     return {
+        # DWM physics preset (WindGym core.calibrated_values). dev_dynamiks made
+        # the LES-calibrated stack opt-in; without this key every env (training,
+        # eval, old checkpoints rebuilt from presets) runs plain dynamiks.
+        "dwm_setup": "les_calibrated",
         "yaw_init": "Random",
         "BaseController": "Local",
         "ActionMethod": "yaw",
@@ -333,6 +337,21 @@ def make_env_config(name: str = "default") -> Dict[str, Any]:
 
     config = deepcopy(_base_config())
     return _deep_update(config, deepcopy(ENV_CONFIGS[name]))
+
+
+def require_les_calibrated(dwm_setup) -> None:
+    """Raise unless ``dwm_setup`` (a preset name, a DWMSetup, or None) is LES_CALIBRATED.
+
+    WindGym dev_dynamiks defaults to plain dynamiks; LESRL never trains or
+    evaluates on that, so a config or env that lost the preset must fail loudly.
+    """
+    from WindGym.core.calibrated_values import LES_CALIBRATED, resolve_dwm_setup
+
+    if resolve_dwm_setup(dwm_setup) != LES_CALIBRATED:
+        raise RuntimeError(
+            f"DWM setup {dwm_setup!r} is not LES_CALIBRATED; set "
+            f'"dwm_setup": "les_calibrated" in the env preset'
+        )
 
 
 def obs_dim_per_turbine(config: Dict[str, Any], history_N: int) -> int:

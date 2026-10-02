@@ -84,7 +84,7 @@ from helpers.helper_funcs import (
     soft_update,
 )
 from helpers.layouts import get_layout_positions
-from helpers.env_configs import make_env_config
+from helpers.env_configs import make_env_config, require_les_calibrated
 
 # Receptivity profile computation
 from helpers.receptivity_profiles import compute_layout_profiles
@@ -391,6 +391,8 @@ def main():
     # Environment configuration
     print(f"using the config: {args.config}")
     config = make_env_config(args.config)
+    # Fail fast on the main process (workers would raise the same per env).
+    require_les_calibrated(config.get("dwm_setup"))
 
     # Override ActionMethod from args (default "wind", or overridden by checkpoint above)
     config["ActionMethod"] = args.action_type
@@ -507,6 +509,9 @@ def main():
                           y_pos=y_pos,
                           reset_init=False,  # Defer reset to training loop
                           **base_env_kwargs)
+        # WindGym dev_dynamiks defaults to plain dynamiks; the presets select
+        # the calibrated stack via config["dwm_setup"]. Never train without it.
+        require_les_calibrated(env.unwrapped.dwm_setup)
         env.action_space.seed(args.seed)
         return env
     
