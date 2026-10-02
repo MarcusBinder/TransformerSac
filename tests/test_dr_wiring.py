@@ -132,3 +132,30 @@ def test_guard_non_mann_subset_allows_other_ti_types(trainer, posterior):
 def test_guard_launch_config_passes(trainer, posterior):
     # The exact Stage-7 launch shape must sail through.
     trainer.validate_dr_setup(_args(), posterior)
+
+
+# ---- Stage-9 turbine-parameter DR (--turb_dr) ------------------------------
+
+def test_turb_dr_args_default_off():
+    from config import Args
+    a = Args()
+    assert a.turb_dr == () and a.turb_dr_per_turbine is True
+
+
+def test_guard_turb_dr_rejects_hawc2(trainer):
+    with pytest.raises(ValueError, match="htc_path"):
+        trainer.validate_dr_setup(
+            _args(htc_path="x.htc"), None, {"cp_gain": (0.95, 1.05)}
+        )
+
+
+def test_guard_turbine_only_allows_mannload(trainer):
+    # No posterior -> no Mann-key constraint; turbine keys are TI-type agnostic.
+    pytest.importorskip("WindGym.core.turbine_params")
+    trainer.validate_dr_setup(
+        _args(TI_type="MannLoad", htc_path=None), None, {"cp_gain": (0.95, 1.05)}
+    )
+
+
+def test_guard_turb_dr_two_arg_call_still_works(trainer):
+    trainer.validate_dr_setup(_args(), None)

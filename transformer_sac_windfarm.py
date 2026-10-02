@@ -70,38 +70,64 @@ except ImportError:  # pragma: no cover - only on outdated windgym checkouts
     DWMRandomizationWrapper = None
 
 
-def validate_dr_setup(args, dr_posterior):
+def validate_dr_setup(args, dr_posterior, turb_ranges=None):
     """Fail fast on DR configurations that would train wrong physics silently.
 
     Module-level (not inline in the training loop) so tests/test_dr_wiring.py
     can exercise the guards without entering the trainer. No-op when DR is off
-    (dr_posterior is None).
+    (no posterior and no turbine ranges). ``turb_ranges`` is the parsed
+    ``--turb_dr`` spec (Stage 9); two-argument calls keep working.
     """
-    if dr_posterior is None:
+    turb_ranges = turb_ranges or {}
+    if dr_posterior is None and not turb_ranges:
         return
     if DWMRandomizationWrapper is None:
         raise RuntimeError(
-            "--dr_posterior_path requested but this WindGym has no "
+            "--dr_posterior_path / --turb_dr requested but this WindGym has no "
             "DWMRandomizationWrapper (needs proj/wdest >= the Stage-7 "
             "lesrl merge)."
         )
     if args.backend == "pywake":
         raise ValueError(
-            "--dr_posterior_path requires --backend dynamiks: the DWM "
-            "closure params (k1, k2, d_particle) and Mann-box statistics "
-            "have no counterpart in the pywake_steady adapter."
+            "--dr_posterior_path / --turb_dr require --backend dynamiks: the DWM "
+            "closure params (k1, k2, d_particle), Mann-box statistics and the "
+            "turbine-model perturbations have no counterpart in the "
+            "pywake_steady adapter."
         )
-    mann_in_dr = tuple(
-        k for k in args.dr_keys if k in WindFarmEnv._MANN_PARAM_KEYS
-    )
-    if mann_in_dr and args.TI_type != "MannGenerate":
-        raise ValueError(
-            f"dr_keys includes Mann-box keys {mann_in_dr} but "
-            f"TI_type={args.TI_type!r} does not regenerate the box from "
-            "those statistics. Either pass --TI_type MannGenerate, or "
-            f"remove {mann_in_dr} from --dr_keys."
+    if dr_posterior is not None:
+        mann_in_dr = tuple(
+            k for k in args.dr_keys if k in WindFarmEnv._MANN_PARAM_KEYS
         )
+        if mann_in_dr and args.TI_type != "MannGenerate":
+            raise ValueError(
+                f"dr_keys includes Mann-box keys {mann_in_dr} but "
+                f"TI_type={args.TI_type!r} does not regenerate the box from "
+                "those statistics. Either pass --TI_type MannGenerate, or "
+                f"remove {mann_in_dr} from --dr_keys."
+            )
+    if turb_ranges:
+        if getattr(args, "htc_path", None) is not None:
+            raise ValueError(
+                "--turb_dr cannot be combined with --htc_path: HAWC2 turbines "
+                "are the deployment target this DR imitates and are never "
+                "perturbed."
+            )
+        validate_turb_dr_names(turb_ranges)
+        unknown_to_env = set(turb_ranges) - set(WindFarmEnv._DWM_PARAM_KEYS)
+        if unknown_to_env:
+            raise RuntimeError(
+                f"this WindFarmEnv does not accept turbine-parameter keys "
+                f"{sorted(unknown_to_env)} in dwm_params (needs windgym "
+                "dev_dynamiks with turbine-parameter DR)."
+            )
 from helpers.dr_posterior import load_posterior, make_dr_sampler
+from helpers.dr_turbine import (
+    combine_samplers,
+    format_turb_dr,
+    make_turbine_sampler,
+    parse_turb_dr,
+    validate_turb_dr_names,
+)
 from helpers.agent import WindFarmAgent
 
 # Logging utilities for multi-layout training
@@ -828,13 +854,22 @@ def main():
     _dr_posterior = (
         load_posterior(args.dr_posterior_path) if args.dr_posterior_path else None
     )
-    validate_dr_setup(args, _dr_posterior)
+    # Stage 9: per-turbine turbine-model perturbations (helpers/dr_turbine.py),
+    # drawn on the same per-env RNG right after the posterior row.
+    _turb_ranges = parse_turb_dr(args.turb_dr)
+    validate_dr_setup(args, _dr_posterior, _turb_ranges)
+    _n_turb_dr = int(args.max_turbines or max(l.n_turbines for l in layouts))
+    _dr_active = _dr_posterior is not None or bool(_turb_ranges)
     if _dr_posterior is not None:
         print(
             f"[DR] loaded posterior with {len(_dr_posterior['samples'])} samples "
             f"over {_dr_posterior['names']}; randomizing keys {tuple(args.dr_keys)} "
             f"(turbtype={args.TI_type})"
         )
+    if _turb_ranges:
+        print(format_turb_dr(_turb_ranges)
+              + f" ({'per-turbine iid' if args.turb_dr_per_turbine else 'farm-wide'}, "
+              f"n_turb={_n_turb_dr}; training resets only)")
 
     def make_env_fn(seed, warmup_steps=None):
         """Factory function for vectorized environments."""
@@ -855,8 +890,14 @@ def main():
             # changes (MultiLayoutEnv reconstructs the inner WindFarmEnv on
             # layout change, which would reset any wrapper installed via
             # per_turbine_wrapper and silently break reproducibility).
-            if _dr_posterior is not None:
-                sampler = make_dr_sampler(_dr_posterior, keys=tuple(args.dr_keys))
+            if _dr_active:
+                sampler = combine_samplers(
+                    make_dr_sampler(_dr_posterior, keys=tuple(args.dr_keys))
+                    if _dr_posterior is not None else None,
+                    make_turbine_sampler(_turb_ranges, _n_turb_dr,
+                                         per_turbine=args.turb_dr_per_turbine)
+                    if _turb_ranges else None,
+                )
                 env = DWMRandomizationWrapper(env, sampler=sampler, seed=seed)
             return env
         return _init
@@ -1956,6 +1997,7 @@ def main():
     # Tracking
     step_reward_window = deque(maxlen=1000)
     yaw_accumulator = defaultdict(list)
+    dr_log_episodes = 0  # final_info events seen (DR introspection cadence)
     # DEL-penalty diagnostics (filled only when the DELRewardWrapper is
     # attached: --del_penalty_scale > 0 or --del_log). ratio/max keys are NaN
     # during each episode's ti_window warm-up; only finite values are
@@ -2931,6 +2973,23 @@ def main():
             writer.add_scalar("charts/episodic_return", ep_return, global_step)
             writer.add_scalar("charts/episodic_length", ep_length, global_step)
             writer.add_scalar("charts/episodic_power", ep_power, global_step)
+
+            # DR introspection (cheap: one get_attr round trip every ~50
+            # episodes): mean of each drawn parameter over the workers' last
+            # resets, so the W&B run records what physics it actually saw.
+            if _dr_active and args.track:
+                dr_log_episodes += 1
+                if dr_log_episodes % 50 == 1:
+                    try:
+                        _thetas = [t for t in envs.env.get_attr("last_theta") if t]
+                    except Exception:  # noqa: BLE001 - diagnostics only
+                        _thetas = []
+                    if _thetas:
+                        for _k in _thetas[0]:
+                            writer.add_scalar(
+                                f"dr/{_k}_mean",
+                                float(np.mean([np.mean(t[_k]) for t in _thetas if _k in t])),
+                                global_step)
 
             # Greedy-baseline comparison (filled by RecordEpisodeVals only when
             # the env is built with Baseline_comp, e.g. Power_reward="Baseline").

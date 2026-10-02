@@ -136,6 +136,18 @@ class Args:
     dr_keys: Tuple[str, ...] = (
         "k1", "k2", "d_particle", "mann_L", "mann_GAMMA", "mann_AE",
     )
+    # === Turbine-parameter domain randomization (Stage 9, sim2real) ===
+    # Per-turbine perturbations of the PyWake turbine model, drawn iid from
+    # U[lo, hi] on every TRAINING reset through the same DWMRandomizationWrapper
+    # (helpers/dr_turbine.py; names/bounds from WindGym.core.turbine_params:
+    # yaw_exp cp_gain ct_gain tau_yaw delay_yaw tau_power). Spec items are
+    # "name=lo:hi", e.g. --turb_dr yaw_exp=-0.4:0.6 cp_gain=0.95:1.05. Empty =
+    # off (nominal turbine, bit-identical to Stage 8). Training resets only:
+    # in-training eval envs and the LESRL eval harnesses stay nominal unless
+    # they pass --turb-params. Incompatible with --htc_path (HAWC2 turbines are
+    # the target model) and with --backend pywake. Saved in checkpoint["args"].
+    turb_dr: Tuple[str, ...] = ()
+    turb_dr_per_turbine: bool = True   # False = one draw per name for the whole farm
 
     # === Evaluation Settings ===
     eval_interval: int = 50000        # How often to evaluate (in env steps)
