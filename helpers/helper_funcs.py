@@ -367,9 +367,14 @@ class EnhancedPerTurbineWrapper(gym.Wrapper):
         return obs_transformed, reward, terminated, truncated, info
 
 
-def get_env_wind_directions(envs) -> np.ndarray:
-    """Get current wind direction from each environment."""
-    return np.array(envs.env.get_attr('wd'), dtype=np.float32)
+def get_env_wind_directions(envs, attr: str = 'wd') -> np.ndarray:
+    """Get current wind direction from each environment.
+
+    ``attr`` selects the source: 'wd' (privileged true value, default) or
+    'wd_est' (sensor-derived estimate, --wd_source est). The replay buffer
+    stores whatever this fetched, so buffer honesty follows automatically.
+    """
+    return np.array(envs.env.get_attr(attr), dtype=np.float32)
 
 
 def get_env_raw_positions(envs) -> np.ndarray:
@@ -448,6 +453,7 @@ def save_checkpoint(
     tqc_critic_target: Optional[nn.Module] = None,
     qf1_target: Optional[nn.Module] = None,
     qf2_target: Optional[nn.Module] = None,
+    obs_norm_state: Optional[Dict[str, torch.Tensor]] = None,
 ) -> str:
     """
     Save training checkpoint.
@@ -455,6 +461,10 @@ def save_checkpoint(
     Target networks are optional so old call sites keep working; when given,
     they are stored under *_target_state_dict keys so a resumed run keeps the
     Polyak lag instead of hard-copying online -> target.
+
+    Args:
+        obs_norm_state: ObsRunningNorm.state_dict() (CPU tensors) when --obs_norm
+            is on; the weights are meaningless without the matching statistics.
 
     Returns:
         Path to saved checkpoint
@@ -488,6 +498,8 @@ def save_checkpoint(
         checkpoint["log_alpha"] = log_alpha.detach().cpu()
     if alpha_optimizer is not None:
         checkpoint["alpha_optimizer_state_dict"] = alpha_optimizer.state_dict()
+    if obs_norm_state is not None:
+        checkpoint["obs_norm_state"] = obs_norm_state
 
     torch.save(checkpoint, checkpoint_path)
     print(f"Checkpoint saved to {checkpoint_path}")
@@ -559,6 +571,7 @@ def load_checkpoint(
     alpha_optimizer: Optional[optim.Optimizer] = None,
     tqc_critic: Optional[nn.Module] = None,
     tqc_critic_target: Optional[nn.Module] = None,
+    obs_normalizer=None,
 ) -> int:
     """
     Load training checkpoint.
@@ -577,6 +590,7 @@ def load_checkpoint(
         alpha_optimizer: Optional entropy optimizer
         tqc_critic: TQC critic (None for SAC)
         tqc_critic_target: TQC target critic (None for SAC)
+        obs_normalizer: Optional ObsRunningNorm to restore (--obs_norm runs)
 
     Returns:
         Step number from checkpoint
@@ -601,6 +615,8 @@ def load_checkpoint(
         log_alpha.data = checkpoint["log_alpha"].to(device)
     if alpha_optimizer is not None and "alpha_optimizer_state_dict" in checkpoint:
         alpha_optimizer.load_state_dict(checkpoint["alpha_optimizer_state_dict"])
+    if obs_normalizer is not None and "obs_norm_state" in checkpoint:
+        obs_normalizer.load_state_dict(checkpoint["obs_norm_state"])
 
     print(f"Loaded checkpoint from {checkpoint_path} at step {checkpoint['step']}")
 

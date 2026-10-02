@@ -52,14 +52,8 @@ def load_actor_from_checkpoint(checkpoint_path: str, device: torch.device):
 def create_eval_env(layout: str, args: dict, turbbox_path: str, seed: int = 42, n_envs: int = 1):
     """Create evaluation environment for a single layout."""
 
-    if args["turbtype"] == "DTU10MW":
-        from py_wake.examples.data.dtu10mw import DTU10MW as WT
-    elif args["turbtype"] == "V80":
-        from py_wake.examples.data.hornsrev1 import V80 as WT
-    else:
-        raise ValueError(f"Unknown turbine type: {args['turbtype']}")
-
-    wind_turbine = WT()
+    from helpers.plain_turbines import make_plain_turbine
+    wind_turbine = make_plain_turbine(args["turbtype"])
 
     layout_names = [l.strip() for l in layout.split(",")]
     layouts = []

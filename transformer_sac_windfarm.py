@@ -22,10 +22,12 @@ Author: Marcus Binder Nilsen (DTU Wind Energy)
 """
 
 import atexit
+import copy
 import inspect
 import os
 import random
 import signal
+import sys
 import time
 from typing import Optional, Tuple, List, Dict, Any, Union
 from collections import deque, defaultdict
@@ -57,8 +59,48 @@ from WindGym import WindFarmEnv
 from WindGym.wrappers import (
     RecordEpisodeVals,
     PerTurbineObservationWrapper,
-    DWMRandomizationWrapper,
 )
+
+# Stage-7 DR wrapper: absent on pre-lesrl-merge windgym. Import lazily so the
+# trainer still runs (DR off) against an older windgym, and the DR guard below
+# can raise a version-skew message instead of a bare module ImportError.
+try:
+    from WindGym.wrappers import DWMRandomizationWrapper
+except ImportError:  # pragma: no cover - only on outdated windgym checkouts
+    DWMRandomizationWrapper = None
+
+
+def validate_dr_setup(args, dr_posterior):
+    """Fail fast on DR configurations that would train wrong physics silently.
+
+    Module-level (not inline in the training loop) so tests/test_dr_wiring.py
+    can exercise the guards without entering the trainer. No-op when DR is off
+    (dr_posterior is None).
+    """
+    if dr_posterior is None:
+        return
+    if DWMRandomizationWrapper is None:
+        raise RuntimeError(
+            "--dr_posterior_path requested but this WindGym has no "
+            "DWMRandomizationWrapper (needs proj/wdest >= the Stage-7 "
+            "lesrl merge)."
+        )
+    if args.backend == "pywake":
+        raise ValueError(
+            "--dr_posterior_path requires --backend dynamiks: the DWM "
+            "closure params (k1, k2, d_particle) and Mann-box statistics "
+            "have no counterpart in the pywake_steady adapter."
+        )
+    mann_in_dr = tuple(
+        k for k in args.dr_keys if k in WindFarmEnv._MANN_PARAM_KEYS
+    )
+    if mann_in_dr and args.TI_type != "MannGenerate":
+        raise ValueError(
+            f"dr_keys includes Mann-box keys {mann_in_dr} but "
+            f"TI_type={args.TI_type!r} does not regenerate the box from "
+            "those statistics. Either pass --TI_type MannGenerate, or "
+            f"remove {mann_in_dr} from --dr_keys."
+        )
 from helpers.dr_posterior import load_posterior, make_dr_sampler
 from helpers.agent import WindFarmAgent
 
@@ -84,7 +126,12 @@ from helpers.helper_funcs import (
     soft_update,
 )
 from helpers.layouts import get_layout_positions
-from helpers.env_configs import make_env_config, require_les_calibrated
+from helpers.env_configs import (
+    make_env_config,
+    apply_config_overrides,
+    make_eval_wind_config,
+    require_les_calibrated,
+)
 
 # Receptivity profile computation
 from helpers.receptivity_profiles import compute_layout_profiles
@@ -93,10 +140,17 @@ from helpers.receptivity_profiles import compute_layout_profiles
 from helpers.eval_utils import PolicyEvaluator, run_evaluation
 from helpers.yaw_metrics import YawTravelTracker
 
+# Repo root (parent of TransformerSac/): `del_surrogate` lives there and is
+# not installed into the pixi env. The path insert + import happen INSIDE
+# combined_wrapper so they also run in AsyncVectorEnv worker processes,
+# where module-level state of __main__ may not be replayed.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 from networks import (
     TransformerActor,
     TransformerCritic,
     TransformerTQCCritic,
+    TransformerTQCSharedCritic,
     create_profile_encoding,
     quantile_huber_loss,
 )
@@ -202,13 +256,16 @@ def main():
     if _adam_fused:
         print("Optimizers: fused Adam enabled (CUDA)")
 
-    # Force math SDPA backend (avoids ROCm Flash/MemEfficient kernel bugs)
-    # ONLY RELEVANT FOR LUMI. TODO make it such this only works on lumi
-    # if device.type == "cuda":
-    #     torch.backends.cuda.enable_flash_sdp(False)
-    #     torch.backends.cuda.enable_mem_efficient_sdp(False)
-    #     torch.backends.cuda.enable_math_sdp(True)
-    #     print("Forced math SDPA backend")
+    # Force the math SDPA backend on ROCm, which has Flash/MemEfficient kernel
+    # bugs for our attention shapes. torch.version.hip is a version string on
+    # ROCm builds and None on CUDA builds, so this self-activates on LUMI's
+    # MI250X and stays dormant on Sophia -- no hostname sniffing, and nothing
+    # changes for existing CUDA runs.
+    if device.type == "cuda" and torch.version.hip is not None:
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+        print(f"ROCm detected (HIP {torch.version.hip}): forced math SDPA backend")
 
     # =========================================================================
     # ENVIRONMENT SETUP
@@ -216,26 +273,25 @@ def main():
     
     # Import WindGym components
     from WindGym import WindFarmEnv
-    from WindGym.wrappers import (
-        RecordEpisodeVals,
-        PerTurbineObservationWrapper,
-        DWMRandomizationWrapper,
-    )
+    from WindGym.wrappers import RecordEpisodeVals, PerTurbineObservationWrapper
     from helpers.multi_layout_env import MultiLayoutEnv, LayoutConfig
     
-    # Wind turbine
-    if args.turbtype == "DTU10MW":
-        from py_wake.examples.data.dtu10mw import DTU10MW as WT
-    elif args.turbtype == "V80":
-        from py_wake.examples.data.hornsrev1 import V80 as WT
-    elif args.turbtype.lower() == "iea22":
-        from iea_22_rwt import IEA_22MW_H2S as WT
-    elif args.turbtype.lower() == "iea22h2":
-        from iea_22_rwt import IEA_22MW_HAWC2Surrogate as WT  # HAWC2 (ws, yaw) table
+    # Wind turbine. Derate-enabled configs (e.g. power_max_derate) need a
+    # turbine whose powerCtFunction accepts a `derate` input; plain turbine
+    # classes fail WindFarmEnv's check_turbine_supports_derating, so dispatch
+    # on --turbtype to the derate-capable surrogate turbines (IEA34 default;
+    # DTU10MW for reproducing old checkpoints). make_env_config is pure/cheap;
+    # the full env config is (re)built later for the env itself.
+    if make_env_config(args.config).get("derate_action", False):
+        from helpers.derating_turbine import make_derating_turbine
+        wind_turbine = make_derating_turbine(
+            args.turbtype, iea34_variant=args.iea34_variant
+        )
     else:
-        raise ValueError(f"Unknown turbine type: {args.turbtype}")
-    
-    wind_turbine = WT()
+        from helpers.plain_turbines import make_plain_turbine
+        wind_turbine = make_plain_turbine(args.turbtype)
+    # Greppable smoke gate: which turbine class the --turbtype string resolved to.
+    print(f"Turbine: --turbtype {args.turbtype} -> {wind_turbine.name()}")
     
     # Create layout configurations
     print("Setting up layouts...")
@@ -398,13 +454,72 @@ def main():
     config["ActionMethod"] = args.action_type
     print(f"ActionMethod set to: {config['ActionMethod']}")
 
-    # Override yaw-travel penalty weight from args (default 0.0 = disabled, matching
-    # the shipped configs). Persisted via the checkpoint's saved args.
-    config["act_pen"]["action_penalty"] = args.action_penalty
-    print(f"action_penalty set to: {config['act_pen']['action_penalty']} (type: {config['act_pen']['action_penalty_type']})")
+    # Optional derate slew limit (fraction per sim substep, like yaw_step_sim).
+    if args.derate_step_sim is not None:
+        config["derate_step_sim"] = args.derate_step_sim
+        print(f"derate_step_sim set to: {config['derate_step_sim']}")
+    
+    mes_prefixes = {
+        "ws_mes": "ws",
+        "wd_mes": "wd",
+        "yaw_mes": "yaw",
+        "power_mes": "power",
+        "derate_mes": "derate",
+    }
 
-    # Wind veer range + rotor tilt from args (defaults 0 = off). An outdated
-    # WindGym would silently ignore these config keys, so fail loudly instead.
+    # LES-3x3 Stage 4 (--obs_agg): the ObsAggWrapper reduces the env's raw
+    # measurement deques itself, so only the DEQUE length grows to obs_agg_len
+    # (history_N, i.e. the base obs width the wrapper replaces, is unchanged).
+    # The env's reset burn-in follows max_hist(), so all L samples are filled
+    # before the first observation (+L-power_avg sim steps per reset).
+    mes_history_length = args.history_length
+    if args.obs_agg:
+        if args.obs_encoding:
+            raise ValueError("--obs_agg cannot be combined with --obs_encoding")
+        if args.use_wd_deviation:
+            raise ValueError("--obs_agg cannot be combined with --use_wd_deviation")
+        if args.obs_encoder_mode == "per_sensor":
+            raise ValueError("--obs_agg needs --obs_encoder_mode shared "
+                             "(per_sensor asserts obs_dim == 4*history_length)")
+        if args.del_penalty_scale > 0 or args.del_log:
+            raise ValueError("--obs_agg cannot be combined with the DEL wrapper "
+                             "(it appends a per-turbine column)")
+        from helpers.obs_agg import AGG_MODES
+        if args.obs_agg not in AGG_MODES:
+            raise ValueError(f"Unknown --obs_agg {args.obs_agg!r}; valid: "
+                             f"{sorted(AGG_MODES)}")
+        if args.history_N != args.history_length or args.window_length != 1:
+            # ObsAggWrapper reduces the raw deques itself and sizes its output
+            # from history_length; a decoupled history_N / window_length would
+            # change the env's base obs width underneath it.
+            raise ValueError(
+                "--obs_agg requires history_N == history_length and "
+                f"window_length == 1 (got history_N={args.history_N}, "
+                f"history_length={args.history_length}, "
+                f"window_length={args.window_length})")
+        mes_history_length = max(args.history_length, args.obs_agg_len)
+        print(f"obs_agg: mode={args.obs_agg} K={AGG_MODES[args.obs_agg].K} "
+              f"L={args.obs_agg_len} ({AGG_MODES[args.obs_agg].doc}); "
+              f"measurement deques lengthened to {mes_history_length}, "
+              f"history_N stays {args.history_N}")
+
+    for mes_type, prefix in mes_prefixes.items():
+        if mes_type not in config:
+            continue  # e.g. derate_mes is absent outside the derate presets
+        config[mes_type][f"{prefix}_history_N"] = args.history_N
+        config[mes_type][f"{prefix}_history_length"] = mes_history_length
+        config[mes_type][f"{prefix}_window_length"] = args.window_length
+
+    # change_wd_3 reward / training-wind overrides (all no-ops when unset).
+    # Applied HERE, before make_eval_env_factory deep-copies `config`, so the
+    # reward definition is shared by training and eval envs; the training-only
+    # ws range is then overwritten per eval spec below.
+    apply_config_overrides(config, args)
+
+    # Wind veer range + rotor tilt from args (defaults 0 = off). Applied before
+    # the eval deep-copies so eval episodes sample the same veer band as
+    # training (veer is part of the physical scenario, unlike DR which stays
+    # training-only). An outdated windgym would silently drop these keys.
     config["wind"]["veer_min"] = args.veer_min
     config["wind"]["veer_max"] = args.veer_max
     config["farm"]["tilt"] = args.tilt
@@ -412,8 +527,8 @@ def main():
         if "tilt" not in inspect.signature(WindFarmEnv.__init__).parameters:
             raise RuntimeError(
                 "veer/tilt requested but this WindGym predates veer+tilt "
-                "support (needs windgym commit 9b746f8 or later); the config "
-                "keys would be silently ignored."
+                "support (needs windgym commit 9b746f8 / proj/wdest >= the "
+                "Stage-7 lesrl merge); the config keys would be silently ignored."
             )
         print(
             f"veer range set to: [{args.veer_min}, {args.veer_max}] deg/100m, "
@@ -442,19 +557,6 @@ def main():
             f"yaw sensor mode={args.hawc2_yaw_mode}, slot={args.hawc2_yaw_slot}"
         )
 
-    mes_prefixes = {
-        "ws_mes": "ws",
-        "wd_mes": "wd",
-        "yaw_mes": "yaw",
-        "power_mes": "power",
-    }
-
-    for mes_type, prefix in mes_prefixes.items():
-        config[mes_type][f"{prefix}_history_N"] = args.history_N
-        config[mes_type][f"{prefix}_history_length"] = args.history_length
-        config[mes_type][f"{prefix}_window_length"] = args.window_length
-
-    
     if args.TI_type == "Precursor":
         # Fail fast on the main process: every AsyncVectorEnv worker would
         # otherwise raise the same error (or, worse, 30 workers would race to
@@ -479,14 +581,6 @@ def main():
         "dt_sim": args.dt_sim,
         "dt_env": args.dt_env,
         "yaw_step_sim": args.yaw_step,
-        # Observation scaling bounds; saved in ckpt args and read back at eval.
-        # Yaw scaling is set by _apply_config from the config farm yaw range.
-        "ws_scaling_min": args.ws_scaling_min,
-        "ws_scaling_max": args.ws_scaling_max,
-        "wd_scaling_min": args.wd_scaling_min,
-        "wd_scaling_max": args.wd_scaling_max,
-        "ti_scaling_min": args.ti_scaling_min,
-        "ti_scaling_max": args.ti_scaling_max,
     }
     if args.TI_type == "Precursor" and args.max_episode_steps is not None:
         # Episode truncation normally lives in MultiLayoutEnv (step counting),
@@ -503,57 +597,239 @@ def main():
         base_env_kwargs["hawc2_yaw_mode"] = args.hawc2_yaw_mode
         base_env_kwargs["hawc2_yaw_slot"] = args.hawc2_yaw_slot
 
-    def env_factory(x_pos: np.ndarray, y_pos: np.ndarray) -> gym.Env:
-        """Create a base WindFarmEnv with given positions."""
-        env = WindFarmEnv(x_pos=x_pos,
-                          y_pos=y_pos,
-                          reset_init=False,  # Defer reset to training loop
-                          **base_env_kwargs)
-        # WindGym dev_dynamiks defaults to plain dynamiks; the presets select
-        # the calibrated stack via config["dwm_setup"]. Never train without it.
-        require_les_calibrated(env.unwrapped.dwm_setup)
-        env.action_space.seed(args.seed)
-        return env
-    
+    # LES-3x3 campaign: relax dynamiks' apparent-turbine-motion cap so the
+    # wd_slow frame can track a moving wd schedule (its ONLY consumer is the
+    # frame slew limit max_wd_step = max_turb_move*360/(2*pi*max_dist) per sim
+    # step). Large enough that the clip never binds => wd_slow == schedule,
+    # wd_small == 0, and env.wd is exact AND causal. Spread into all three env
+    # factories (train / in-training eval / train-wd) via base_env_kwargs, so
+    # train and eval physics stay consistent. None = env default (2 m).
+    if args.max_turb_move is not None:
+        base_env_kwargs["max_turb_move"] = float(args.max_turb_move)
+        print(f"max_turb_move set to: {base_env_kwargs['max_turb_move']} m "
+              f"(wd_slow frame slew limit scales with it)")
+
+    # WD-estimation ladder: swap the privileged env.wd for the sensor-derived
+    # estimate. The env computes it from measurements it already takes
+    # (core/wd_estimator.py); rollout fetch + agent fetch + replay buffer all
+    # read through wd_source_attr, so gradients never see the true wd.
+    assert args.wd_source in ("true", "est"), (
+        f"--wd_source must be 'true' or 'est', got {args.wd_source!r}")
+    if args.wd_source == "est":
+        if args.backend == "pywake":
+            raise ValueError(
+                "--wd_source est requires --backend dynamiks: pywake's "
+                "adapter hard-codes v=w=0, so a measured local wind "
+                "direction does not exist there (atan2(v,u) == 0).")
+        if args.wd_est_tau is None:
+            raise ValueError("--wd_source est requires --wd_est_tau")
+        base_env_kwargs["wd_est_tau"] = float(args.wd_est_tau)
+        base_env_kwargs["wd_est_consensus"] = args.wd_est_consensus
+        print(f"wd source: ESTIMATED (tau={args.wd_est_tau}s, "
+              f"consensus={args.wd_est_consensus}) — the policy never "
+              f"sees the privileged env.wd")
+    wd_source_attr = "wd" if args.wd_source == "true" else "wd_est"
+
+    # DEL-constrained reward: DELRewardWrapper compares agent DELs against a
+    # greedy baseline farm, which only exists when the env is built with
+    # Baseline_comp=True. With Power_reward="Baseline" (the power-max presets)
+    # windgym forces Baseline_comp anyway, so the explicit kwarg is free; it
+    # matters only for other reward types. --del_log attaches the wrapper with
+    # penalty_scale=0 (penalty exactly 0, reward untouched) so an unpenalized
+    # A/B arm still logs the same charts/del_* metrics. BaseController
+    # "Global" pins the baseline yaw offset to 0 (deterministic greedy
+    # reference); "Local" would chase the fluctuating local wind direction and
+    # add noise to both the Baseline reward denominator and the DEL reference.
+    _del_active = args.del_penalty_scale > 0 or args.del_log
+    assert not args.del_limit_random or _del_active, (
+        "--del_limit_random conditions the policy on the DEL limit, which "
+        "only exists when the DEL wrapper is attached: also pass "
+        "--del_penalty_scale > 0 (or --del_log)."
+    )
+    if _del_active:
+        base_env_kwargs["Baseline_comp"] = True
+        config["BaseController"] = "Global"
+
+    # change_wd_4: override the env's hardcoded 0-30 m/s obs-affine range
+    # (OBS_SCALING.md). These are WindFarmEnv CTOR kwargs, deliberately NOT
+    # config-dict keys — None means "omit", so the env default stays untouched.
+    # The eval factories spread {**base_env_kwargs, ...} below, so train and
+    # eval envs get the same scaling automatically.
+    if args.ws_scaling_min is not None:
+        base_env_kwargs["ws_scaling_min"] = float(args.ws_scaling_min)
+    if args.ws_scaling_max is not None:
+        base_env_kwargs["ws_scaling_max"] = float(args.ws_scaling_max)
+    if args.ws_scaling_min is not None or args.ws_scaling_max is not None:
+        print(f"ws obs scaling override: "
+              f"[{base_env_kwargs.get('ws_scaling_min', 0.0)}, "
+              f"{base_env_kwargs.get('ws_scaling_max', 30.0)}] m/s")
+    # LES branch: the same contract for the wd and TI columns (saved in the
+    # checkpoint args; the LESRL eval scripts read them back).
+    for _k in ("wd_scaling_min", "wd_scaling_max", "ti_scaling_min", "ti_scaling_max"):
+        if getattr(args, _k) is not None:
+            base_env_kwargs[_k] = float(getattr(args, _k))
+            print(f"{_k} override: {base_env_kwargs[_k]}")
+
+
+    def make_env_factory(env_kwargs: dict):
+        """Build a WindFarmEnv factory bound to one set of env kwargs."""
+        def _factory(x_pos: np.ndarray, y_pos: np.ndarray) -> gym.Env:
+            env = WindFarmEnv(x_pos=x_pos,
+                              y_pos=y_pos,
+                              reset_init=False,  # Defer reset to training loop
+                              **env_kwargs)
+            # WindGym dev_dynamiks defaults to plain dynamiks; the presets
+            # select the calibrated stack via config["dwm_setup"]. Never train
+            # without it (older windgym has no attribute: nothing to check).
+            require_les_calibrated(getattr(env.unwrapped, "dwm_setup", None))
+            env.action_space.seed(args.seed)
+            return env
+        return _factory
+
+    # Static-wd factory: the default for training, and the eval fallback when no
+    # --eval_wd_function is given. Deliberately carries NO wd_function, so a
+    # --train_wd_function can never leak into the eval envs.
+    env_factory = make_env_factory(base_env_kwargs)
+
+    # Eval-only env factories: when --eval_wd_function is set (comma-separated for
+    # several schedules), eval envs get a time-varying wd schedule (training envs are
+    # untouched by this path). The burn-in holds the per-reset base_wd, so wd is pinned
+    # to wd_function(0) — and ws to the spec's speed so all episodes in a cell share
+    # one condition — mirroring make_flow_gif.py.
+    #
+    # The ladder is the CROSS PRODUCT (schedule x --eval_ws), because the reward
+    # conditioning under test is largely a wind-SPEED story: DTU10MW rates near
+    # 11.4 m/s, so an eval pinned only at 12 m/s sits above rated and cannot show
+    # whether an arm gained anything below it. eval_specs entries are
+    # (wd_name, ws, spec_name); spec_name carries the /ws<speed> segment only when
+    # more than one speed is requested, keeping the single-speed namespace
+    # byte-identical to change_wd_2.
+    from helpers.wd_functions import build_eval_specs
+    eval_specs = build_eval_specs(args.eval_wd_function, args.eval_ws)
+    eval_spec_names = [name for _, _, name in eval_specs]
+
+    def make_eval_env_factory(wd_name: str, ws: float):
+        from helpers.wd_functions import get_wd_function
+        _wd_fn = get_wd_function(wd_name)
+        _wd0 = float(_wd_fn(0.0))
+        # Pins wd to the schedule's t=0 value and ws UNCONDITIONALLY — the latter
+        # is what keeps a --train_ws_min/max override out of the eval condition.
+        eval_config = make_eval_wind_config(config, _wd0, ws)
+        print(f"Eval wd_function: {wd_name} "
+              f"(eval wind pinned to wd={_wd0}, ws={float(ws)})")
+        return make_env_factory({**base_env_kwargs,
+                                 "config": eval_config,
+                                 "wd_function": _wd_fn})
+
+    eval_env_factories = ([make_eval_env_factory(wd, ws) for wd, ws, _ in eval_specs]
+                          if eval_specs else [env_factory])
+
+    # Training wd schedule (--train_wd_function). Unlike the eval path these are
+    # RELATIVE — wd(t) = base_wd + delta(t) — so wd_min/wd_max are deliberately NOT
+    # pinned and the config's per-episode wd randomization survives. The schedules are
+    # stateful (they re-draw every episode), so each vector-env slot builds its own
+    # instance seeded off that slot's seed; a single shared instance would make all
+    # num_envs envs walk one identical wd trajectory.
+    def make_train_env_factory(env_seed: int):
+        if args.train_wd_function is None:
+            return env_factory
+        from helpers.wd_functions import get_train_wd_factory
+        return make_env_factory({
+            **base_env_kwargs,
+            "wd_function": get_train_wd_factory(args.train_wd_function, seed=env_seed),
+        })
+
+    if args.train_wd_function is not None:
+        from helpers.wd_functions import ABSOLUTE_TRAIN_NAMES, get_train_wd_factory
+        if args.train_wd_function in ABSOLUTE_TRAIN_NAMES:
+            # ABSOLUTE training schedule (LES-3x3 Stage 5 cycle): the burn-in
+            # holds the drawn base_wd and wd_list[0] = base_wd, so the preset's
+            # wd band MUST be pinned to f(0) or every episode starts with a wd
+            # jump that the backward wd_slow pass smears non-causally into the
+            # burn-in. Fail loudly instead of training on that silently.
+            _probe = get_train_wd_factory(args.train_wd_function, seed=args.seed)
+            _f0 = float(_probe(0.0))
+            _wd_lo, _wd_hi = float(config["wind"]["wd_min"]), float(config["wind"]["wd_max"])
+            if not (_wd_lo == _wd_hi == _f0):
+                raise ValueError(
+                    f"--train_wd_function {args.train_wd_function} is ABSOLUTE "
+                    f"(f(0)={_f0}); --config {args.config} must pin wd_min=wd_max={_f0} "
+                    f"(got [{_wd_lo}, {_wd_hi}]; use e.g. les_recipe_pin270)"
+                )
+            print(f"Train wd_function: {args.train_wd_function} "
+                  f"(ABSOLUTE; phase-randomised per episode; wd pinned by preset "
+                  f"to {_f0}; per-env seeds {args.seed}..{args.seed + args.num_envs - 1})")
+        else:
+            print(f"Train wd_function: {args.train_wd_function} "
+                  f"(relative schedule; wd domain randomization preserved, "
+                  f"per-env seeds {args.seed}..{args.seed + args.num_envs - 1})")
+
     def combined_wrapper(env: gym.Env) -> gym.Env:
         """
         Combined wrapper that:
         1. Applies PerTurbineObservationWrapper (reshapes obs to per-turbine)
         2. Optionally applies EnhancedPerTurbineWrapper (converts WD to deviation)
+        3. Optionally applies DELRewardWrapper (baseline-relative DEL hinge penalty)
+        4. Optionally applies TransformReward (reward_scale)
         """
         env = PerTurbineObservationWrapper(env)
         if args.use_wd_deviation:
             env = EnhancedPerTurbineWrapper(env, wd_scale_range=args.wd_scale_range)
+        # DEL hinge penalty BEFORE TransformReward, so the scaler multiplies
+        # the ALREADY-penalized reward: effective reward is
+        # reward_scale * (power_reward - del_penalty). del_penalty_scale is
+        # therefore in pre-scale units and the penalty/reward ratio is
+        # invariant to --reward_scale. Placed after the obs wrappers (not
+        # innermost) because gymnasium 1.x wrappers don't forward attributes:
+        # PerTurbineObservationWrapper reads env.n_turb at construction, while
+        # DELRewardWrapper only touches env.unwrapped, so it can sit anywhere
+        # in the chain. Reward-wise the two orders are identical (obs wrappers
+        # pass reward through untouched).
+        if args.del_penalty_scale > 0 or args.del_log:
+            # NN DEL surrogate (default) or proxy zoo (--load_proxies); the
+            # comparison rule / penalty kind come from --load_compare /
+            # --load_penalty. Goal-conditioned limit: per-episode uniform
+            # sample + one obs column per turbine (limit / del_limit_obs_ref).
+            # None keeps the fixed allowed_increase behavior bit-identical.
+            from helpers.load_reward import build_load_reward_wrapper
+            env = build_load_reward_wrapper(
+                env, args,
+                limit_range=(
+                    (args.del_limit_lo, args.del_limit_hi)
+                    if args.del_limit_random else None
+                ),
+                limit_obs_ref=args.del_limit_obs_ref,
+            )
+        # change_wd_4: re-encode the ws columns (rbf/pyramid/cdf/fourier/reldef/
+        # pcurve). Must sit INSIDE TransformReward so MultiLayoutEnv's
+        # outermost-first _obs_dim_per_turbine probe finds the expanded dim.
+        if args.obs_encoding:
+            from helpers.obs_encoding import ObsEncodingWrapper
+            env = ObsEncodingWrapper(env, mode=args.obs_encoding,
+                                     turbine=wind_turbine,
+                                     **json.loads(args.obs_encoding_kwargs))
+        # LES-3x3 Stage 4: aggregate scheme over the L-long deques (same slot
+        # as obs_encoding: inside TransformReward, before MultiLayoutEnv's
+        # shuffle/pad, so spatial_rel sees the true layout order).
+        if args.obs_agg:
+            from helpers.obs_agg import ObsAggWrapper
+            env = ObsAggWrapper(env, args.obs_agg, args.obs_agg_len,
+                                dt_env=args.dt_env)
         # v9.1: scale the (tiny) Wake_recovery reward to probe optimization signal-to-noise.
         if args.reward_scale != 1.0:
             _scale = float(args.reward_scale)
             env = gym.wrappers.TransformReward(env, lambda r: r * _scale)
         return env
     
-    # === LES-calibrated domain randomization ===
-    # Pre-load the posterior once on the main process; the dict is pickled into
-    # each AsyncVectorEnv worker via the env-factory closure (314 KB, cheap).
-    # Disabled when args.dr_posterior_path is None — make_env_fn falls back to
-    # plain MultiLayoutEnv exactly as before.
+    # Domain randomization: per-reset DWM parameter draws from a calibrated
+    # posterior. TRAINING envs only — the in-training eval envs (and eval_wd
+    # harvests) run the nominal calibrated defaults so eval curves aren't
+    # DR-noised. Disabled when args.dr_posterior_path is None.
     _dr_posterior = (
         load_posterior(args.dr_posterior_path) if args.dr_posterior_path else None
     )
+    validate_dr_setup(args, _dr_posterior)
     if _dr_posterior is not None:
-        # Fail fast on the misconfiguration where Mann-box keys are randomized
-        # under a turbtype that doesn't regenerate the box (Random/MannLoad/
-        # MannFixed/None). The env raises the same message on its first reset,
-        # but checking here surfaces the error before AsyncVectorEnv workers
-        # spawn — much easier to debug than a worker traceback.
-        _mann_in_dr = tuple(
-            k for k in args.dr_keys if k in WindFarmEnv._MANN_PARAM_KEYS
-        )
-        if _mann_in_dr and args.TI_type != "MannGenerate":
-            raise ValueError(
-                f"dr_keys includes Mann-box keys {_mann_in_dr} but "
-                f"TI_type={args.TI_type!r} does not regenerate the box from "
-                "those statistics. Either pass --TI-type MannGenerate, or "
-                f"remove {_mann_in_dr} from --dr-keys."
-            )
         print(
             f"[DR] loaded posterior with {len(_dr_posterior['samples'])} samples "
             f"over {_dr_posterior['names']}; randomizing keys {tuple(args.dr_keys)} "
@@ -563,9 +839,11 @@ def main():
     def make_env_fn(seed, warmup_steps=None):
         """Factory function for vectorized environments."""
         def _init():
+            # Built inside _init so the (stateful) training wd schedule is
+            # constructed in this worker process, one instance per env slot.
             env = MultiLayoutEnv(
                 layouts=layouts,
-                env_factory=env_factory,
+                env_factory=make_train_env_factory(seed),
                 per_turbine_wrapper=combined_wrapper,  # Use combined wrapper
                 seed=seed,
                 shuffle=args.shuffle_turbs,  # Shuffle turbines within each layout
@@ -631,36 +909,111 @@ def main():
 
     n_turbines_max = envs.env.get_attr('max_turbines')[0]
     obs_dim_per_turbine = envs.single_observation_space.shape[-1]
-    action_dim_per_turbine = 1
+    # 1 for yaw-only, 2 for yaw+derate (block action [yaw..., derate...]);
+    # MultiLayoutEnv derives it from the wrapped env's action space.
+    action_dim_per_turbine = envs.env.get_attr('action_dim_per_turbine')[0]
     rotor_diameter = envs.env.get_attr('rotor_diameter')[0]
 
     print(f"Max turbines: {n_turbines_max}")
     print(f"Obs dim per turbine: {obs_dim_per_turbine}")
     print(f"Action dim per turbine: {action_dim_per_turbine}")
     print(f"Rotor diameter: {rotor_diameter:.1f} m")
-    
 
-    # Create policy evaluator
-    evaluator = PolicyEvaluator(
-        agent=None,  # Will be set after actor is created
-        eval_layouts=eval_layout_names,
-        env_factory=env_factory,
-        combined_wrapper=combined_wrapper,
-        num_envs=args.num_envs,
-        num_eval_steps=args.num_eval_steps,
-        num_eval_episodes=args.num_eval_episodes,
-        device=device,
-        rotor_diameter=rotor_diameter,
-        wind_turbine=wind_turbine,
-        seed=args.eval_seed,
-        max_turbines=n_turbines_max,
-        deterministic=args.eval_deterministic,
-        use_profiles=use_profiles,  # NEW: Pass profile setting
-        n_profile_directions=args.n_profile_directions,  # NEW: Pass profile resolution
-        profile_source=args.profile_source,
-        profile_sigma_smooth=args.profile_sigma_smooth,
-        profile_geom_mode=args.profile_geom_mode,
-    )
+    # Which column of a per-turbine action row is yaw and which is derate, for
+    # the actions/* diagnostics. PerTurbineObservationWrapper emits ONE ROW PER
+    # TURBINE -- [yaw_i, derate_i] with both enabled, or the single enabled
+    # channel -- and transposes to the base env's variable-grouped
+    # [yaw_0..yaw_n | derate_0..derate_n] layout internally. So the column index
+    # here is NOT the base env's block offset; mixing the two up would silently
+    # mislabel yaw as derate.
+    _env_flags = make_env_config(args.config)
+    _yaw_on = bool(_env_flags.get("yaw_action", True))
+    _derate_on = bool(_env_flags.get("derate_action", False))
+    if action_dim_per_turbine >= 2:
+        _act_cols = {"yaw": 0, "derate": 1}
+    elif _derate_on and not _yaw_on:
+        _act_cols = {"derate": 0}
+    else:
+        _act_cols = {"yaw": 0}
+    print(f"Action columns (for actions/* logging): {_act_cols}")
+
+    # change_wd_4: agent-side running obs normalization. Constructed from the
+    # WRAPPED obs dim so it composes with --obs_encoding; applied at act() time
+    # (via the agent's BatchPreparer) and on replay batches after rb.sample.
+    # See helpers/obs_norm.py for why this is not a per-env wrapper.
+    obs_normalizer = None
+    if args.obs_norm:
+        from helpers.obs_norm import ObsRunningNorm
+        obs_normalizer = ObsRunningNorm(obs_dim_per_turbine, device)
+        print(f"ObsRunningNorm enabled ({obs_dim_per_turbine} features, "
+              f"updates from step 0, clip ±{obs_normalizer.clip})")
+
+
+    # Create policy evaluators — one per eval wd schedule. Every evaluator shares the
+    # same eval_seed, so the schedules are compared on PAIRED episodes.
+    evaluators = [
+        PolicyEvaluator(
+            agent=None,  # Will be set after actor is created
+            eval_layouts=eval_layout_names,
+            env_factory=_factory,
+            combined_wrapper=combined_wrapper,
+            num_envs=args.num_envs,
+            num_eval_steps=args.num_eval_steps,
+            num_eval_episodes=args.num_eval_episodes,
+            device=device,
+            rotor_diameter=rotor_diameter,
+            wind_turbine=wind_turbine,
+            seed=args.eval_seed,
+            max_turbines=n_turbines_max,
+            deterministic=args.eval_deterministic,
+            use_profiles=use_profiles,  # NEW: Pass profile setting
+            n_profile_directions=args.n_profile_directions,  # NEW: Pass profile resolution
+            profile_source=args.profile_source,
+            profile_sigma_smooth=args.profile_sigma_smooth,
+            profile_geom_mode=args.profile_geom_mode,
+        )
+        for _factory in eval_env_factories
+    ]
+
+    # FORK SAFETY: create every evaluator's AsyncVectorEnv NOW — before the
+    # networks initialize the GPU (HIP/CUDA context) and before any gradient
+    # burst spins up torch/OMP threads — and keep them RESIDENT for the whole
+    # run. Lazily forking eval workers at the first mid-training eval is a
+    # fork-after-threads deadlock: the child inherits a lock some torch thread
+    # holds and hangs in futex_do_wait while the parent blocks on the worker
+    # pipe (observed on local CPU and on LUMI/ROCm, where it froze all six T3
+    # runs at their first 50k eval for 10+ hours). The training envs never
+    # deadlock for exactly this reason — they fork at startup. Resident cost
+    # is num_specs x num_envs idle workers; the eval layouts are capped small
+    # (square_2x2), so this is noise next to the 30 training envs.
+    for _ev in evaluators:
+        _ = _ev.eval_envs  # property; triggers AsyncVectorEnv creation
+
+    def run_all_evaluations():
+        """Evaluate on every eval wd schedule.
+
+        Returns (metrics_dict, primary_metrics). The FIRST spec additionally
+        writes the historical unprefixed eval/... keys so existing W&B panels and
+        paper_figures.ipynb readers keep working; every spec also writes
+        eval/wd/<spec>/... . Evaluators are deliberately NOT closed between
+        passes — their envs must stay resident (see the fork-safety note at
+        creation above).
+        """
+        metrics = {}
+        primary = None
+        for i, ev in enumerate(evaluators):
+            m = ev.evaluate()
+            if i == 0:
+                primary = m
+                metrics.update(m.to_dict())
+            if eval_spec_names:
+                metrics.update(m.to_dict(prefix=f"eval/wd/{eval_spec_names[i]}"))
+                print(f"  [{eval_spec_names[i]}] power ratio: {m.power_ratio:.4f}")
+        return metrics, primary
+
+    def close_all_evaluators():
+        for ev in evaluators:
+            ev.close()
 
 
     # Action scaling
@@ -676,7 +1029,6 @@ def main():
     yaw_step_env = args.yaw_step * (args.dt_env / args.dt_sim)
     yaw_tracker = YawTravelTracker(deadband=0.05, slew_limit=yaw_step_env)
     action_tracker = YawTravelTracker(deadband=0.01)
-
 
     # =========================================================================
     # DEBUG LOGGER AND TRACKING SETUP
@@ -726,6 +1078,17 @@ def main():
             monitor_gym=True,
             save_code=True,
         )
+
+        # Everything reaches W&B through sync_tensorboard, so the TB tag is the
+        # W&B key and the TB step arrives as "global_step". Declaring the groups
+        # explicitly makes each one chart against global_step instead of
+        # W&B's own monotonically-increasing _step, which otherwise spreads
+        # metrics logged at different frequencies (per-iteration perf/* vs
+        # per-episode del/*) across mismatched x-axes.
+        wandb.define_metric("global_step")
+        for _group in ("perf/*", "actions/*", "del/*", "losses/*",
+                       "charts/*", "entropy/*", "timing/*"):
+            wandb.define_metric(_group, step_metric="global_step")
 
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
@@ -878,10 +1241,17 @@ def main():
         use_wind_relative=args.use_wind_relative_pos,
         use_profiles=use_profiles,
         rotate_profiles=args.rotate_profiles,
+        # The evaluators share this agent, so eval act() calls are normalized
+        # with the same (live) statistics as training — eval envs never go cold.
+        obs_normalizer=obs_normalizer,
+        # PolicyEvaluator lets the agent fetch wd itself, so the wd source
+        # follows the agent into every eval pass too.
+        wd_attr=wd_source_attr,
     )
 
     # Update evaluator with actor reference
-    evaluator.agent = agent
+    for _ev in evaluators:
+        _ev.agent = agent
 
     # Build critic-specific kwargs (DroQ params only go to critics, not actor)
     critic_kwargs = {**common_kwargs}
@@ -915,12 +1285,16 @@ def main():
     taus = None
 
     if args.algorithm == "tqc":
-        tqc_critic = TransformerTQCCritic(
+        # NOTE (pre-existing, both TQC variants + SAC): with --share_profile_encoder,
+        # critic_kwargs holds the LIVE encoder modules, so the target's profile
+        # encoders alias the live ones and soft_update lerps them with themselves.
+        tqc_cls = TransformerTQCSharedCritic if args.tqc_share_trunk else TransformerTQCCritic
+        tqc_critic = tqc_cls(
             n_critics=args.tqc_n_critics,
             n_quantiles=args.tqc_n_quantiles,
             **critic_kwargs,
         ).to(device)
-        tqc_critic_target = TransformerTQCCritic(
+        tqc_critic_target = tqc_cls(
             n_critics=args.tqc_n_critics,
             n_quantiles=args.tqc_n_quantiles,
             **critic_kwargs,
@@ -936,7 +1310,9 @@ def main():
         actor_params = sum(p.numel() for p in actor.parameters())
         critic_params = sum(p.numel() for p in tqc_critic.parameters())
         print(f"Actor parameters: {actor_params:,}")
-        print(f"TQC Critic parameters: {critic_params:,} ({args.tqc_n_critics} critics x {args.tqc_n_quantiles} quantiles)")
+        shared_note = (f" [shared trunk: 1 trunk x {args.tqc_n_critics} heads]"
+                       if args.tqc_share_trunk else "")
+        print(f"TQC Critic parameters: {critic_params:,} ({args.tqc_n_critics} critics x {args.tqc_n_quantiles} quantiles){shared_note}")
     else:
         # SAC: standard dual-critic setup (DroQ regularization applied via critic_kwargs if enabled)
         qf1 = TransformerCritic(**critic_kwargs).to(device)
@@ -1025,6 +1401,18 @@ def main():
                 f"--algorithm={args.algorithm} but checkpoint contains TQC critic weights. "
                 f"Use --algorithm=tqc to resume this checkpoint."
             )
+        if ckpt_is_tqc:
+            # Key probe (not saved args) so pre-tqc_share_trunk checkpoints validate:
+            # shared-trunk critics have "trunk.*" keys, independent ones "critics.*".
+            ckpt_shared = any(k.startswith("trunk.")
+                              for k in checkpoint["tqc_critic_state_dict"])
+            if ckpt_shared != args.tqc_share_trunk:
+                raise ValueError(
+                    f"TQC critic layout mismatch: checkpoint was saved with "
+                    f"tqc_share_trunk={ckpt_shared} but current run has "
+                    f"tqc_share_trunk={args.tqc_share_trunk}. Shared-trunk and "
+                    f"independent TQC checkpoints are not interchangeable."
+                )
 
         # Load network weights. Target networks are restored from their own
         # state dicts when present (checkpoints written by the current code);
@@ -1077,7 +1465,17 @@ def main():
                     print(f"✓ Loaded alpha optimizer state")
             else:
                 print(f"✓ Reset entropy coefficient (alpha={float(alpha):.4f})")
-       
+
+        # === Obs normalizer statistics (change_wd_4, --obs_norm) ===
+        if obs_normalizer is not None:
+            if "obs_norm_state" in checkpoint:
+                obs_normalizer.load_state_dict(checkpoint["obs_norm_state"])
+                print(f"✓ Loaded obs normalizer statistics "
+                      f"(count={float(obs_normalizer.count):.0f})")
+            else:
+                print("WARNING: --obs_norm set but checkpoint has no "
+                      "obs_norm_state — statistics start cold.")
+
         # === Resume step logic ===
         if args.resume_step_counter:
             start_step = checkpoint["step"]
@@ -1182,8 +1580,11 @@ def main():
 
         # Critics always get encoder-only loading (obs_action_encoder input dim differs)
         if args.algorithm == "tqc":
-            for i, critic in enumerate(tqc_critic.critics):
-                load_pretrained_into(critic, f"TQC Critic {i}", _pretrain_encoder_sd)
+            if args.tqc_share_trunk:
+                load_pretrained_into(tqc_critic.trunk, "TQC shared trunk", _pretrain_encoder_sd)
+            else:
+                for i, critic in enumerate(tqc_critic.critics):
+                    load_pretrained_into(critic, f"TQC Critic {i}", _pretrain_encoder_sd)
             tqc_critic_target.load_state_dict(tqc_critic.state_dict())
         else:
             n_qf1 = load_pretrained_into(qf1, "Critic qf1", _pretrain_encoder_sd)
@@ -1342,6 +1743,7 @@ def main():
         tqc_critic=tqc_critic,
         tqc_critic_target=tqc_critic_target,
         qf1_target=qf1_target, qf2_target=qf2_target,
+        obs_norm_state=obs_normalizer.state_dict() if obs_normalizer is not None else None,
     )
 
 
@@ -1351,12 +1753,11 @@ def main():
     # Initial evaluation
     if args.eval_initial:
         print("\nRunning initial evaluation before training...")
-        eval_metrics = evaluator.evaluate()
-        eval_dict = eval_metrics.to_dict()
-        
+        eval_dict, eval_metrics = run_all_evaluations()
+
         for name, value in eval_dict.items():
             writer.add_scalar(name, value, 0)
-        
+
         print(f"Initial eval - Mean reward: {eval_metrics.mean_reward:.4f}, "
               f"Power ratio: {eval_metrics.power_ratio:.4f}")
 
@@ -1377,7 +1778,161 @@ def main():
     # Wall-clock breakdown (only populated when --log_timing). Accumulated over a
     # logging window and reset on each flush. Syncs are gated so they add no
     # overhead when timing is off.
-    timing = {"env": 0.0, "sample": 0.0, "critic": 0.0, "actor": 0.0}
+    # "env" = time BLOCKED in step_wait (name kept for dashboard continuity);
+    # "env_span" = wall-clock from step_async to step_wait return, i.e. the
+    # full env-step duration whether or not it was hidden behind the gradient
+    # burst (--async_overlap). hidden time = env_span - env.
+    timing = {"env": 0.0, "env_span": 0.0, "sample": 0.0, "critic": 0.0, "actor": 0.0}
+
+    # -------------------------------------------------------------------------
+    # perf/* : cheap, always-on resource accounting.
+    #
+    # On a cluster billed by GPU-hour the question that matters is whether the
+    # GPU sits idle while the DWM env workers churn -- which is what sets both
+    # the wall clock and the right --cpus-per-task. torch's own counters cover
+    # the GPU; for CPU and memory we read the job's cgroup rather than this
+    # process, because the AsyncVectorEnv workers are separate processes and
+    # os.times()/RSS of the parent would miss all of their work.
+    #
+    # Preferred source is the job's cgroup, but /sys/fs/cgroup is NOT populated
+    # inside LUMI's Singularity container (measured: cpu.stat and
+    # memory.current are both absent), so fall back to walking /proc and
+    # summing over our PROCESS GROUP -- multiprocessing does not setpgrp, so
+    # the AsyncVectorEnv workers share our pgrp and are counted. Everything is
+    # best-effort: if both sources fail the metric is simply not logged.
+    _CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+
+    def _proc_stat_fields(pid="self"):
+        """Fields 3.. of /proc/<pid>/stat, 0-indexed so field N is at N-3.
+
+        Splits on the LAST ')': the comm field is parenthesised and may itself
+        contain spaces and parentheses (e.g. "(python3.12 (deleted))"), which
+        would misalign a naive .split().
+        """
+        with open(f"/proc/{pid}/stat") as fh:
+            return fh.read().rsplit(")", 1)[1].split()
+
+    def _read_cgroup_cpu_usec():
+        try:
+            with open("/sys/fs/cgroup/cpu.stat") as fh:
+                for line in fh:
+                    if line.startswith("usage_usec"):
+                        return int(line.split()[1])
+        except (OSError, ValueError, IndexError):
+            pass
+        # Fallback: utime+stime (fields 14,15) over our process group (field 5).
+        try:
+            pgrp = _proc_stat_fields()[2]
+        except (OSError, IndexError):
+            return None
+        ticks = 0
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                f = _proc_stat_fields(entry)
+                if f[2] != pgrp:
+                    continue
+                ticks += int(f[11]) + int(f[12])
+            except (OSError, IndexError, ValueError):
+                continue          # process exited mid-scan, or unreadable
+        return int(ticks / _CLK_TCK * 1e6)
+
+    def _read_cgroup_mem_bytes():
+        out = {}
+        for key, path in (("cur", "/sys/fs/cgroup/memory.current"),
+                          ("peak", "/sys/fs/cgroup/memory.peak")):
+            try:
+                with open(path) as fh:
+                    out[key] = int(fh.read().strip())
+            except (OSError, ValueError):
+                pass
+        if "cur" not in out:
+            # Fallback: summed RSS (field 24) over the process group. Shared
+            # pages are counted once per process, so this OVERSTATES real usage
+            # -- it is a trend line for --mem sizing, not an accounting figure.
+            try:
+                pgrp = _proc_stat_fields()[2]
+            except (OSError, IndexError):
+                return out
+            pages = 0
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                try:
+                    f = _proc_stat_fields(entry)
+                    if f[2] != pgrp:
+                        continue
+                    pages += int(f[21])
+                except (OSError, IndexError, ValueError):
+                    continue
+            out["rss_sum"] = pages * os.sysconf("SC_PAGE_SIZE")
+        return out
+
+    # Number of CPUs this job may actually use, so cpu_util is a percentage of
+    # the allocation rather than of the whole 128-core node.
+    try:
+        _n_cpu_alloc = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        _n_cpu_alloc = os.cpu_count() or 1
+
+    _perf_prev = {"t": time.time(), "cpu_usec": _read_cgroup_cpu_usec(),
+                  "step": global_step}
+
+    # Always-on env-vs-update wall-clock split, in HOST time with NO cuda sync.
+    #
+    # timing/* already reports a sync-accurate breakdown, but it costs a
+    # torch.cuda.synchronize() per bucket per gradient step, which is why it
+    # sits behind --log_timing -- and the production run scripts do not pass
+    # that flag. These two counters are four perf_counter() calls per iteration,
+    # so they can stay on always, and for this launch-bound update loop host
+    # time is the number that actually answers "is the GPU waiting on 30 DWM
+    # env workers?". Use --log_timing when you need GPU-inclusive attribution.
+    _perf_split = {"env": 0.0, "update": 0.0}
+
+    # -------------------------------------------------------------------------
+    # actions/* : exact mean/std/saturation per channel over each logging window.
+    #
+    # Running sums (not a deque of raw arrays) so the window statistics are
+    # exact rather than an average-of-per-step-averages, and so memory does not
+    # scale with num_envs * n_turbines.
+    #
+    # Actions live in the normalized [-1, 1] space of the wrapper's Box. Under
+    # the "yaw"/"step" action methods that value IS the fraction of the per-step
+    # slew budget, so |a| ~ 1 means the turbine is moving at its rate limit --
+    # a persistently high sat_frac says the slew limit, not the policy, is what
+    # is shaping behaviour.
+    _act_acc = {f"{ch}_{stat}": 0.0
+                for ch in _act_cols for stat in ("sum", "sq", "sat")}
+    _act_acc["n"] = 0.0
+
+    def _accumulate_actions(act, masks):
+        """Fold one step's actions into _act_acc. Cheap: ~num_envs*n_turb floats."""
+        a = np.asarray(act, dtype=np.float64)
+        if a.ndim == 2:                       # (num_envs, n_turb) -> single channel
+            a = a[..., None]
+        if a.ndim != 3:
+            return
+        # masks mark PADDED turbines (True = padding), matching the convention
+        # in the actor/critic (n_real = (~attention_mask).sum()). Excluding them
+        # keeps padded slots from dragging every statistic toward zero.
+        keep = None
+        if masks is not None:
+            m = np.asarray(masks)
+            if m.shape == a.shape[:2]:
+                keep = ~m.astype(bool)
+        for ch, col in _act_cols.items():
+            if col >= a.shape[2]:
+                continue
+            v = a[:, :, col]
+            v = v[keep] if keep is not None else v.reshape(-1)
+            if v.size == 0:
+                continue
+            _act_acc[f"{ch}_sum"] += float(v.sum())
+            _act_acc[f"{ch}_sq"] += float(np.square(v).sum())
+            _act_acc[f"{ch}_sat"] += float((np.abs(v) >= 0.99).sum())
+            if ch == next(iter(_act_cols)):
+                _act_acc["n"] += float(v.size)
 
     def _sync_timer():
         """Return perf_counter, syncing CUDA first so GPU work is included."""
@@ -1397,10 +1952,44 @@ def main():
     # resumed job would replay the same wind/DR episode sequence from scratch.
     # Unchanged when start_step == 0.
     obs, infos = envs.reset(seed=args.seed + start_step)
-    
+
     # Tracking
     step_reward_window = deque(maxlen=1000)
     yaw_accumulator = defaultdict(list)
+    # DEL-penalty diagnostics (filled only when the DELRewardWrapper is
+    # attached: --del_penalty_scale > 0 or --del_log). ratio/max keys are NaN
+    # during each episode's ti_window warm-up; only finite values are
+    # collected so the logged means reflect evaluated steps.
+    del_penalty_window = deque(maxlen=1000)
+    del_ratio_window = deque(maxlen=1000)
+    del_agent_max_window = deque(maxlen=1000)
+    del_base_max_window = deque(maxlen=1000)
+    reward_unpen_window = deque(maxlen=1000)
+    del_ood_window = deque(maxlen=1000)
+    # Goal-conditioned limit diagnostics: the limit in effect (varies across
+    # episodes under --del_limit_random) and the budget margin
+    # (1 + limit) - ratio; margin > 0 <=> inside the DEL budget, so its mean
+    # is the constraint-satisfaction signal across the sampled-limit
+    # distribution. Margin is NaN wherever ratio is (finite-filtered below).
+    del_limit_window = deque(maxlen=1000)
+    del_margin_window = deque(maxlen=1000)
+    # Multi-channel penalty: which reward channel realized the binding (max)
+    # ratio each step -> charts/del_binding_frac/<channel>. Only logged when
+    # more than one channel is configured (single-channel: trivially 1.0).
+    # Canonicalized ("wtow_H0FAMnt" -> "H0FAMnt") to match the names the
+    # wrapper reports in info["del_binding_channel"].
+    del_binding_window = deque(maxlen=1000)
+    _del_reward_channels = []
+    if _del_active:
+        from helpers.load_reward import load_reward_channels
+        _del_reward_channels = load_reward_channels(args)
+
+    # del/*: per-channel load ratios. charts/del_agent_max collapses every
+    # channel into a single worst-case number, which tells you a limit is being
+    # approached but not WHICH load is doing it -- so the load story is
+    # unreadable from the charts alone. Keyed by channel name, created lazily
+    # from whatever info["del_ratio_by_channel"] actually reports.
+    del_channel_windows = {}
     # next_save_step = ((start_step // args.save_interval) + 1) * args.save_interval  # Account for resumed step
     next_save_step = start_step + args.save_interval
     # Replay buffer saving
@@ -1410,8 +1999,15 @@ def main():
     # logging drain. Avoids a per-grad-step .item() sync that would serialize this
     # launch-bound update loop. Counts track how many updates contributed each metric.
     _qf_keys = ['qf_loss'] if args.algorithm == "tqc" else ['qf1_loss', 'qf2_loss']
+    # q_mean / td_* / *_gnorm / target_entropy feed the losses/* panel. They are
+    # accumulated on-GPU like the rest and materialized once per logging window,
+    # so they cost no extra host syncs in the launch-bound update loop.
+    # td_abs/td_sq are SAC-only: TQC regresses a quantile distribution, so there
+    # is no single scalar TD error to spread.
     _acc_keys = _qf_keys + ['actor_loss', 'alpha_loss',
-                            'logpi_per_turbine', 'ent_term', 'q_term', 'n_real_mean']
+                            'logpi_per_turbine', 'ent_term', 'q_term', 'n_real_mean',
+                            'q_mean', 'td_abs', 'td_sq',
+                            'critic_gnorm', 'actor_gnorm', 'target_entropy']
 
     def _zero_losses():
         return {k: torch.zeros((), device=device) for k in _acc_keys}
@@ -1458,8 +2054,10 @@ def main():
             )
             print(f"\n[Step {global_step}] Unfroze pretrained encoder parameters")
         
-        # Get environment info (needed for replay buffer)
-        wind_dirs = get_env_wind_directions(envs)
+        # Get environment info (needed for replay buffer). Under
+        # --wd_source est this fetches wd_est, so the buffer stores (and the
+        # policy trains on) the estimate — buffer honesty is automatic.
+        wind_dirs = get_env_wind_directions(envs, attr=wd_source_attr)
         raw_positions = get_env_raw_positions(envs)
         current_masks = get_env_attention_masks(envs)
 
@@ -1467,14 +2065,22 @@ def main():
         if args.profile_encoding_type is not None:
             current_layout_indices = get_env_layout_indices(envs)
             current_permutations = get_env_permutations(envs)
+            # Prefetch the profiles too so agent.act does no get_attr of its
+            # own: ALL env IPC must happen before step_async (--async_overlap
+            # forbids IPC while a step is in flight).
+            current_receptivity = get_env_receptivity_profiles(envs)
+            current_influence = get_env_influence_profiles(envs)
         else:
             current_layout_indices = None
             current_permutations = None
+            current_receptivity = None
+            current_influence = None
 
 
         # Select action
         # Reuse the env state already fetched above to avoid duplicate get_attr IPC
-        act_state = dict(wind_dirs=wind_dirs, raw_positions=raw_positions, masks=current_masks)
+        act_state = dict(wind_dirs=wind_dirs, raw_positions=raw_positions, masks=current_masks,
+                        receptivity=current_receptivity, influence=current_influence)
         if global_step < args.learning_starts:
             if args.initial_exploration == "policy":
                 # Use the actor network (useful when resuming from checkpoint)
@@ -1486,118 +2092,54 @@ def main():
         else:
             with torch.no_grad():
                 actions = agent.act(envs, obs, **act_state)
-        
-        # Step environment
-        _t0 = _sync_timer()
-        next_obs, rewards, terminations, truncations, infos = envs.step(actions)
-        if args.log_timing:
-            timing["env"] += time.perf_counter() - _t0
 
+        # actions/* accounting. Before step_async, but it touches no env IPC --
+        # current_masks was prefetched above -- so it is safe under
+        # --async_overlap.
+        _accumulate_actions(actions, current_masks)
 
-        # Get current layout names for each env. Under domain randomization the pool
-        # is huge, so bucket every training layout under "dr_pool" for debug stats.
-        if dr_enabled:
-            current_layouts = ["dr_pool"] * args.num_envs
-        else:
-            current_layouts = get_env_current_layout(envs)
+        # Step environment. The step is always dispatched async; the flag only
+        # picks the blocking point. --async_overlap collects the result AFTER
+        # the gradient burst (env workers simulate while the GPU trains);
+        # otherwise we block right here, giving the same compute order as the
+        # old blocking envs.step().
+        _t_async = time.perf_counter()
+        envs.step_async(actions)
+        step_result = None
+        if not args.async_overlap:
+            _t0 = _sync_timer()
+            _t_env0 = time.perf_counter()
+            step_result = envs.step_wait()
+            _perf_split["env"] += time.perf_counter() - _t_env0
+            if args.log_timing:
+                _t_now = time.perf_counter()
+                timing["env"] += _t_now - _t0
+                timing["env_span"] += _t_now - _t_async
 
-        # Log per-step data to debug tracker (always - internal deques handle storage)
-        for i in range(args.num_envs):
-            debug_logger.log_layout_step(
-                layout_name=current_layouts[i],
-                reward=float(rewards[i]),
-                power=float(infos.get("Power agent", [0.0] * args.num_envs)[i]) if "Power agent" in infos else None,
-                actions=actions[i] if isinstance(actions, np.ndarray) else np.array(actions[i]),
-            )
-            debug_logger.log_wind_direction(float(wind_dirs[i]))
-
-
-        # Track rewards
-        step_reward_window.extend(np.array(rewards).flatten().tolist())
-
-        # Track yaw angles (from info dict; shape (num_envs, n_turbines))
-        if "yaw angles agent" in infos:
-            yaw_deg = np.array(infos["yaw angles agent"])
-            yaw_accumulator['yaw_abs_mean_deg'].append(float(np.abs(yaw_deg).mean()))
-            yaw_accumulator['yaw_max_deg'].append(float(np.abs(yaw_deg).max()))
-            yaw_accumulator['yaw_over_20_frac'].append(float(np.mean(np.abs(yaw_deg) > 20.0)))
-            for t in range(yaw_deg.shape[-1]):
-                yaw_accumulator[f'yaw_turb{t}_abs_deg'].append(float(np.abs(yaw_deg[:, t]).mean()))
-            env0_yaw = yaw_deg[0] if yaw_deg.ndim > 1 else yaw_deg
-            for t in range(len(env0_yaw)):
-                yaw_accumulator[f'yaw_env0_turb{t}_deg'].append(float(env0_yaw[t]))
-
-            # Movement diagnostics (travel, reversals, duty cycle). Mask done
-            # envs so post-autoreset yaw is never diffed against pre-reset yaw.
-            dones = np.logical_or(terminations, truncations)
-            yaw_tracker.update(yaw_deg, done=dones)
-            actions_np = np.asarray(actions)
-            action_tracker.update(actions_np.reshape(args.num_envs, -1), done=dones)
-            yaw_accumulator['action_saturation_frac'].append(
-                float(np.mean(np.abs(actions_np) > 0.95)))
-
-        # Log episode stats
-        if "final_info" in infos:
-            ep_return = np.mean(envs.return_queue)
-            ep_length = np.mean(envs.length_queue)
-            ep_power = np.mean(envs.mean_power_queue)
-            
-            print(f"Step {global_step}: Episode return={ep_return:.2f}, power={ep_power:.2f}")
-            writer.add_scalar("charts/episodic_return", ep_return, global_step)
-            writer.add_scalar("charts/episodic_length", ep_length, global_step)
-            writer.add_scalar("charts/episodic_power", ep_power, global_step)
-
-
-        # Handle final observations
-        real_next_obs = next_obs.copy()
-        for idx, trunc in enumerate(truncations):
-            if trunc:
-                real_next_obs[idx] = infos["final_obs"][idx]
-        
-        # Store in replay buffer
-        for i in range(args.num_envs):
-            done = terminations[i] or truncations[i]
-            action_reshaped = actions[i].reshape(-1, action_dim_per_turbine)
-        
-            layout_idx_i = current_layout_indices[i] if current_layout_indices is not None else None
-            perm_i = current_permutations[i] if current_permutations is not None else None
-
-            rb.add(
-                obs[i],
-                real_next_obs[i],
-                action_reshaped,
-                rewards[i],
-                done,
-                raw_positions[i],
-                current_masks[i],
-                wind_dirs[i],
-                layout_index=layout_idx_i,
-                permutation=perm_i,
+        # change_wd_4: fold the fresh observations into the running obs stats.
+        # Masked so 0.0-pad rows don't drag the means; runs from step 0 (the
+        # random-exploration warmup is already on-distribution).
+        if obs_normalizer is not None:
+            obs_normalizer.update(
+                torch.as_tensor(next_obs, dtype=torch.float32, device=device),
+                torch.as_tensor(current_masks, device=device),
             )
 
-        # One-shot warmup buffer save (buffer pre-generation for ablation runs)
-        if (args.save_buffer_at_learning_starts
-                and not warmup_buffer_saved
-                and global_step >= args.learning_starts):
-            rb.save(
-                f"runs/{run_name}/replay_buffer_warmup_{args.learning_starts}.npz",
-                extra_meta=buffer_meta(global_step),
-            )
-            warmup_buffer_saved = True
-            if args.buffer_only:
-                print("\n--buffer_only set: warmup buffer saved, exiting before training.")
-                evaluator.close()
-                envs.close()
-                writer.close()
-                return
 
-        obs = next_obs
-        
         # =====================================================================
         # TRAINING
         # =====================================================================
-        
+        # NOTE (--async_overlap): an env step may be IN FLIGHT throughout this
+        # block -- do not add env IPC (get_attr / call / step) anywhere in the
+        # training region or AsyncVectorEnv raises AlreadyPendingCallError.
+        # envs.return_queue reads below are wrapper-local deques: safe, but one
+        # iteration stale (cosmetic only). The replay buffer excludes the
+        # in-flight transitions (rb.add runs after step_wait, below); at the
+        # first gated iteration len(rb) ~ learning_starts >> batch_size, so at
+        # worst the first burst happens one iteration later.
+
         if global_step > args.learning_starts and len(rb) >= args.batch_size:
+            _t_upd0 = time.perf_counter()
 
             # Calculate number of gradient updates for this iteration
             # This scales with num_envs to maintain consistent sample efficiency
@@ -1615,6 +2157,13 @@ def main():
                 data = rb.sample(args.batch_size)
                 if args.log_timing:
                     timing["sample"] += _sync_timer() - _t0
+
+                # change_wd_4: the buffer stores RAW obs; normalizing at the
+                # single sample point covers critic, actor and every diagnostic
+                # that reuses `data`, always with the freshest statistics.
+                if obs_normalizer is not None:
+                    data["observations"] = obs_normalizer.normalize(data["observations"])
+                    data["next_observations"] = obs_normalizer.normalize(data["next_observations"])
 
                 _t_critic = _sync_timer()
 
@@ -1674,20 +2223,42 @@ def main():
 
                     q_optimizer.zero_grad(set_to_none=True)
                     qf_loss.backward()
-                    if args.grad_clip:
-                        torch.nn.utils.clip_grad_norm_(
-                            tqc_critic.parameters(),
-                            max_norm=args.grad_clip_max_norm,
-                        )
+                    # max_norm=inf makes this a pure measurement when clipping
+                    # is off (the clip coefficient is clamped to 1.0), so
+                    # losses/critic_grad_norm is populated on this branch too
+                    # rather than silently logging 0.
+                    _critic_gnorm = torch.nn.utils.clip_grad_norm_(
+                        tqc_critic.parameters(),
+                        max_norm=args.grad_clip_max_norm if args.grad_clip else float("inf"),
+                    )
+                    loss_accumulator['critic_gnorm'] += _critic_gnorm.detach()
+                    # Q level for TQC: mean over the predicted quantiles. No
+                    # td_* here -- quantile regression has no single scalar TD
+                    # error to take a spread of.
+                    with torch.no_grad():
+                        loss_accumulator['q_mean'] += current_q.detach().float().mean()
                     q_optimizer.step()
 
                     if debug_logger.should_log_gradients(total_gradient_steps):
-                        for i, critic in enumerate(tqc_critic.critics):
+                        if args.tqc_share_trunk:
                             grad_norm = sum(
                                 p.grad.norm().item() ** 2
-                                for p in critic.parameters() if p.grad is not None
+                                for p in tqc_critic.trunk.parameters() if p.grad is not None
                             ) ** 0.5
-                            writer.add_scalar(f"debug/grad_norm/tqc_critic_{i}", grad_norm, global_step)
+                            writer.add_scalar("debug/grad_norm/tqc_trunk", grad_norm, global_step)
+                            for i, head in enumerate(tqc_critic.heads):
+                                grad_norm = sum(
+                                    p.grad.norm().item() ** 2
+                                    for p in head.parameters() if p.grad is not None
+                                ) ** 0.5
+                                writer.add_scalar(f"debug/grad_norm/tqc_head_{i}", grad_norm, global_step)
+                        else:
+                            for i, critic in enumerate(tqc_critic.critics):
+                                grad_norm = sum(
+                                    p.grad.norm().item() ** 2
+                                    for p in critic.parameters() if p.grad is not None
+                                ) ** 0.5
+                                writer.add_scalar(f"debug/grad_norm/tqc_critic_{i}", grad_norm, global_step)
 
                     loss_accumulator['qf_loss'] += qf_loss.detach()
                     n_critic_updates += 1
@@ -1739,11 +2310,15 @@ def main():
 
                     q_optimizer.zero_grad(set_to_none=True)
                     qf_loss.backward()
-                    if args.grad_clip:
-                        torch.nn.utils.clip_grad_norm_(
-                            qf1_params + qf2_params + shared_encoder_params,
-                            max_norm=args.grad_clip_max_norm,
-                        )
+                    # clip_grad_norm_ RETURNS the pre-clip total norm, so this
+                    # is free when clipping is on; with max_norm=inf the clip
+                    # coefficient is clamped to 1.0, making it a pure
+                    # measurement. A rising critic grad norm alongside a rising
+                    # qf_loss is divergence rather than a hard task.
+                    _critic_gnorm = torch.nn.utils.clip_grad_norm_(
+                        qf1_params + qf2_params + shared_encoder_params,
+                        max_norm=args.grad_clip_max_norm if args.grad_clip else float("inf"),
+                    )
                     q_optimizer.step()
 
                     if debug_logger.should_log_gradients(total_gradient_steps):
@@ -1751,6 +2326,15 @@ def main():
 
                     loss_accumulator['qf1_loss'] += qf1_loss.detach()
                     loss_accumulator['qf2_loss'] += qf2_loss.detach()
+                    loss_accumulator['critic_gnorm'] += _critic_gnorm.detach()
+                    with torch.no_grad():
+                        # Q level and TD-error spread. A td_std that grows while
+                        # td_abs stays flat means a few transitions dominate the
+                        # loss -- the usual precursor to Q-value blow-up.
+                        _td = (qf1_value.detach().float() - target_q.float())
+                        loss_accumulator['q_mean'] += qf1_value.detach().float().mean()
+                        loss_accumulator['td_abs'] += _td.abs().mean()
+                        loss_accumulator['td_sq'] += _td.pow(2).mean()
                     n_critic_updates += 1
 
                 if args.log_timing:
@@ -1800,11 +2384,13 @@ def main():
                     # Update actor
                     actor_optimizer.zero_grad(set_to_none=True)
                     actor_loss.backward()
-                    if args.grad_clip:
-                        torch.nn.utils.clip_grad_norm_(
-                            actor.parameters(),
-                            max_norm=args.grad_clip_max_norm
-                        )
+                    # See the critic note: max_norm=inf makes this a pure
+                    # measurement when --grad_clip is off.
+                    _actor_gnorm = torch.nn.utils.clip_grad_norm_(
+                        actor.parameters(),
+                        max_norm=args.grad_clip_max_norm if args.grad_clip else float("inf"),
+                    )
+                    loss_accumulator['actor_gnorm'] += _actor_gnorm.detach()
                     actor_optimizer.step()
 
                     if debug_logger.should_log_gradients(total_gradient_steps):
@@ -1842,6 +2428,11 @@ def main():
                         
                         # Alpha loss
                         alpha_loss = (-log_alpha.exp() * (log_pi_detached + target_entropy_batch)).mean()
+                        # Target entropy is adaptive (it depends on how many
+                        # real turbines are in each batch element), so logging
+                        # it alongside the achieved entropy is the only way to
+                        # read whether alpha is tracking or saturated.
+                        loss_accumulator['target_entropy'] += target_entropy_batch.detach().float().mean()
                         
                         alpha_optimizer.zero_grad(set_to_none=True)
                         alpha_loss.backward()
@@ -1905,6 +2496,10 @@ def main():
 
                 total_gradient_steps += 1
 
+            # Host time in the whole gradient burst (sampling + critic + actor).
+            # Closed before the logging block so the logging cost is excluded.
+            _perf_split["update"] += time.perf_counter() - _t_upd0
+
             # -----------------------------------------------------------------
             # Logging
             # -----------------------------------------------------------------
@@ -1933,6 +2528,32 @@ def main():
                 writer.add_scalar("losses/actor_loss", mean_actor_loss, global_step)
                 writer.add_scalar("losses/alpha", alpha_val, global_step)
 
+                # --- losses/* : health of the value function and the updates ---
+                writer.add_scalar("losses/critic_grad_norm",
+                                  (loss_accumulator['critic_gnorm'] / _nc).item(), global_step)
+                writer.add_scalar("losses/actor_grad_norm",
+                                  (loss_accumulator['actor_gnorm'] / _na).item(), global_step)
+                writer.add_scalar("losses/q_mean",
+                                  (loss_accumulator['q_mean'] / _nc).item(), global_step)
+                if args.algorithm != "tqc":
+                    _td_abs = (loss_accumulator['td_abs'] / _nc).item()
+                    _td_ms = (loss_accumulator['td_sq'] / _nc).item()
+                    writer.add_scalar("losses/td_error_abs_mean", _td_abs, global_step)
+                    # sqrt(E[td^2] - E[|td|]^2) is a lower bound on the true
+                    # spread (it uses E|td| rather than E[td]); good enough as a
+                    # relative "are a few transitions dominating" signal.
+                    writer.add_scalar("losses/td_error_spread",
+                                      max(_td_ms - _td_abs * _td_abs, 0.0) ** 0.5, global_step)
+                if args.autotune:
+                    # entropy_gap > 0 => policy is MORE random than the target,
+                    # so alpha should be falling. Persistently large and positive
+                    # is the "stay diffuse" pathology.
+                    _tgt_ent = (loss_accumulator['target_entropy'] / _na).item()
+                    _ach_ent = -(loss_accumulator['logpi_per_turbine'] / _na).item()
+                    writer.add_scalar("losses/target_entropy", _tgt_ent, global_step)
+                    writer.add_scalar("losses/policy_entropy", _ach_ent, global_step)
+                    writer.add_scalar("losses/entropy_gap", _ach_ent - _tgt_ent, global_step)
+
                 # Entropy-scaling diagnostics (see actor-update block)
                 def _acc_mean(key):
                     return (loss_accumulator[key] / _na).item()
@@ -1958,8 +2579,8 @@ def main():
                         key = f'yaw_turb{t}_abs_deg'
                         if yaw_accumulator.get(key):
                             writer.add_scalar(f"yaw/turbine_{t}_abs_deg", np.mean(yaw_accumulator[key]), global_step)
-                    
-                    for t in range(n_turbines_max):                        
+
+                    for t in range(n_turbines_max):
                         key = f"yaw_env0_turb{t}_deg"
                         if yaw_accumulator.get(key):
                             writer.add_scalar(f"yaw_env0/turbine_{t}_deg", np.mean(yaw_accumulator[key]), global_step)
@@ -1978,9 +2599,12 @@ def main():
                         # Matches the env's "change" penalty formula:
                         # action_penalty * mean(|yaw change|) per step. Logged
                         # even with penalty disabled ("what it would charge").
+                        # action_penalty is Optional on the unified Args (None
+                        # = preset value), so read the resolved config value.
                         writer.add_scalar(
                             "yaw/penalty_reward_estimate",
-                            args.action_penalty * yaw_move['travel_deg_per_step'],
+                            float(config["act_pen"].get("action_penalty") or 0.0)
+                            * yaw_move['travel_deg_per_step'],
                             global_step)
                     act_move = action_tracker.compute_and_reset()
                     if 'travel_deg_per_step' in act_move:
@@ -1997,12 +2621,107 @@ def main():
                     yaw_accumulator.clear()
 
                 if args.log_timing:
-                    total_t = sum(timing.values()) or 1.0
+                    # env_span overlaps the other buckets (the burst runs inside
+                    # it under --async_overlap), so it is excluded from the
+                    # fraction denominator. overlap_hidden = un-blocked portion
+                    # of the dispatch->collect span (~ the burst duration when
+                    # overlapping; ~0 sequential). The direct evidence of
+                    # hiding is env_sec collapsing vs a sequential run.
+                    total_t = sum(v for k, v in timing.items() if k != "env_span") or 1.0
                     for k, v in timing.items():
                         writer.add_scalar(f"timing/{k}_sec", v, global_step)
-                        writer.add_scalar(f"timing/{k}_frac", v / total_t, global_step)
+                        if k != "env_span":
+                            writer.add_scalar(f"timing/{k}_frac", v / total_t, global_step)
+                    _hidden = timing["env_span"] - timing["env"]
+                    writer.add_scalar("timing/overlap_hidden_sec", _hidden, global_step)
                     print(f"  timing(s): " + ", ".join(f"{k}={v:.2f}" for k, v in timing.items()))
+                    if args.async_overlap:
+                        print(f"  overlap: hidden={_hidden:.2f}s, wait={timing['env']:.2f}s")
+                    # With --log_timing on, also publish the sync-accurate
+                    # per-bucket fractions under perf/ so the panel gains detail
+                    # rather than changing meaning.
+                    for k, v in timing.items():
+                        if k != "env_span":
+                            writer.add_scalar(f"perf/sync_{k}_frac", v / total_t, global_step)
                     timing = {k: 0.0 for k in timing}
+
+                # -------------------------------------------------------------
+                # perf/*: is the GPU idle while the DWM envs churn?
+                # -------------------------------------------------------------
+                _t_now_w = time.time()
+                _dt = max(_t_now_w - _perf_prev["t"], 1e-9)
+                _dsteps = global_step - _perf_prev["step"]
+                writer.add_scalar("perf/wall_sec_per_1k_steps",
+                                  1000.0 * _dt / max(_dsteps, 1), global_step)
+
+                # Always-on env-vs-update split (host time, no cuda sync). If
+                # env_frac sits near 1 the GPU is starved and more
+                # --cpus-per-task buys throughput; if update_frac dominates,
+                # more CPUs buy nothing.
+                _split_tot = _perf_split["env"] + _perf_split["update"]
+                if _split_tot > 0:
+                    writer.add_scalar("perf/env_frac",
+                                      _perf_split["env"] / _split_tot, global_step)
+                    writer.add_scalar("perf/update_frac",
+                                      _perf_split["update"] / _split_tot, global_step)
+                    writer.add_scalar("perf/env_sec", _perf_split["env"], global_step)
+                    writer.add_scalar("perf/update_sec", _perf_split["update"], global_step)
+                _perf_split = {"env": 0.0, "update": 0.0}
+
+                # CPU: cgroup usage covers the main process AND every env
+                # worker, expressed as a percentage of the cores this job was
+                # actually allocated. ~100% means the CPU side is saturated and
+                # more --cpus-per-task would buy throughput.
+                _cpu_now = _read_cgroup_cpu_usec()
+                if _cpu_now is not None and _perf_prev["cpu_usec"] is not None:
+                    _busy_cores = (_cpu_now - _perf_prev["cpu_usec"]) / 1e6 / _dt
+                    writer.add_scalar("perf/cpu_busy_cores", _busy_cores, global_step)
+                    writer.add_scalar("perf/cpu_util_pct",
+                                      100.0 * _busy_cores / max(_n_cpu_alloc, 1), global_step)
+                writer.add_scalar("perf/cpu_allocated", _n_cpu_alloc, global_step)
+
+                _mem = _read_cgroup_mem_bytes()
+                if "cur" in _mem:
+                    writer.add_scalar("perf/host_mem_gb", _mem["cur"] / 2**30, global_step)
+                if "peak" in _mem:
+                    writer.add_scalar("perf/host_mem_peak_gb", _mem["peak"] / 2**30, global_step)
+                if "rss_sum" in _mem:      # /proc fallback; see _read_cgroup_mem_bytes
+                    writer.add_scalar("perf/host_rss_sum_gb",
+                                      _mem["rss_sum"] / 2**30, global_step)
+
+                if device.type == "cuda":
+                    writer.add_scalar("perf/gpu_mem_alloc_gb",
+                                      torch.cuda.memory_allocated() / 2**30, global_step)
+                    writer.add_scalar("perf/gpu_mem_reserved_gb",
+                                      torch.cuda.memory_reserved() / 2**30, global_step)
+                    writer.add_scalar("perf/gpu_mem_peak_gb",
+                                      torch.cuda.max_memory_allocated() / 2**30, global_step)
+                    # Not implemented by every ROCm/CUDA build; never fatal.
+                    try:
+                        writer.add_scalar("perf/gpu_util_pct",
+                                          float(torch.cuda.utilization()), global_step)
+                    except Exception:  # noqa: BLE001 - diagnostic only
+                        pass
+
+                _perf_prev = {"t": _t_now_w, "cpu_usec": _cpu_now, "step": global_step}
+
+                # -------------------------------------------------------------
+                # actions/*: what is the policy actually commanding?
+                # A derate mean pinned near a constant with a small std is the
+                # "stuck at one derate level" failure; a sat_frac near 1 says
+                # the slew limit is binding rather than the policy choosing.
+                # -------------------------------------------------------------
+                if _act_acc["n"] > 0:
+                    _an = _act_acc["n"]
+                    for _ch in _act_cols:
+                        _mean = _act_acc[f"{_ch}_sum"] / _an
+                        _var = max(_act_acc[f"{_ch}_sq"] / _an - _mean * _mean, 0.0)
+                        writer.add_scalar(f"actions/{_ch}_mean", _mean, global_step)
+                        writer.add_scalar(f"actions/{_ch}_std", _var ** 0.5, global_step)
+                        writer.add_scalar(f"actions/{_ch}_sat_frac",
+                                          _act_acc[f"{_ch}_sat"] / _an, global_step)
+                    for _k in _act_acc:
+                        _act_acc[_k] = 0.0
 
                 print(f"Step {global_step}: SPS={sps}, qf_loss={mean_qf_loss:.4f}, "
                       f"actor_loss={mean_actor_loss:.4f}, alpha={alpha_val:.4f}, "
@@ -2077,6 +2796,251 @@ def main():
                     debug_logger.print_diagnostics(global_step)
 
 
+        # =====================================================================
+        # COLLECT ENV STEP (dispatched before the training block)
+        # =====================================================================
+        if step_result is None:  # overlap mode: workers simulated during the burst
+            _t0 = _sync_timer()
+            _t_env0 = time.perf_counter()
+            step_result = envs.step_wait()
+            # Under --async_overlap this is only the UNHIDDEN remainder of the
+            # env step (the workers ran during the burst), which is exactly what
+            # perf/env_frac should report.
+            _perf_split["env"] += time.perf_counter() - _t_env0
+            if args.log_timing:
+                _t_now = time.perf_counter()
+                timing["env"] += _t_now - _t0
+                timing["env_span"] += _t_now - _t_async
+        next_obs, rewards, terminations, truncations, infos = step_result
+
+        # Get current layout names for each env. Under domain randomization the pool
+        # is huge, so bucket every training layout under "dr_pool" for debug stats.
+        if dr_enabled:
+            current_layouts = ["dr_pool"] * args.num_envs
+        else:
+            current_layouts = get_env_current_layout(envs)
+
+        # Log per-step data to debug tracker (always - internal deques handle storage)
+        for i in range(args.num_envs):
+            debug_logger.log_layout_step(
+                layout_name=current_layouts[i],
+                reward=float(rewards[i]),
+                power=float(infos.get("Power agent", [0.0] * args.num_envs)[i]) if "Power agent" in infos else None,
+                actions=actions[i] if isinstance(actions, np.ndarray) else np.array(actions[i]),
+            )
+            debug_logger.log_wind_direction(float(wind_dirs[i]))
+
+
+        # Track rewards
+        step_reward_window.extend(np.array(rewards).flatten().tolist())
+
+        # Track yaw angles (from info dict; shape (num_envs, n_turbines))
+        if "yaw angles agent" in infos:
+            yaw_deg = np.array(infos["yaw angles agent"])
+            yaw_accumulator['yaw_abs_mean_deg'].append(float(np.abs(yaw_deg).mean()))
+            yaw_accumulator['yaw_max_deg'].append(float(np.abs(yaw_deg).max()))
+            yaw_accumulator['yaw_over_20_frac'].append(float(np.mean(np.abs(yaw_deg) > 20.0)))
+            for t in range(yaw_deg.shape[-1]):
+                yaw_accumulator[f'yaw_turb{t}_abs_deg'].append(float(np.abs(yaw_deg[:, t]).mean()))
+            env0_yaw = yaw_deg[0] if yaw_deg.ndim > 1 else yaw_deg
+            for t in range(len(env0_yaw)):
+                yaw_accumulator[f'yaw_env0_turb{t}_deg'].append(float(env0_yaw[t]))
+
+            # Movement diagnostics (travel, reversals, duty cycle). Mask done
+            # envs so post-autoreset yaw is never diffed against pre-reset yaw.
+            dones = np.logical_or(terminations, truncations)
+            yaw_tracker.update(yaw_deg, done=dones)
+            actions_np = np.asarray(actions)
+            action_tracker.update(actions_np.reshape(args.num_envs, -1), done=dones)
+            yaw_accumulator['action_saturation_frac'].append(
+                float(np.mean(np.abs(actions_np) > 0.95)))
+
+        # DEL-penalty per-step diagnostics (vector env exposes wrapper info
+        # keys as per-env arrays).
+        if _del_active and "del_penalty" in infos:
+            del_penalty_window.extend(
+                np.asarray(infos["del_penalty"], dtype=float).flatten().tolist())
+            reward_unpen_window.extend(
+                np.asarray(infos["reward_unpenalized"], dtype=float).flatten().tolist())
+            if "del_limit" in infos:
+                del_limit_window.extend(
+                    np.asarray(infos["del_limit"], dtype=float).flatten().tolist())
+            for _key, _win in (("del_ratio", del_ratio_window),
+                               ("del_agent_max", del_agent_max_window),
+                               ("del_baseline_max", del_base_max_window),
+                               ("del_margin", del_margin_window)):
+                if _key not in infos:
+                    continue
+                _vals = np.asarray(infos[_key], dtype=float).flatten()
+                _win.extend(_vals[np.isfinite(_vals)].tolist())
+            # loads_ood is per-env (T,) bool arrays; collation across envs can
+            # be ragged/objecty depending on gymnasium version -- diagnostic
+            # only, so never let it kill training.
+            try:
+                _ood = infos.get("loads_ood")
+                if _ood is not None:
+                    del_ood_window.extend(
+                        float(np.mean(np.asarray(o, dtype=float))) for o in _ood)
+            except (TypeError, ValueError):
+                pass
+            if len(_del_reward_channels) > 1 and "del_binding_channel" in infos:
+                del_binding_window.extend(
+                    ch for ch in np.asarray(
+                        infos["del_binding_channel"], dtype=object
+                    ).flatten() if ch is not None
+                )
+            # Per-channel ratios. The wrapper puts ONE DICT PER ENV in
+            # info["del_ratio_by_channel"], but gymnasium's VectorEnv._add_info
+            # RECURSES into dict-valued infos, so what arrives here is
+            # {channel: array-over-envs} -- plus a "_channel" boolean mask entry
+            # per key, which must be skipped. Older/other collations hand back an
+            # object array of dicts instead, so accept both shapes. Diagnostic
+            # only: never let it kill training.
+            try:
+                _by_ch = infos.get("del_ratio_by_channel")
+
+                def _push_del_ratio(_ch, _val):
+                    _fv = float(_val)
+                    if not np.isfinite(_fv):
+                        return
+                    if _ch not in del_channel_windows:
+                        del_channel_windows[_ch] = deque(maxlen=1000)
+                    del_channel_windows[_ch].append(_fv)
+
+                if isinstance(_by_ch, dict):
+                    for _ch, _arr in _by_ch.items():
+                        if _ch.startswith("_"):      # gymnasium's presence mask
+                            continue
+                        for _v in np.asarray(_arr, dtype=float).flatten():
+                            _push_del_ratio(_ch, _v)
+                elif _by_ch is not None:
+                    for _d in np.asarray(_by_ch, dtype=object).flatten():
+                        if isinstance(_d, dict):
+                            for _ch, _v in _d.items():
+                                _push_del_ratio(_ch, _v)
+            except (TypeError, ValueError):
+                pass
+
+        # Log episode stats
+        if "final_info" in infos:
+            ep_return = np.mean(envs.return_queue)
+            ep_length = np.mean(envs.length_queue)
+            ep_power = np.mean(envs.mean_power_queue)
+
+            print(f"Step {global_step}: Episode return={ep_return:.2f}, power={ep_power:.2f}")
+            writer.add_scalar("charts/episodic_return", ep_return, global_step)
+            writer.add_scalar("charts/episodic_length", ep_length, global_step)
+            writer.add_scalar("charts/episodic_power", ep_power, global_step)
+
+            # Greedy-baseline comparison (filled by RecordEpisodeVals only when
+            # the env is built with Baseline_comp, e.g. Power_reward="Baseline").
+            # power_ratio > 1 means the agent beats the zero-offset greedy farm.
+            if getattr(envs, "mean_power_queue_baseline", None) and len(envs.mean_power_queue_baseline) > 0:
+                ep_power_base = float(np.mean(envs.mean_power_queue_baseline))
+                writer.add_scalar("charts/episodic_power_baseline", ep_power_base, global_step)
+                if ep_power_base > 0:
+                    writer.add_scalar("charts/episodic_power_ratio",
+                                      ep_power / ep_power_base, global_step)
+
+            # DEL signs of life (rolling-window means; window length ~ recent
+            # episode(s)). del_penalty stays 0 through each warm-up, and is
+            # identically 0 in --del_log-only (unpenalized) runs.
+            if _del_active and len(del_penalty_window) > 0:
+                writer.add_scalar("charts/episodic_del_penalty",
+                                  float(np.mean(del_penalty_window)), global_step)
+                writer.add_scalar("charts/episodic_reward_unpenalized",
+                                  float(np.mean(reward_unpen_window)), global_step)
+                if len(del_ratio_window) > 0:
+                    writer.add_scalar("charts/episodic_del_ratio",
+                                      float(np.mean(del_ratio_window)), global_step)
+                if len(del_agent_max_window) > 0:
+                    writer.add_scalar("charts/del_agent_max",
+                                      float(np.mean(del_agent_max_window)), global_step)
+                if len(del_base_max_window) > 0:
+                    writer.add_scalar("charts/del_baseline_max",
+                                      float(np.mean(del_base_max_window)), global_step)
+                if len(del_ood_window) > 0:
+                    writer.add_scalar("charts/del_ood_frac",
+                                      float(np.mean(del_ood_window)), global_step)
+                if len(del_limit_window) > 0:
+                    writer.add_scalar("charts/del_limit",
+                                      float(np.mean(del_limit_window)), global_step)
+                if len(del_margin_window) > 0:
+                    writer.add_scalar("charts/del_margin",
+                                      float(np.mean(del_margin_window)), global_step)
+                if len(del_binding_window) > 0:
+                    _bind = list(del_binding_window)
+                    for _ch in _del_reward_channels:
+                        writer.add_scalar(
+                            f"charts/del_binding_frac/{_ch}",
+                            _bind.count(_ch) / len(_bind), global_step)
+
+                # --- del/* : the per-channel load story ---
+                # Same numbers, but split by channel instead of collapsed into
+                # del_agent_max, plus the argmax identity mirrored into the same
+                # namespace so one panel shows which load binds and how hard.
+                # charts/* is left untouched so existing runs stay comparable.
+                for _ch, _win in del_channel_windows.items():
+                    if len(_win) > 0:
+                        writer.add_scalar(f"del/ratio/{_ch}",
+                                          float(np.mean(_win)), global_step)
+                if len(del_binding_window) > 0:
+                    _bind = list(del_binding_window)
+                    for _ch in _del_reward_channels:
+                        writer.add_scalar(f"del/binding_frac/{_ch}",
+                                          _bind.count(_ch) / len(_bind), global_step)
+                if len(del_agent_max_window) > 0:
+                    writer.add_scalar("del/agent_max",
+                                      float(np.mean(del_agent_max_window)), global_step)
+                if len(del_margin_window) > 0:
+                    writer.add_scalar("del/margin",
+                                      float(np.mean(del_margin_window)), global_step)
+
+
+        # Handle final observations
+        real_next_obs = next_obs.copy()
+        for idx, trunc in enumerate(truncations):
+            if trunc:
+                real_next_obs[idx] = infos["final_obs"][idx]
+
+        # Store in replay buffer
+        for i in range(args.num_envs):
+            done = terminations[i] or truncations[i]
+            action_reshaped = actions[i].reshape(-1, action_dim_per_turbine)
+
+            layout_idx_i = current_layout_indices[i] if current_layout_indices is not None else None
+            perm_i = current_permutations[i] if current_permutations is not None else None
+
+            rb.add(
+                obs[i],
+                real_next_obs[i],
+                action_reshaped,
+                rewards[i],
+                done,
+                raw_positions[i],
+                current_masks[i],
+                wind_dirs[i],
+                layout_index=layout_idx_i,
+                permutation=perm_i,
+            )
+
+        # One-shot warmup buffer save (buffer pre-generation for ablation runs)
+        if (args.save_buffer_at_learning_starts
+                and not warmup_buffer_saved
+                and global_step >= args.learning_starts):
+            rb.save(
+                f"runs/{run_name}/replay_buffer_warmup_{args.learning_starts}.npz",
+                extra_meta=buffer_meta(global_step),
+            )
+            warmup_buffer_saved = True
+            if args.buffer_only:
+                print("\n--buffer_only set: warmup buffer saved, exiting before training.")
+                close_all_evaluators()
+                envs.close()
+                writer.close()
+                return
+
+        obs = next_obs
 
         # =====================================================================
         # CHECKPOINTING
@@ -2089,6 +3053,7 @@ def main():
                 tqc_critic=tqc_critic,
                 tqc_critic_target=tqc_critic_target,
                 qf1_target=qf1_target, qf2_target=qf2_target,
+                obs_norm_state=obs_normalizer.state_dict() if obs_normalizer is not None else None,
             )
             next_save_step += args.save_interval
 
@@ -2107,9 +3072,8 @@ def main():
         
         if global_step >= next_eval_step:
             print(f"\nRunning evaluation at step {global_step}...")
-            eval_metrics = evaluator.evaluate()
-            eval_dict = eval_metrics.to_dict()
-            
+            eval_dict, eval_metrics = run_all_evaluations()
+
             # Log to tensorboard/wandb
             for name, value in eval_dict.items():
                 writer.add_scalar(name, value, global_step)
@@ -2136,7 +3100,7 @@ def main():
 
     # FINAL SAVE AND CLEANUP
     # =========================================================================
-
+    
     if args.save_model:
         save_checkpoint(
             actor, qf1, qf2, actor_optimizer, q_optimizer,
@@ -2144,6 +3108,7 @@ def main():
             tqc_critic=tqc_critic,
             tqc_critic_target=tqc_critic_target,
             qf1_target=qf1_target, qf2_target=qf2_target,
+            obs_norm_state=obs_normalizer.state_dict() if obs_normalizer is not None else None,
         )
 
     if args.save_buffer_final or args.buffer_save_interval > 0:
@@ -2158,8 +3123,8 @@ def main():
     print("=" * 60)
     
 
-    # Close evaluator
-    evaluator.close()
+    # Close evaluators
+    close_all_evaluators()
 
     envs.close()
     writer.close()

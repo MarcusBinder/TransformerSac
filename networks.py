@@ -533,6 +533,87 @@ class TransformerEncoder(nn.Module):
 
 
 # =============================================================================
+# PER-SENSOR OBSERVATION ENCODERS (change_wd_4, --obs_encoder_mode per_sensor)
+# =============================================================================
+# Hypothesis (Marcus): the shared obs-encoder MLP mixes the four sensor
+# histories (ws/wd/yaw/power) in its very first Linear, so a low-resolution ws
+# channel can be drowned by the wider-range channels before any nonlinearity.
+# Encoding each sensor group with its OWN small MLP forces the network to build
+# a per-sensor representation first; the groups only meet after concat.
+#
+# Contract: the per-turbine obs must be exactly 4 contiguous groups of
+# history_length ([ws x H, wd x H, yaw x H, power x H] — the hard_2 layout, no
+# probes/TI). The asserts below double as a guard against accidentally
+# combining per_sensor with an expanding --obs_encoding (desired hard failure).
+
+class PerSensorObsEncoder(nn.Module):
+    """4 per-sensor MLPs (H -> E/4 each), concatenated to E. Drop-in for the
+    shared obs_encoder: same input/output shapes, forward untouched."""
+
+    def __init__(self, obs_dim_per_turbine: int, embed_dim: int, history_length: int):
+        super().__init__()
+        assert obs_dim_per_turbine == 4 * history_length, (
+            f"per_sensor obs encoder expects obs_dim == 4*history_length "
+            f"(4 sensor groups), got obs_dim={obs_dim_per_turbine}, "
+            f"history_length={history_length}. Incompatible with expanding "
+            f"--obs_encoding modes."
+        )
+        assert embed_dim % 4 == 0, f"embed_dim must be divisible by 4, got {embed_dim}"
+        self.history_length = history_length
+        e4 = embed_dim // 4
+        self.sensor_mlps = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(history_length, e4),
+                nn.ReLU(),
+                nn.Linear(e4, e4),
+            )
+            for _ in range(4)
+        ])
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        # obs: (..., 4*H) -> 4 x (..., H) -> concat 4 x (..., E/4) = (..., E)
+        groups = obs.split(self.history_length, dim=-1)
+        return torch.cat([mlp(g) for mlp, g in zip(self.sensor_mlps, groups)], dim=-1)
+
+
+class PerSensorObsActionEncoder(nn.Module):
+    """Critic variant: input is already cat([obs, action], dim=-1). The 4 sensor
+    groups plus the action group each get their own MLP (-> E/4), then a final
+    Linear fuses the 5E/4 concat back to E."""
+
+    def __init__(self, obs_dim_per_turbine: int, action_dim_per_turbine: int,
+                 embed_dim: int, history_length: int):
+        super().__init__()
+        assert obs_dim_per_turbine == 4 * history_length, (
+            f"per_sensor obs-action encoder expects obs_dim == 4*history_length, "
+            f"got obs_dim={obs_dim_per_turbine}, history_length={history_length}."
+        )
+        assert embed_dim % 4 == 0, f"embed_dim must be divisible by 4, got {embed_dim}"
+        self.history_length = history_length
+        self.action_dim = action_dim_per_turbine
+        e4 = embed_dim // 4
+
+        def _mlp(in_dim):
+            return nn.Sequential(
+                nn.Linear(in_dim, e4),
+                nn.ReLU(),
+                nn.Linear(e4, e4),
+            )
+
+        self.sensor_mlps = nn.ModuleList([_mlp(history_length) for _ in range(4)])
+        self.action_mlp = _mlp(action_dim_per_turbine)
+        self.fuse = nn.Linear(5 * e4, embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (..., 4*H + A); split off the action tail, then the 4 sensor groups
+        obs, action = x.split([4 * self.history_length, self.action_dim], dim=-1)
+        groups = obs.split(self.history_length, dim=-1)
+        parts = [mlp(g) for mlp, g in zip(self.sensor_mlps, groups)]
+        parts.append(self.action_mlp(action))
+        return self.fuse(torch.cat(parts, dim=-1))
+
+
+# =============================================================================
 # ACTOR NETWORK
 # =============================================================================
 
@@ -689,19 +770,20 @@ class TransformerActor(nn.Module):
             self.profile_proj = nn.Linear(2 * embed_dim, embed_dim)
 
 
-        # Observation encoder (shared across turbines). The tracking branch
-        # also has --obs_encoder_mode per_sensor (PerSensorObsEncoder, one MLP
-        # per sensor group); this checkout does not, so refuse such checkpoints
-        # here instead of failing at load_state_dict with a key-mismatch error.
-        assert getattr(args, "obs_encoder_mode", "shared") == "shared", (
-            f"obs_encoder_mode={getattr(args, 'obs_encoder_mode')!r} is not "
-            "supported by this TransformerSac checkout (only 'shared'); load "
-            "the checkpoint with the tracking branch")
-        self.obs_encoder = nn.Sequential(
-            nn.Linear(obs_dim_per_turbine, embed_dim),
-            nn.ReLU(),
-            nn.Linear(embed_dim, embed_dim),
-        )
+        # Observation encoder (shared across turbines). change_wd_4: "per_sensor"
+        # swaps in one small MLP per sensor group (see PerSensorObsEncoder);
+        # forward() is untouched because the input/output shapes are identical.
+        if getattr(args, "obs_encoder_mode", "shared") == "per_sensor":
+            self.obs_encoder = PerSensorObsEncoder(
+                obs_dim_per_turbine, embed_dim,
+                history_length=int(getattr(args, "history_length")),
+            )
+        else:
+            self.obs_encoder = nn.Sequential(
+                nn.Linear(obs_dim_per_turbine, embed_dim),
+                nn.ReLU(),
+                nn.Linear(embed_dim, embed_dim),
+            )
 
         # Input projection: only needed when concatenating position embedding
         if self.embedding_mode == "concat":
@@ -726,7 +808,7 @@ class TransformerActor(nn.Module):
         self.register_buffer("action_scale", torch.tensor(action_scale, dtype=torch.float32))
         self.register_buffer("action_bias_val", torch.tensor(action_bias, dtype=torch.float32))
 
-    def forward(
+    def forward_trunk(
         self,
         obs: torch.Tensor,
         positions: torch.Tensor,
@@ -734,9 +816,11 @@ class TransformerActor(nn.Module):
         recep_profile: Optional[torch.Tensor] = None,
         influence_profile: Optional[torch.Tensor] = None,
         need_weights: bool = False,  # Whether to return attention weights for debugging
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
-        Forward pass returning action distribution parameters.
+        Trunk forward: everything up to (and including) the transformer, i.e.
+        forward() minus the action heads. The PPO trainer's shared-trunk value
+        head reads these per-turbine embeddings directly.
 
         Args:
             obs: (batch, n_turbines, obs_dim_per_turbine)
@@ -747,8 +831,7 @@ class TransformerActor(nn.Module):
             need_weights: If True, compute and return attention weights for all layers
 
         Returns:
-            mean: (batch, n_turbines, action_dim) action means
-            log_std: (batch, n_turbines, action_dim) action log stds
+            h: (batch, n_turbines, embed_dim) final-LayerNorm'd token embeddings
             attn_weights: List of attention weights from each layer
         """
         batch_size, n_turbines, _ = obs.shape
@@ -811,6 +894,38 @@ class TransformerActor(nn.Module):
 
         h, attn_weights = self.transformer(h, key_padding_mask, attn_bias,
                                            local_allow=local_allow, need_weights=need_weights)
+
+        return h, attn_weights
+
+    def forward(
+        self,
+        obs: torch.Tensor,
+        positions: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        recep_profile: Optional[torch.Tensor] = None,
+        influence_profile: Optional[torch.Tensor] = None,
+        need_weights: bool = False,  # Whether to return attention weights for debugging
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        """
+        Forward pass returning action distribution parameters.
+
+        Args:
+            obs: (batch, n_turbines, obs_dim_per_turbine)
+            positions: (batch, n_turbines, 2) wind-relative normalized positions
+            key_padding_mask: (batch, n_turbines) where True = padding
+            recep_profile: (batch, n_turbines, n_directions) receptivity profiles (optional)
+            influence_profile: (batch, n_turbines, n_directions) influence profiles (optional)
+            need_weights: If True, compute and return attention weights for all layers
+
+        Returns:
+            mean: (batch, n_turbines, action_dim) action means
+            log_std: (batch, n_turbines, action_dim) action log stds
+            attn_weights: List of attention weights from each layer
+        """
+        h, attn_weights = self.forward_trunk(
+            obs, positions, key_padding_mask,
+            recep_profile, influence_profile, need_weights,
+        )
 
         # Action distribution parameters
         mean = self.fc_mean(h)
@@ -998,16 +1113,19 @@ class TransformerCritic(nn.Module):
 
 
         # Observation + action encoder (no DroQ here — applied only in q_head per Hiraoka et al.)
-        # Same guard as TransformerActor: no per_sensor encoder in this checkout.
-        assert getattr(args, "obs_encoder_mode", "shared") == "shared", (
-            f"obs_encoder_mode={getattr(args, 'obs_encoder_mode')!r} is not "
-            "supported by this TransformerSac checkout (only 'shared'); load "
-            "the checkpoint with the tracking branch")
-        self.obs_action_encoder = nn.Sequential(
-            nn.Linear(obs_dim_per_turbine + action_dim_per_turbine, embed_dim),
-            nn.ReLU(),
-            nn.Linear(embed_dim, embed_dim),
-        )
+        # change_wd_4 "per_sensor": per-sensor MLPs + a dedicated action MLP
+        # (see PerSensorObsActionEncoder); same input/output shapes, forward untouched.
+        if getattr(args, "obs_encoder_mode", "shared") == "per_sensor":
+            self.obs_action_encoder = PerSensorObsActionEncoder(
+                obs_dim_per_turbine, action_dim_per_turbine, embed_dim,
+                history_length=int(getattr(args, "history_length")),
+            )
+        else:
+            self.obs_action_encoder = nn.Sequential(
+                nn.Linear(obs_dim_per_turbine + action_dim_per_turbine, embed_dim),
+                nn.ReLU(),
+                nn.Linear(embed_dim, embed_dim),
+            )
 
         # Input projection: only needed when concatenating position embedding
         if self.embedding_mode == "concat":
@@ -1045,7 +1163,7 @@ class TransformerCritic(nn.Module):
         q_head_layers.append(nn.Linear(embed_dim, 1))
         self.q_head = nn.Sequential(*q_head_layers)
 
-    def forward(
+    def forward_trunk(
         self,
         obs: torch.Tensor,
         action: torch.Tensor,
@@ -1055,18 +1173,9 @@ class TransformerCritic(nn.Module):
         influence_profile: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Compute Q-value for observation-action pair.
-
-        Args:
-            obs: (batch, n_turbines, obs_dim)
-            action: (batch, n_turbines, action_dim)
-            positions: (batch, n_turbines, 2) wind-relative normalized positions
-            key_padding_mask: (batch, n_turbines) where True = padding
-            recep_profile: (batch, n_turbines, n_directions) receptivity profiles (optional)
-            influence_profile: (batch, n_turbines, n_directions) influence profiles (optional)
-
-        Returns:
-            q_value: (batch, 1) Q-value for the entire farm
+        Everything up to (and including) the transformer: encode obs+action,
+        positional/profile encoding, transformer. Returns per-turbine embeddings
+        h of shape (batch, n_turbines, embed_dim) — no aggregation, no q_head.
         """
         batch_size = obs.shape[0]
 
@@ -1127,6 +1236,33 @@ class TransformerCritic(nn.Module):
         h, _ = self.transformer(h, key_padding_mask, attn_bias,
                                 local_allow=local_allow, need_weights=False)
 
+        return h
+
+    def forward(
+        self,
+        obs: torch.Tensor,
+        action: torch.Tensor,
+        positions: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        recep_profile: Optional[torch.Tensor] = None,
+        influence_profile: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute Q-value for observation-action pair.
+
+        Args:
+            obs: (batch, n_turbines, obs_dim)
+            action: (batch, n_turbines, action_dim)
+            positions: (batch, n_turbines, 2) wind-relative normalized positions
+            key_padding_mask: (batch, n_turbines) where True = padding
+            recep_profile: (batch, n_turbines, n_directions) receptivity profiles (optional)
+            influence_profile: (batch, n_turbines, n_directions) influence profiles (optional)
+
+        Returns:
+            q_value: (batch, 1) Q-value for the entire farm
+        """
+        h = self.forward_trunk(obs, action, positions, key_padding_mask,
+                               recep_profile, influence_profile)
 
         if self.critic_agg == "vdn":
             # v9 value decomposition: per-turbine Q-head, then masked-SUM over turbines.
@@ -1157,6 +1293,27 @@ class TransformerCritic(nn.Module):
 # TQC CRITIC (Truncated Quantile Critics)
 # =============================================================================
 
+def _make_tqc_head(
+    embed_dim: int,
+    n_quantiles: int,
+    droq_dropout: float = 0.0,
+    droq_layer_norm: bool = False,
+) -> nn.Sequential:
+    """Quantile head MLP: Linear -> [LayerNorm] -> ReLU -> [Dropout] -> Linear.
+
+    Same layer order as TransformerCritic's q_head so RNG consumption (and thus
+    seeded init) is unchanged for the independent TQC critic.
+    """
+    layers: list[nn.Module] = [nn.Linear(embed_dim, embed_dim)]
+    if droq_layer_norm:
+        layers.append(nn.LayerNorm(embed_dim))
+    layers.append(nn.ReLU())
+    if droq_dropout > 0.0:
+        layers.append(nn.Dropout(droq_dropout))
+    layers.append(nn.Linear(embed_dim, n_quantiles))
+    return nn.Sequential(*layers)
+
+
 class TransformerTQCCritic(nn.Module):
     """
     TQC critic: N independent TransformerCritic networks, each outputting
@@ -1178,15 +1335,8 @@ class TransformerTQCCritic(nn.Module):
         droq_layer_norm = critic_kwargs.get("droq_layer_norm", False)
 
         for critic in self.critics:
-            embed_dim = critic.embed_dim
-            q_head_layers: list[nn.Module] = [nn.Linear(embed_dim, embed_dim)]
-            if droq_layer_norm:
-                q_head_layers.append(nn.LayerNorm(embed_dim))
-            q_head_layers.append(nn.ReLU())
-            if droq_dropout > 0.0:
-                q_head_layers.append(nn.Dropout(droq_dropout))
-            q_head_layers.append(nn.Linear(embed_dim, n_quantiles))
-            critic.q_head = nn.Sequential(*q_head_layers)
+            critic.q_head = _make_tqc_head(
+                critic.embed_dim, n_quantiles, droq_dropout, droq_layer_norm)
 
     def forward(
         self,
@@ -1203,6 +1353,74 @@ class TransformerTQCCritic(nn.Module):
               recep_profile, influence_profile)
             for c in self.critics
         ], dim=0)
+
+
+class TransformerTQCSharedCritic(nn.Module):
+    """
+    Shared-trunk TQC critic: ONE TransformerCritic trunk feeding n_critics small
+    quantile heads. TQC's quantile truncation handles overestimation without
+    independent ensembles, so the heads may be correlated — the payoff is ~1/N
+    the trunk compute and params vs TransformerTQCCritic.
+
+    Same output contract as TransformerTQCCritic: (n_critics, batch, n_quantiles).
+    Checkpoints are NOT interchangeable with the independent TQC critic.
+    """
+
+    def __init__(self, n_critics: int, n_quantiles: int, **critic_kwargs):
+        super().__init__()
+        self.n_critics = n_critics
+        self.n_quantiles = n_quantiles
+        self.trunk = TransformerCritic(**critic_kwargs)
+        self.critic_agg = self.trunk.critic_agg
+        # Drop the trunk's unused scalar q_head so it never shows up in
+        # state_dict/parameters (only the agg branch reads it, which we bypass).
+        self.trunk.q_head = nn.Identity()
+        droq_dropout = critic_kwargs.get("droq_dropout", 0.0)
+        droq_layer_norm = critic_kwargs.get("droq_layer_norm", False)
+        self.heads = nn.ModuleList([
+            _make_tqc_head(self.trunk.embed_dim, n_quantiles,
+                           droq_dropout, droq_layer_norm)
+            for _ in range(n_critics)
+        ])
+
+    def forward(
+        self,
+        obs: torch.Tensor,
+        action: torch.Tensor,
+        positions: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        recep_profile: Optional[torch.Tensor] = None,
+        influence_profile: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Returns (n_critics, batch, n_quantiles)."""
+        h = self.trunk.forward_trunk(obs, action, positions, key_padding_mask,
+                                     recep_profile, influence_profile)
+        # Python loop over heads (N tiny MLPs): measured faster than a vmap
+        # ensemble under reduce-overhead cudagraphs (see trainer compile block).
+        if self.critic_agg == "vdn":
+            # Per-turbine quantiles -> zero padded turbines -> masked-SUM.
+            valid = None
+            if key_padding_mask is not None:
+                valid = (~key_padding_mask).unsqueeze(-1).float()  # (batch, n_turb, 1)
+            outs = []
+            for head in self.heads:
+                q_per = head(h)  # (batch, n_turb, n_quantiles)
+                if valid is not None:
+                    q_per = q_per * valid
+                outs.append(q_per.sum(dim=1))  # (batch, n_quantiles)
+            return torch.stack(outs, dim=0)
+        else:
+            # "pool": masked-mean pool ONCE, then all heads on the pooled embedding.
+            if key_padding_mask is not None:
+                mask = ~key_padding_mask.unsqueeze(-1)  # (batch, n_turb, 1), True = real
+                mask_f = mask.float()
+                h = h * mask_f
+                h_sum = h.sum(dim=1)  # (batch, embed_dim)
+                n_real = mask_f.sum(dim=1).clamp(min=1)  # (batch, 1)
+                h_pooled = h_sum / n_real
+            else:
+                h_pooled = h.mean(dim=1)  # (batch, embed_dim)
+            return torch.stack([head(h_pooled) for head in self.heads], dim=0)
 
 
 def quantile_huber_loss(

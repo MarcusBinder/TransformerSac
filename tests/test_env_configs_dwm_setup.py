@@ -9,7 +9,11 @@ import pytest
 
 from helpers.env_configs import ENV_CONFIGS, make_env_config, require_les_calibrated
 
-from WindGym.core.calibrated_values import LES_CALIBRATED, resolve_dwm_setup
+# paper-derating's older windgym pin has no calibrated_values module (the
+# calibrated stack is not opt-in there); require_les_calibrated is a no-op then.
+calibrated_values = pytest.importorskip("WindGym.core.calibrated_values")
+LES_CALIBRATED = calibrated_values.LES_CALIBRATED
+resolve_dwm_setup = calibrated_values.resolve_dwm_setup
 
 
 @pytest.mark.parametrize("name", sorted(ENV_CONFIGS))

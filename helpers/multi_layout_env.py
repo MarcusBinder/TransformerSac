@@ -143,17 +143,38 @@ class MultiLayoutEnv(gym.Env):
             dtype=np.float32
         )
         
-        # Define padded action space (1 action per turbine for yaw)
-        # Get action bounds from the wrapped env. PerTurbineObservationWrapper
-        # may expose either the inherited flat (n_turb,) space or (since the
-        # derating merge) a 2-D (n_turb, act_var) space; .flat[0] gives the
-        # scalar bound in both cases. The wrapper accepts flat variable-grouped
-        # actions either way, so this flat padded space stays valid.
+        # Define padded action space.
+        # The wrapped env's action space may be 1-D (max_turbines,) or 2-D
+        # (n_turbines, action_dim_per_turbine) depending on the wrapper version;
+        # the per-turbine bounds are uniform, so extract a scalar bound in a
+        # shape-agnostic way rather than indexing row 0 (which is a (act_dim,)
+        # vector under the 2-D wrapper, breaking the Box shape check).
         base_action_space = self._current_env.action_space
+        # Per-turbine action width (act_var): 1 for a derate-only farm, 2 for
+        # yaw+derate. The 2-D per-turbine wrapper exposes shape
+        # (n_turbines, action_dim_per_turbine); a legacy 1-D wrapper implies 1.
+        # Surface it as an attribute so the trainer can read it via get_attr
+        # (same pattern as max_turbines) -- the vectorized single_action_space
+        # shape is NOT a reliable source once we keep the 1-D form below.
+        self.action_dim_per_turbine = (
+            int(base_action_space.shape[-1]) if len(base_action_space.shape) >= 2 else 1
+        )
+        low = float(np.asarray(base_action_space.low).reshape(-1)[0])
+        high = float(np.asarray(base_action_space.high).reshape(-1)[0])
+        # Keep the action space flat (max_turbines,) for the common single-action
+        # (derate-only) case so that pipeline is byte-for-byte unchanged; widen
+        # to (max_turbines, action_dim_per_turbine) only when a turbine emits >1
+        # action (yaw+derate). step() slices [:n_turbines] and permutes on axis
+        # 0, so both ranks flow through untouched.
+        action_shape = (
+            (self.max_turbines,)
+            if self.action_dim_per_turbine == 1
+            else (self.max_turbines, self.action_dim_per_turbine)
+        )
         self.action_space = spaces.Box(
-            low=float(np.asarray(base_action_space.low).flat[0]),
-            high=float(np.asarray(base_action_space.high).flat[0]),
-            shape=(self.max_turbines,),
+            low=low,
+            high=high,
+            shape=action_shape,
             dtype=np.float32
         )
         
@@ -205,12 +226,25 @@ class MultiLayoutEnv(gym.Env):
     def _get_obs_dim_from_env(self) -> int:
         """Get observation dimension per turbine without calling reset().
 
-        Traverses wrapper chain to find _obs_dim_per_turbine (from
-        PerTurbineObservationWrapper) or get_obs_dim_per_turbine() (from
-        WindFarmEnv). This enables lazy initialization.
+        Prefers the wrapped env's emitted per-token width, which INCLUDES any
+        broadcast farm-level tail (farm_* sensors and/or the power-tracking
+        [setpoint, error] tail). Falls back to traversing the wrapper chain for
+        _obs_dim_per_turbine (from PerTurbineObservationWrapper) or
+        get_obs_dim_per_turbine() (from WindFarmEnv). This enables lazy
+        initialization.
+
+        NOTE: the sensor-only _obs_dim_per_turbine attribute is width n_sensors
+        (e.g. 6); the emitted token is n_sensors + n_farm. Reading the emitted
+        width keeps _pad_observation's allocation consistent with the obs it
+        assigns. For a purely per-turbine env (n_farm == 0) both agree, so the
+        existing yaw path is unaffected.
         """
         env = self._current_env
-        # Check wrapper first (PerTurbineObservationWrapper stores it)
+        # Emitted per-token width INCLUDES the broadcast farm/tracking tail.
+        if getattr(env, "observation_space", None) is not None \
+                and len(env.observation_space.shape) == 2:
+            return int(env.observation_space.shape[-1])
+        # Fallback: traverse the wrapper chain for the sensor-only attribute.
         while hasattr(env, 'env'):
             if hasattr(env, '_obs_dim_per_turbine'):
                 return env._obs_dim_per_turbine
@@ -295,7 +329,14 @@ class MultiLayoutEnv(gym.Env):
         n_turb = self.n_turbines
         
         for key, value in info.items():
-            if not isinstance(value, np.ndarray):
+            if isinstance(value, dict):
+                # AsyncVectorEnv._add_info RECURSES into dict-valued keys and
+                # stacks their inner ndarrays across envs, so nested arrays
+                # must be padded too (DELWrapper's info["loads"] /
+                # info["loads_baseline"] are {channel: (n_turb,) array} —
+                # ragged across envs under DR layouts).
+                padded_info[key] = self._pad_dict_info(value, n_turb)
+            elif not isinstance(value, np.ndarray):
                 # Non-arrays pass through unchanged
                 padded_info[key] = value
             elif key in self._PER_TURBINE_KEYS:
@@ -314,6 +355,26 @@ class MultiLayoutEnv(gym.Env):
                 
         return padded_info
     
+    def _pad_dict_info(self, d: Dict[str, Any], n_turb: int) -> Dict[str, Any]:
+        """
+        Pad ndarrays inside a dict-valued info key (keys are channel names, so
+        the top-level key-based sets don't apply). 1-D arrays of length n_turb
+        are per-turbine -> pad to max_turbines; any other ndarray falls back
+        to a list so AsyncVectorEnv stores it as an object instead of stacking.
+        """
+        out = {}
+        for k, v in d.items():
+            if isinstance(v, dict):
+                out[k] = self._pad_dict_info(v, n_turb)
+            elif isinstance(v, np.ndarray):
+                if v.ndim == 1 and v.shape[0] == n_turb:
+                    out[k] = self._pad_1d_to_max(v)
+                else:
+                    out[k] = v.tolist()
+            else:
+                out[k] = v
+        return out
+
     def _pad_1d_to_max(self, arr: np.ndarray) -> np.ndarray:
         """Pad 1D array from (n_turb,) to (max_turbines,)."""
         if arr.shape[0] >= self.max_turbines:
@@ -436,6 +497,12 @@ class MultiLayoutEnv(gym.Env):
     def wd(self) -> float:
         """Current wind direction (alias for compatibility)."""
         return self.mean_wind_direction
+
+    @property
+    def wd_est(self) -> float:
+        """Sensor-derived wd estimate from the active environment (only
+        available when it was built with wd_est_tau; --wd_source est)."""
+        return self._get_base_env().wd_est
 
     @property
     def ws(self) -> float:

@@ -9,8 +9,8 @@ windgym*
 
 # Data files
 *.nc
-# the IEA22 HAWC2 (ws, yaw) surrogate table is source data for IEA_22MW_HAWC2Surrogate (68 kB)
-!iea22_hawc2_ws_yaw_surrogate.nc
+# Stage 8: the IEA22 HAWC2 (ws,yaw) surrogate table must ship with the code (helpers/iea_22_rwt.py reads it).
+!helpers/iea22_hawc2_ws_yaw_surrogate.nc
 
 # Training artifacts
 /wandb
@@ -38,3 +38,8 @@ pretrained_pt/
 .ipynb_checkpoints/
 .claude/
 /boxes
+
+# Coverage + local runs symlink
+.coverage
+/runs
+/data

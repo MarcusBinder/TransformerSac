@@ -63,6 +63,8 @@ class BatchPreparer:
         use_wind_relative: bool = True,
         use_profiles: bool = False,
         rotate_profiles: bool = False,
+        obs_normalizer=None,
+        wd_attr: str = 'wd',
     ):
         """
         Args:
@@ -71,12 +73,21 @@ class BatchPreparer:
             use_wind_relative: Whether to transform positions to wind-relative frame
             use_profiles: Whether to include receptivity/influence profiles
             rotate_profiles: Whether to rotate profiles to wind-relative frame
+            obs_normalizer: Optional ObsRunningNorm (--obs_norm). Applied to the
+                obs tensor here so training AND eval act() calls are normalized
+                identically (PolicyEvaluator shares this agent).
+            wd_attr: env attribute fetched when wind_dirs is not passed in:
+                'wd' (privileged true value) or 'wd_est' (sensor-derived
+                estimate, --wd_source est). Covers every act() caller that
+                lets the agent fetch for itself — notably PolicyEvaluator.
         """
         self.device = device
         self.rotor_diameter = rotor_diameter
         self.use_wind_relative = use_wind_relative
         self.use_profiles = use_profiles
         self.rotate_profiles = rotate_profiles
+        self.obs_normalizer = obs_normalizer
+        self.wd_attr = wd_attr
     
     def from_envs(
         self,
@@ -85,6 +96,8 @@ class BatchPreparer:
         wind_dirs: Optional[np.ndarray] = None,
         raw_positions: Optional[np.ndarray] = None,
         masks: Optional[np.ndarray] = None,
+        receptivity: Optional[np.ndarray] = None,
+        influence: Optional[np.ndarray] = None,
     ) -> InferenceBatch:
         """
         Prepare batch from vectorized environment state.
@@ -96,6 +109,11 @@ class BatchPreparer:
                 provided (e.g. the training loop already fetched them), they are
                 used directly to avoid duplicate get_attr IPC to the async
                 workers. Any left as None is queried here.
+            receptivity/influence: optional precomputed layout profiles, shape
+                (num_envs, n_turbines, n_directions). Only consulted when
+                use_profiles is on; when None they are fetched from the envs
+                via get_attr (which needs a MultiLayoutEnv-wrapped vector env,
+                so unvectorized eval drivers must pass them in).
 
         Returns:
             InferenceBatch ready for actor.get_action()
@@ -104,7 +122,8 @@ class BatchPreparer:
 
         # Query environment state (skip the IPC for anything passed in)
         if wind_dirs is None:
-            wind_dirs = np.array(envs.env.get_attr('wd'), dtype=np.float32)
+            wind_dirs = np.array(envs.env.get_attr(self.wd_attr),
+                                 dtype=np.float32)
         if raw_positions is None:
             raw_positions = np.array(envs.env.get_attr('turbine_positions'), dtype=np.float32)
         if masks is None:
@@ -113,6 +132,8 @@ class BatchPreparer:
         # Convert observations to tensor
         obs_tensor = torch.tensor(obs, dtype=torch.float32, device=self.device)
         mask_tensor = torch.tensor(masks, dtype=torch.bool, device=self.device)
+        if self.obs_normalizer is not None:
+            obs_tensor = self.obs_normalizer.normalize(obs_tensor)
         
         # Normalize positions by rotor diameter
         positions_norm = raw_positions / self.rotor_diameter
@@ -129,14 +150,16 @@ class BatchPreparer:
         influence_tensor = None
         
         if self.use_profiles:
-            # Query profiles from environment
-            receptivity = np.array(
-                envs.env.get_attr('receptivity_profiles'), dtype=np.float32
-            )
-            influence = np.array(
-                envs.env.get_attr('influence_profiles'), dtype=np.float32
-            )
-            
+            # Query profiles from environment (skip the IPC when precomputed)
+            if receptivity is None:
+                receptivity = np.array(
+                    envs.env.get_attr('receptivity_profiles'), dtype=np.float32
+                )
+            if influence is None:
+                influence = np.array(
+                    envs.env.get_attr('influence_profiles'), dtype=np.float32
+                )
+
             receptivity_tensor = torch.tensor(receptivity, dtype=torch.float32, device=self.device)
             influence_tensor = torch.tensor(influence, dtype=torch.float32, device=self.device)
             
@@ -190,6 +213,8 @@ class WindFarmAgent:
         use_wind_relative: bool = True,
         use_profiles: bool = False,
         rotate_profiles: bool = False,
+        obs_normalizer=None,
+        wd_attr: str = 'wd',
     ):
         """
         Args:
@@ -199,16 +224,20 @@ class WindFarmAgent:
             use_wind_relative: Whether to transform positions to wind-relative frame
             use_profiles: Whether to use receptivity/influence profiles
             rotate_profiles: Whether to rotate profiles to wind-relative frame
+            obs_normalizer: Optional ObsRunningNorm (--obs_norm), see BatchPreparer
+            wd_attr: wd source attribute ('wd' or 'wd_est'), see BatchPreparer
         """
         self.actor = actor
         self.device = device
-        
+
         self.batch_preparer = BatchPreparer(
             device=device,
             rotor_diameter=rotor_diameter,
             use_wind_relative=use_wind_relative,
             use_profiles=use_profiles,
             rotate_profiles=rotate_profiles,
+            obs_normalizer=obs_normalizer,
+            wd_attr=wd_attr,
         )
     
     def act(
@@ -219,6 +248,8 @@ class WindFarmAgent:
         wind_dirs: Optional[np.ndarray] = None,
         raw_positions: Optional[np.ndarray] = None,
         masks: Optional[np.ndarray] = None,
+        receptivity: Optional[np.ndarray] = None,
+        influence: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Select actions given current environment state.
@@ -227,14 +258,17 @@ class WindFarmAgent:
             envs: Vectorized environment
             obs: Current observations, shape (num_envs, n_turbines, obs_dim)
             deterministic: If True, use mean action. If False, sample stochastically.
-            wind_dirs/raw_positions/masks: optional precomputed env state forwarded
-                to BatchPreparer.from_envs to avoid duplicate get_attr IPC.
+            wind_dirs/raw_positions/masks/receptivity/influence: optional
+                precomputed env state forwarded to BatchPreparer.from_envs to
+                avoid duplicate get_attr IPC (or to supply profiles when there
+                is no vector env at all).
 
         Returns:
             actions: Action array, shape (num_envs, n_turbines)
         """
         batch = self.batch_preparer.from_envs(
             envs, obs, wind_dirs=wind_dirs, raw_positions=raw_positions, masks=masks,
+            receptivity=receptivity, influence=influence,
         )
         
         with torch.no_grad():

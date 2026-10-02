@@ -1,18 +1,3 @@
-# VENDORED FILE -- do not edit here.
-#
-# Verbatim copy of helpers/obs_agg.py from the `tracking` branch of
-# TransformerSac @ 84d450a (the branch ../paper-derating tracks).
-#
-# The LES branch never grew this module, but the `change_wd_*.pt` checkpoints
-# were trained on `tracking` and carry obs_agg='raw15span' / obs_agg_len=60,
-# which RunPretrainedAgentLES_emlhversionTEST.py resolves through AGG_MODES.
-# Copied rather than cherry-picked because the two branches diverged at b0a8117
-# in opposite directions (LES: HAWC2 + Precursor + six-way obs scaling;
-# tracking: wd-schedules, wd-estimation, derating, obs aggregation).
-#
-# The file is self-contained (dataclasses / typing / gymnasium / numpy only).
-# Keep it byte-identical below this header so it can be diffed against
-# `tracking` later; port fixes from there rather than patching in place.
 """
 Observation-aggregate wrapper for the LES-3x3 Stage-4 sweep (--obs_agg).
 

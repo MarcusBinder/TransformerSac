@@ -14,6 +14,7 @@ class Args:
 
     # === Experiment Settings ===
     config: str = "default"  # Environment config preset
+    power_schedule: str = "default"  # "default" (80/60/70/100) or "boost" (80/115/70/100, needs yaw)
     exp_name: str = "transformer_sac_windfarm"
     seed: int = 1
     torch_deterministic: bool = True
@@ -26,7 +27,7 @@ class Args:
     save_interval: int = 10000
     log_image: bool = False  # Log attention images to TensorBoard
 
-    shuffle_turbs: bool = False  # Shuffle turbine order in obs/action
+    shuffle_turbs: bool = True  # Shuffle turbine order in obs/action
     max_episode_steps: Optional[int] = None # Max steps per episode (None = use env default)
 
     # === Staggered warm-up episode lengths ===
@@ -39,22 +40,33 @@ class Args:
     warmup_min_episode_steps: Optional[int] = None  # Shortest warm-up length (e.g. 800)
 
     # === Receptivity Profile Settings ===
-    profile_encoder_kwargs: str = "{}"  # JSON string of encoder-specific kwargs
-    profile_source: str = "PyWake"  # "pywake" or "geometric"
-    profile_encoding_type: Optional[str] = None  # Now Optional, use None for no pos encoding
+    # Stage-1 baseline profile pathway: geometric dual-rose, FourierProfileEncoder,
+    # s1/h48 @ 360 dirs (see archive/stage_1.sh). These were the frozen A00 winners.
+    profile_encoder_kwargs: str = '{"use_phase": false, "learnable_weights": true, "n_harmonics": 48}'  # JSON string of encoder-specific kwargs
+    profile_source: str = "geometric"  # "PyWake" or "geometric"
+    profile_encoding_type: Optional[str] = "FourierProfileEncoder"  # None for no profile encoding
     profile_encoder_hidden: int = 128       # Hidden dim in profile encoder MLP
     rotate_profiles: bool = True            # Rotate profiles to wind-relative frame
     n_profile_directions: int = 360         # Number of directions in profile
-    profile_sigma_smooth: float = 10.0      # Gaussian smoothing sigma (bins) for geometric profile computation
+    profile_sigma_smooth: float = 1.0       # Gaussian smoothing sigma (bins) for geometric profile computation (stage-1 baseline)
     profile_use_influence: bool = True      # False => single receptivity rose + one encoder (drop redundant influence)
     profile_geom_mode: str = "wake"         # geometric rose construction: "wake" (up/downstream wake sum) or "distance" (bearing-keyed inverse-distance)
     profile_fusion_type: str = "add"       # "add" or "joint" fusion of receptivity and influence profiles
-    profile_embed_mode: str = "add"        # "add" or "concat" — how fused profile is integrated into token embedding
+    profile_embed_mode: str = "concat"     # "add" or "concat" — how fused profile is integrated into token embedding (stage-1 baseline)
     share_profile_encoder: bool = False         # Whether to share weights between actor and critic for profile encoder
 
     # === Environment Settings ===
     backend: str = "dynamiks"  # Flow solver backend: "dynamiks" (default) or "pywake" (steady-state)
-    turbtype: str = "IEA22"  # Wind turbine type
+    # Wind turbine type. Default IEA34 (the paper turbine as of 2026-07); old
+    # checkpoints saved turbtype="DTU10MW" in their args, so checkpoint-driven
+    # env rebuilds stay DTU automatically. LESRL launchers pass iea22 / iea22h2
+    # explicitly (see helpers.plain_turbines.make_plain_turbine).
+    turbtype: str = "IEA34"
+    # IEA34 derating-table variant (helpers.derating_turbine): "annrpm"
+    # (constant-Omega derating, rotor speed from the DLC12 RotSpd ANN — ct
+    # consistent with the HF controller the load surrogates saw) or "minct"
+    # (pure min-Ct, rotor speed free). Ignored for other turbtypes.
+    iea34_variant: str = "annrpm"
     TI_type: str = "Random"   # Turbulence sampling: MannLoad|MannGenerate|MannFixed|Random|None|Precursor
     # Precursor .nc (with a unique converted sidecar next to it) or the sidecar
     # .npy/.meta.npz path. Required when TI_type == "Precursor"; the one-time
@@ -64,13 +76,30 @@ class Args:
     dt_sim: int = 5           # Simulation timestep (seconds)
     dt_env: int = 10          # Environment timestep (seconds)
     yaw_step: float = 5.0     # Max yaw change per sim step (degrees)
+    # Derate slew limit toward the setpoint, in derate FRACTION per sim
+    # substep (mirrors yaw_step_sim; windgym config key "derate_step_sim").
+    # None = setpoint applies instantly (windgym default).
+    derate_step_sim: Optional[float] = None
+    # Max apparent turbine displacement per sim step (m) — dynamiks'
+    # max_turb_move, which is the SOLE input to the wd_slow frame slew limit
+    # (max_wd_step = max_turb_move*360/(2*pi*max_dist) per sim step; its only
+    # consumer in dynamiks). At the 2 m default a moving wd schedule mostly
+    # lands in wd_small (a lateral inflow tilt the yaw model cannot see);
+    # raising it until the clip never binds makes wd_slow == schedule exactly,
+    # wd_small == 0, and env.wd exact AND causal (the fwd/bwd smoothing
+    # degenerates to identity). LES-3x3 campaign trains at 12 (frame slew
+    # 0.0897 deg/s > every dr_ramp_les rate). None = env default (2 m).
+    # Forwarded as a WindFarmEnv ctor kwarg via base_env_kwargs, so train and
+    # eval envs stay consistent (eval_wd.py has the matching flag).
+    max_turb_move: Optional[float] = None
     max_eps: int = 20         # Number of flow passthroughs per episode
     num_envs: int = 1         # Number of parallel environments
 
     # Wind veer, sampled U[veer_min, veer_max] per episode (deg per 100 m,
     # pinned to 0 at hub height, positive = wd increases with height).
-    # Overrides the env config's wind veer keys. Needs windgym >= 9b746f8;
-    # veer only produces a yaw-sign asymmetry when tilt != 0.
+    # Overrides the env config's wind veer keys; composes with a time-varying
+    # wd via MetmastSite (Stage 7). Needs windgym >= 9b746f8; veer only
+    # produces a yaw-sign asymmetry when tilt != 0.
     veer_min: float = 0.0
     veer_max: float = 0.0
     # Fixed rotor tilt for all turbines (deg; positive deflects the wake
@@ -90,6 +119,24 @@ class Args:
     hawc2_yaw_mode: str = "yaw_tilt"
     hawc2_yaw_slot: int = 4
 
+    # === Domain randomization (DWM closure + Mann-box posterior) ===
+    # Path to a calibrated posterior .npz with `samples` (N, d) and
+    # `param_names` (d,) arrays (LESRL calibration pipeline). When set, each
+    # parallel TRAINING env draws DWM parameters from the posterior on every
+    # reset via DWMRandomizationWrapper; in-training eval envs and eval_wd
+    # harvests stay on the nominal calibrated defaults (no per-reset draws).
+    # When None (default) DR is disabled. Requires --backend dynamiks.
+    dr_posterior_path: Optional[str] = None
+    # Subset of `param_names` to actually feed into the env. Must be a subset
+    # of the posterior columns. Joint structure is preserved across all
+    # calibrated dimensions even if only a subset is exposed (row-bootstrap).
+    # The Mann subset (`mann_L`, `mann_GAMMA`, `mann_AE`) only takes effect when
+    # the env is built with `turbtype="MannGenerate"` — under MannLoad/MannFixed
+    # the env raises rather than silently ignoring per-episode Mann statistics.
+    dr_keys: Tuple[str, ...] = (
+        "k1", "k2", "d_particle", "mann_L", "mann_GAMMA", "mann_AE",
+    )
+
     # === Evaluation Settings ===
     eval_interval: int = 50000        # How often to evaluate (in env steps)
     eval_initial: bool = False        # Run evaluation before training starts
@@ -98,6 +145,149 @@ class Args:
     eval_layouts: str = ""            # Comma-separated eval layouts (empty = use training layouts)
     eval_seed: int = 42               # Seed for evaluation environments
     eval_deterministic: bool = True   # Use the deterministic (mean) policy action during evaluation
+    # Named time-varying wd schedule(s) from the EVAL registry (helpers/wd_functions.py
+    # WD_FUNCTIONS), applied to eval envs only. Comma-separated for multiple schedules
+    # (e.g. "static_270,step_ramp_270_315"): each gets its own evaluator, and its
+    # metrics are namespaced eval/wd/<schedule>/... . The FIRST schedule additionally
+    # keeps the plain eval/... keys so existing W&B panels and readers still work.
+    # When set, eval wind is pinned to wd_min=wd_max=wd_function(0) and ws=12 so the
+    # burn-in matches the schedule's start. None = static eval wd (unchanged behavior).
+    eval_wd_function: Optional[str] = None
+    # Comma-separated eval wind speeds (m/s). Every --eval_wd_function schedule is
+    # evaluated at EVERY listed speed, i.e. the eval ladder is the cross product
+    # (schedule x ws) and each cell gets its own evaluator namespaced
+    # eval/wd/<schedule>/ws<speed>/... . With a SINGLE speed (the default "12")
+    # the /ws<speed> segment is omitted entirely, so the key namespace is
+    # byte-identical to the pre-flag behaviour and change_wd_2 readers keep
+    # working. Only consulted when --eval_wd_function is set (the fallback
+    # static-wd evaluator does not pin wind at all).
+    eval_ws: str = "12"
+
+    # === Reward conditioning overrides (change_wd_3) ===
+    # All None = "don't override", so the value from --config's power_def wins and
+    # every pre-existing script keeps its exact behaviour. These exist because the
+    # change_wd_3 arms need arbitrary COMBINATIONS of (tau x Power_avg x
+    # Power_scaling x Power_reward), which as named ENV_CONFIGS presets would be a
+    # dozen near-duplicate dicts.
+    #
+    # reward_tau floors the Wake_recovery denominator:
+    #   r = (P_agent - P_greedy) / max(P_freestream - P_greedy, tau * P_freestream)
+    # so it only binds in states with little wake-steering headroom (below rated,
+    # or wd already aligned). Raising it DOWN-WEIGHTS those states relative to the
+    # productive ones. Contrast power_scaling, which multiplies the reward
+    # UNIFORMLY -- that difference is what makes power_scaling the magnitude
+    # control that renders a tau effect attributable.
+    reward_tau: Optional[float] = None      # power_def["tau"]; env default 0.02
+    power_reward: Optional[str] = None      # power_def["Power_reward"]: "Baseline" | "Wake_recovery" | ...
+    power_avg: Optional[int] = None         # power_def["Power_avg"]: reward power-averaging window
+    power_scaling: Optional[float] = None   # power_def["Power_scaling"]: uniform reward gain
+
+    # === Yaw-actuation penalty (LES-3x3 campaign) ===
+    # act_pen["action_penalty"] / ["action_penalty_type"] overrides. The windgym
+    # machinery (reward_calculator.py: "change" = penalty * mean(|delta yaw|)
+    # per env step, in raw degrees, subtracted from the reward) has always
+    # existed but every preset hardcodes 0.0 and no CLI flag reached it.
+    # LESRL swept {0.01, 0.05, 0.1} on the LES3X3 recipe: 0.05 was the Pareto
+    # point (peak energy, ~10x less yaw travel), directly addressing the
+    # HANDOVER 6.4 thrash finding (5-6 deg/step motion in dead-steady wind).
+    # Magnitude: max |delta yaw|/env step = 10 deg at yaw_step 5 -> penalty
+    # 0.05 caps at 0.5/step vs Wake_recovery's ~0.02-0.1/step reward.
+    # None = "don't override" -> the preset's value (0.0 everywhere) wins.
+    action_penalty: Optional[float] = None       # act_pen["action_penalty"]
+    action_penalty_type: Optional[str] = None    # act_pen["action_penalty_type"], e.g. "Change"
+
+    # === Training wind-speed range override (change_wd_3) ===
+    # Override wind.ws_min / wind.ws_max for the TRAINING envs only; eval envs are
+    # always re-pinned to their own spec's ws afterwards, so these cannot leak into
+    # the eval condition. Motivation: DTU10MW rates near 11.4 m/s while hard_2 draws
+    # ws ~ U[10,14], leaving over half of training states with no wake-steering
+    # headroom at all. Narrowing the range is the "stop sampling dead states" arm,
+    # the alternative to reweighting them via reward_tau. None = use the config's range.
+    train_ws_min: Optional[float] = None
+    train_ws_max: Optional[float] = None
+
+    # === Observation encoding (change_wd_4) ===
+    # The OBS_SCALING.md finding: every ws feature is affine-scaled from a HARDCODED
+    # 0-30 m/s (wind_farm_env.py:71-72 ctor defaults, never overridden anywhere),
+    # while training data lives in ~6-14 m/s — the signal uses ~13% of the [-1,1]
+    # axis. These flags are the change_wd_4 bake-off levers. All default to "off",
+    # so every pre-existing script keeps its exact behaviour.
+    #
+    # WARNING: every one of these changes the observation contract, so they
+    # invalidate all existing checkpoints, and the STANDALONE eval scripts
+    # (evaluate.py / eval_checkpoint.py / ...) do NOT apply them — checkpoints from
+    # runs using these flags are only comparable through the in-training eval until
+    # those scripts learn to read the flags back from checkpoint["args"].
+    #
+    # ws_scaling_min/max are WindFarmEnv CTOR KWARGS (not config-dict keys — see
+    # OBS_SCALING.md "Already ruled out"), forwarded via base_env_kwargs so train
+    # and eval envs stay consistent. None = leave the env default (0/30) untouched.
+    ws_scaling_min: Optional[float] = None
+    ws_scaling_max: Optional[float] = None
+    # Same contract for the wind-direction and TI columns (LES branch): None =
+    # leave the WindFarmEnv defaults (0/360 deg, 0/1) untouched; set values are
+    # forwarded as ctor kwargs and saved in checkpoint["args"] so the LESRL eval
+    # scripts rebuild the identical scaling. Yaw scaling is NOT settable here:
+    # WindFarmEnv._apply_config ties it to the env config's farm yaw_min/yaw_max.
+    wd_scaling_min: Optional[float] = None
+    wd_scaling_max: Optional[float] = None
+    ti_scaling_min: Optional[float] = None
+    ti_scaling_max: Optional[float] = None
+    # Feature-map re-encodings of the ws columns, applied by ObsEncodingWrapper
+    # (helpers/obs_encoding.py) on the PER-TURBINE obs. Modes: rbf | pyramid | cdf
+    # | fourier | reldef | pcurve. Appending modes add features at the END of the
+    # per-turbine vector so indices 0..11 keep their meaning; cdf warps the ws
+    # columns in place. The wrapper reads the env's actual ws scaling range, so
+    # combining with --ws_scaling_* stays correct (but don't — one lever per arm).
+    obs_encoding: Optional[str] = None
+    obs_encoding_kwargs: str = "{}"   # JSON overrides of a mode's defaults (precedent: profile_encoder_kwargs)
+    # Agent-side running mean/std normalization (helpers/obs_norm.py), applied at
+    # act() time and on replay batches. Agent-side (not a per-env wrapper) because
+    # per-env statistics cannot sync across the 30 async workers and eval envs
+    # would start cold. State rides in the checkpoint (obs_norm_state).
+    obs_norm: bool = False
+    # "shared" = the usual single obs-encoder MLP over the full per-turbine vector.
+    # "per_sensor" = one small MLP per sensor group (ws/wd/yaw/power histories),
+    # concatenated — requires obs_dim_per_turbine == 4*history_length, so it
+    # hard-fails if combined with an expanding --obs_encoding (intended).
+    obs_encoder_mode: str = "shared"
+    # LES-3x3 Stage 4: replace the per-turbine [ws|wd|yaw|power] x H raw-sample
+    # vector with an aggregate scheme (helpers/obs_agg.py AGG_MODES: latest |
+    # mean_std | ema | trend | minmax | quantiles | raw15 | raw15span |
+    # spectral | spatial_rel; raw3 is a seam test) computed over the env's L-long
+    # measurement deques. WARNING: like --obs_encoding this CHANGES THE OBS
+    # CONTRACT (width 4*K per turbine, fixed physical scales, no --obs_norm);
+    # the checkpoint carries both flags so eval_wd rebuilds the same wrapper.
+    # Mutually exclusive with --obs_encoding, --use_wd_deviation,
+    # --obs_encoder_mode per_sensor and the DEL wrapper. obs_agg_len also
+    # lengthens the reset burn-in to max(power_avg, obs_agg_len) env steps.
+    obs_agg: Optional[str] = None
+    obs_agg_len: int = 30
+
+    # === Training wind-direction schedule ===
+    # Named randomized wd schedule from the TRAIN registry (helpers/wd_functions.py
+    # TRAIN_WD_FACTORIES, e.g. "dr_ramp") applied to TRAINING envs. These schedules are
+    # RELATIVE -- wd(t) = base_wd + delta(t) with delta(0) = 0 -- so unlike the eval
+    # path they do NOT pin wd_min/wd_max: the config's per-episode wd randomization is
+    # preserved and the schedule composes on top of it. Each vector env is seeded
+    # independently so the 30 envs do not share one wd trajectory. The train and eval
+    # registries are disjoint, so an eval schedule name is rejected here (and vice
+    # versa). None = static per-episode wd (unchanged behavior).
+    train_wd_function: Optional[str] = None
+
+    # === Wind-direction source (WD-estimation ladder, T3) ===
+    # What feeds the agent's rotation machinery (wind-relative position
+    # transform + profile rotation) AND the replay buffer's wind_directions:
+    # "true" = the privileged env.wd scalar (historical behavior); "est" = the
+    # sensor-derived env.wd_est (per-turbine circular EWMA + consensus,
+    # WindGym/core/wd_estimator.py). "est" requires backend=dynamiks —
+    # pywake's adapter hard-codes v=w=0, so no measured local wd exists there.
+    wd_source: str = "true"
+    # Estimator EWMA time constant (s); forwarded to the env when
+    # wd_source="est". Pick from the T1 probe against the T0 error budget.
+    wd_est_tau: Optional[float] = None
+    # Cross-turbine consensus: median (robust default) / mean / front.
+    wd_est_consensus: str = "median"
 
     # === Layout Settings ===
     # Comma-separated list of layouts. Single = single-layout, Multiple = multi-layout
@@ -119,7 +309,7 @@ class Args:
     dr_min_dist_D: float = 3.0       # minimum turbine spacing in rotor diameters
     dr_screen_headroom: bool = True  # reject generated layouts with no wake-steering headroom
     dr_min_involved_frac: float = 0.5  # min fraction of turbines in a wake interaction to keep a layout
-    dr_generator: str = "irregular"  # {"irregular","cluster"}: procedural pool generator (cluster = PLayGen Poisson-disc)
+    dr_generator: str = "irregular"  # {"irregular","cluster","grid"}: procedural pool generator (cluster = PLayGen Poisson-disc; grid = rotated regular grids, dr_n_lo/hi bound nx*ny)
 
     # === Observation Settings ===
     history_length: int = 15            # Raw measurements buffered per feature (deque size; sets warm-up length)
@@ -127,19 +317,7 @@ class Args:
     window_length: int = 1              # Raw samples averaged per rolling mean
     use_wd_deviation: bool = False      # If True, convert WD to deviation from mean
     use_wind_relative_pos: bool = True  # Transform positions to wind-relative frame
-    wd_scale_range: float = 90.0        # Only used if use_wd_deviation=True. Wind direction deviation range for scaling (±degrees → [-1,1])
-
-    # Observation scaling bounds: map raw measurements to [-1,1] in FarmMes.
-    # Saved in the checkpoint args; the eval scripts read them back so train and
-    # eval always scale identically. Defaults equal the WindFarmEnv defaults.
-    # Yaw scaling is NOT settable here: WindFarmEnv._apply_config ties it to the
-    # env config's farm yaw_min/yaw_max.
-    ws_scaling_min: float = 0.0   # Wind speed scaling lower bound (m/s)
-    ws_scaling_max: float = 30.0  # Wind speed scaling upper bound (m/s)
-    wd_scaling_min: float = 0.0   # Wind direction scaling lower bound (deg)
-    wd_scaling_max: float = 360.0 # Wind direction scaling upper bound (deg)
-    ti_scaling_min: float = 0.0   # Turbulence intensity scaling lower bound (-)
-    ti_scaling_max: float = 1.0   # Turbulence intensity scaling upper bound (-)
+    wd_scale_range: float = 45.0        # Only used if use_wd_deviation=True. Wind direction deviation range for scaling (±degrees → [-1,1]) (stage-1 baseline)
 
     # === Transformer Architecture ===
     embed_dim: int = 128          # Transformer hidden dimension
@@ -165,7 +343,7 @@ class Args:
     # === Positional Encoding Settings ===
     # Options: "absolute_mlp", "relative_mlp", "relative_mlp_shared",
     #          "sinusoidal_2d",
-    pos_encoding_type: Optional[str] = None  # Now Optional, use None for no pos encoding
+    pos_encoding_type: Optional[str] = "relative_mlp"  # None for no pos encoding (stage-1 baseline: relative_mlp)
     # For relative encoding: number of hidden units in the bias MLP
     rel_pos_hidden_dim: int = 64
     # For relative encoding: whether to use separate bias per head
@@ -180,6 +358,11 @@ class Args:
     tqc_n_critics: int = 5               # Number of critic networks
     tqc_n_quantiles: int = 25            # Quantiles per critic
     tqc_top_quantiles_to_drop: int = 2   # Truncation: drop top-d per-sample quantiles
+    tqc_share_trunk: bool = False        # ONE TransformerCritic trunk + tqc_n_critics small
+    # quantile heads (TransformerTQCSharedCritic) instead of n_critics independent trunks.
+    # ~4x fewer critic params / 2 trunk passes per grad-step instead of 2*n_critics; relies
+    # on TQC's quantile truncation (not ensemble independence) to control overestimation.
+    # Checkpoints are NOT interchangeable with the independent TQC critic.
 
     # === DroQ Hyperparameters (only used when use_droq=True) ===
     droq_dropout: float = 0.01           # Dropout rate for DroQ critic MLPs
@@ -212,6 +395,86 @@ class Args:
     # reward is tiny (~0.02-0.10/step) -> small Q -> small gradients; scaling tests signal-to-noise.
     # Applied via a gymnasium reward wrapper in combined_wrapper; 1.0 = no change.
 
+    # === DEL-constrained reward (baseline-relative max-DEL hinge penalty) ===
+    # penalty = del_penalty_scale * max(0, DEL_agent_max/DEL_baseline_max
+    #                                      - (1 + del_allowed_increase))
+    # subtracted from the tracking reward BEFORE reward_scale (see
+    # combined_wrapper). 0.0 disables the DELRewardWrapper entirely -- the env
+    # is then built WITHOUT Baseline_comp, avoiding the doubled DWM cost.
+    del_penalty_scale: float = 0.0     # lambda, in pre-reward_scale units
+    del_allowed_increase: float = 0.10  # allowed fractional DEL increase over greedy baseline
+    del_ti_window: float = 60.0        # trailing window (s) for sector statistics
+    # DEL channel(s) the hinge penalty is computed on (CSV). One channel keeps
+    # today's behavior; several make the penalty bind on the WORST channel:
+    # ratio_c = farm-max agent / farm-max baseline per channel, penalty =
+    # hinge(max_c ratio_c) with the shared episode limit. Channel names must
+    # exist in the active turbine set (del_surrogate.SETS; e.g. wtow_H0FAMnt
+    # is spelled H0FAMnt).
+    del_channels: str = "Bl1Rad0FlpMnt"
+    # Which del_surrogate artifact set to load. None (default) derives it from
+    # turbtype (IEA34 -> "iea34", DTU10MW -> "dtu10mw"); set explicitly only
+    # to cross-evaluate (e.g. DTU loads on an IEA34 farm — not meaningful for
+    # training).
+    del_artifact_set: Optional[str] = None
+    # Attach the DEL wrapper even when del_penalty_scale == 0 (info-only:
+    # penalty is exactly 0, reward untouched) so case-A runs log the same
+    # charts/del_* metrics as penalized runs. Free with Power_reward="Baseline"
+    # (the baseline farm already exists).
+    del_log: bool = False
+    # Goal-conditioned DEL limit: sample del_allowed_increase per episode
+    # (uniform in [del_limit_lo, del_limit_hi]) and expose it as one extra
+    # observation column per turbine (limit / del_limit_obs_ref). One policy
+    # then covers the whole limit sweep; at eval a limit is pinned via
+    # DELRewardWrapper(fixed_limit=...) / reset(options={"del_limit": x}).
+    # Requires the DEL wrapper to be attached (del_penalty_scale > 0 or
+    # del_log). del_allowed_increase is ignored while this is on.
+    del_limit_random: bool = False   # sample the limit per episode; adds 1 obs column/turbine
+    del_limit_lo: float = 0.0
+    del_limit_hi: float = 0.3
+    del_limit_obs_ref: float = 0.3   # obs normalization denominator; keep fixed across checkpoints
+    # === Proxy-zoo load reward (alternative to the NN DEL surrogate) ===
+    # Set load_proxies (CSV of proxy_zoo registry names, e.g.
+    # "p20_ct,p12_thrust_std") to swap DELRewardWrapper for
+    # proxy_zoo.ProxyRewardWrapper at the same position in the stack: every
+    # listed proxy is computed per step (agent + baseline farm) and lands in
+    # info["loads"][name]; the penalty is computed on load_reward_proxies
+    # (default: all of load_proxies; several -> worst binds). Reuses
+    # del_penalty_scale / del_allowed_increase / del_limit_* / del_ti_window /
+    # del_log unchanged; incompatible with an explicit del_channels.
+    load_proxies: Optional[str] = None
+    load_reward_proxies: Optional[str] = None
+    # Comparison rule + penalty kind, applied to BOTH the surrogate and the
+    # proxy path (defaults reproduce the historical farm-max hinge):
+    #   compare: farm_max | farm_mean | per_turbine_max
+    #   penalty: hinge (baseline-relative) | absolute (reward -= lambda*agg)
+    load_compare: str = "farm_max"
+    load_penalty: str = "hinge"
+
+    # === PPO Hyperparameters (transformer_ppo_windfarm.py only) ===
+    # Reused existing fields: gamma, total_timesteps, num_envs, policy_lr,
+    # grad_clip/grad_clip_max_norm, plus all env/arch/profile/layout/eval/DEL
+    # fields. Harmless defaults for the SAC trainer, which never reads these.
+    num_steps: int = 256          # rollout length per env (batch = num_steps * num_envs)
+    ppo_epochs: int = 10          # optimization epochs per rollout
+    num_minibatches: int = 8      # minibatches per epoch
+    clip_coef: float = 0.2        # PPO surrogate clipping epsilon
+    ent_coef: float = 0.0         # entropy bonus coefficient (per-dim normalized)
+    vf_coef: float = 0.5          # value loss coefficient
+    gae_lambda: float = 0.95      # GAE lambda
+    norm_adv: bool = True         # normalize advantages per minibatch
+    clip_vloss: bool = True       # clipped value loss (CleanRL style)
+    target_kl: Optional[float] = None  # early-stop epoch when approx_kl exceeds this
+    anneal_lr: bool = True        # linear LR anneal over num_iterations
+    # Shared actor-critic trunk (opt-in A/B vs the default separate value
+    # net): the value head reads the ACTOR's trunk output (forward_trunk)
+    # instead of owning its own transformer. actor_state_dict is unchanged
+    # either way (eval/interp tooling and SAC warm-starts unaffected). With
+    # sharing on, vf_coef * v_loss gradients flow into the policy trunk —
+    # if the policy destabilizes, lower vf_coef or set
+    # ppo_value_detach_trunk so the value loss only trains the head.
+    ppo_share_trunk: bool = False        # value head reads the ACTOR's trunk output
+    ppo_value_detach_trunk: bool = False # stop-grad: value loss doesn't shape trunk
+
     # === Gradient Clipping ===
     grad_clip: bool = True
     grad_clip_max_norm: float = 1.0
@@ -221,6 +484,13 @@ class Args:
     compile: bool = False    # torch.compile the network forward passes (static shapes)
     compile_mode: str = "reduce-overhead"  # torch.compile mode; "default" disables cudagraphs (needed for single-rose arms)
     log_timing: bool = False  # Log a wall-clock breakdown (env step / sample / critic / actor) to TensorBoard
+    # Overlap the SAC gradient burst with the (async) env step: step_async ->
+    # gradient updates -> step_wait, so the AsyncVectorEnv workers simulate the
+    # next step while the GPU trains. Iteration time ~ max(env, grad) instead of
+    # the sum. Both modes run the burst on the same (one-iteration-lagged)
+    # buffer contents, so loss traces are comparable; the flag only moves the
+    # blocking point. SAC-only (PPO has its own loop).
+    async_overlap: bool = False
 
     # === Fine-tuning / Resume Settings ===
     resume_checkpoint: Optional[str] = None  # Path to checkpoint .pt file for fine-tuning or resuming
@@ -247,24 +517,3 @@ class Args:
 
     # === Action Settings ===
     action_type: str = "wind"   # "wind" (target setpoint) or "yaw" (delta). Overridden by BC checkpoint if provided.
-    # Yaw-travel penalty weight: reward -= action_penalty * mean(|yaw change|) per env
-    # step (RewardCalculator type "Change"). 0.0 keeps the shipped configs' behavior
-    # (penalty disabled). Overrides the env config's act_pen["action_penalty"].
-    action_penalty: float = 0.0
-
-    # === LES-calibrated Domain Randomization ===
-    # Path to a posterior .npz file containing `samples` (N, d) and
-    # `param_names` (d,) arrays. When set, each parallel env draws DWM closure
-    # parameters from the posterior on every reset via DWMRandomizationWrapper.
-    # When None (default) DR is disabled and behaviour matches pre-DR training.
-    dr_posterior_path: Optional[str] = None
-
-    # Subset of `param_names` to actually feed into the env. Must be a subset
-    # of the posterior columns. Joint structure is preserved across all
-    # calibrated dimensions even if only a subset is exposed (row-bootstrap).
-    # The Mann subset (`mann_L`, `mann_GAMMA`, `mann_AE`) only takes effect when
-    # the env is built with `turbtype="MannGenerate"` — under MannLoad/MannFixed
-    # the env raises rather than silently ignoring per-episode Mann statistics.
-    dr_keys: Tuple[str, ...] = (
-        "k1", "k2", "d_particle", "mann_L", "mann_GAMMA", "mann_AE",
-    )
