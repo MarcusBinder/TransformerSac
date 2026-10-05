@@ -454,6 +454,8 @@ def save_checkpoint(
     qf1_target: Optional[nn.Module] = None,
     qf2_target: Optional[nn.Module] = None,
     obs_norm_state: Optional[Dict[str, torch.Tensor]] = None,
+    adapt_state_dict: Optional[Dict[str, torch.Tensor]] = None,
+    student_actor_state_dict: Optional[Dict[str, torch.Tensor]] = None,
 ) -> str:
     """
     Save training checkpoint.
@@ -500,6 +502,11 @@ def save_checkpoint(
         checkpoint["alpha_optimizer_state_dict"] = alpha_optimizer.state_dict()
     if obs_norm_state is not None:
         checkpoint["obs_norm_state"] = obs_norm_state
+    # Stage 10 phase 2: adaptation module phi (and the teacher-student copy)
+    if adapt_state_dict is not None:
+        checkpoint["adapt_state_dict"] = adapt_state_dict
+    if student_actor_state_dict is not None:
+        checkpoint["student_actor_state_dict"] = student_actor_state_dict
 
     torch.save(checkpoint, checkpoint_path)
     print(f"Checkpoint saved to {checkpoint_path}")

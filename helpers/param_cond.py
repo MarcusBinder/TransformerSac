@@ -201,7 +201,8 @@ class ParamNormalizer:
         its ``dwm_setup`` (see :func:`farm_params_from_base_env`).
         """
         tp = getattr(base_env, "turbine_params", None)
-        n = int(getattr(base_env, "n_turbines", 0) or (len(next(iter(tp.values()))) if tp else 0))
+        n = int(getattr(base_env, "n_turbines", 0) or getattr(base_env, "n_turb", 0)
+                or (len(next(iter(tp.values()))) if tp else 0))
         if n <= 0:
             raise ValueError("cannot infer the turbine count from base_env")
         tok = turbine_params_matrix(tp, n)

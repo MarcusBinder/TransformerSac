@@ -133,6 +133,10 @@ class PolicyEvaluator:
         profile_source: str = "pywake",
         profile_sigma_smooth: float = 10.0,
         profile_geom_mode: str = "wake",
+        dr_sampler_factory: Optional[Callable[[], Callable]] = None,
+        autoreset_mode=None,
+        shuffle: bool = False,
+        metrics_prefix: str = "eval",
     ):
         """
         Args:
@@ -151,8 +155,21 @@ class PolicyEvaluator:
             deterministic: If True, use deterministic actions (mean). If False, sample stochastically.
             use_profiles: Whether to compute receptivity/influence profiles for layouts
             n_profile_directions: Number of directions in profile (default 360)
+            dr_sampler_factory: Stage 10 --eval_dr. When given, each eval env is
+                wrapped (OUTSIDE MultiLayoutEnv, like the training envs) in a
+                DWMRandomizationWrapper seeded with the env's seed, drawing from
+                dr_sampler_factory() on every reset: evaluation under the
+                training DR instead of the nominal physics.
+            autoreset_mode: gymnasium AutoresetMode for the AsyncVectorEnv
+                (None = gymnasium's default NEXT_STEP, today's behaviour).
+            shuffle: MultiLayoutEnv turbine shuffle in the eval envs (default off).
+            metrics_prefix: label for this evaluator's metric keys ("eval" or "eval_dr").
         """
         self.agent = agent
+        self.dr_sampler_factory = dr_sampler_factory
+        self.autoreset_mode = autoreset_mode
+        self.shuffle = shuffle
+        self.metrics_prefix = metrics_prefix
         self.eval_layout_names = eval_layouts
         self.env_factory = env_factory
         self.combined_wrapper = combined_wrapper
@@ -239,16 +256,23 @@ class PolicyEvaluator:
                     env_factory=self.env_factory,
                     per_turbine_wrapper=self.combined_wrapper,
                     seed=seed,
-                    shuffle=False,  # No shuffling during evaluation for consistency
+                    shuffle=self.shuffle,  # default False: no shuffling during evaluation for consistency
                     max_turbines=effective_max_turbines,
                     max_episode_steps=self.num_eval_steps+1000, #Just to be safe.
                 )
+                if self.dr_sampler_factory is not None:
+                    # Stage 10 --eval_dr: randomised physics, same wrapper
+                    # placement as the training envs (outermost).
+                    from WindGym.wrappers import DWMRandomizationWrapper
+                    env = DWMRandomizationWrapper(env, sampler=self.dr_sampler_factory(), seed=seed)
                 return env
             return _init
         
         # Use AsyncVectorEnv for parallel execution (faster for expensive sims)
+        _vec_kwargs = {} if self.autoreset_mode is None else {"autoreset_mode": self.autoreset_mode}
         envs = gym.vector.AsyncVectorEnv(
-            [make_eval_env_fn(self.seed + i) for i in range(self.num_envs)]
+            [make_eval_env_fn(self.seed + i) for i in range(self.num_envs)],
+            **_vec_kwargs,
         )
         envs = RecordEpisodeVals(envs)
         return envs

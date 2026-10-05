@@ -199,7 +199,7 @@ class Args:
     adapt_round_steps: int = 1000
     adapt_fit_steps: int = 5000
     adapt_lr: float = 3e-4
-    adapt_only: bool = False          # skip the RL loop; phase 2 from --checkpoint_path
+    adapt_only: bool = False          # skip the RL loop; phase 2 only, from --resume_checkpoint (+ optional --load_buffer)
     # phase2_loss: "latent" = MSE(z_hat, z) only (RMA / UP-OSI, actor frozen);
     # "latent_action" = + MSE(student mean action | z_hat, teacher mean action | z)
     # (Lee et al. 2020 teacher-student; needs phase2_train_actor for the student copy).

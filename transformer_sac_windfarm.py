@@ -830,6 +830,12 @@ def main():
         4. Optionally applies TransformReward (reward_scale)
         """
         env = PerTurbineObservationWrapper(env)
+        # Stage 10: commanded-action history per turbine (phase-2 adaptation
+        # input). Innermost after the per-turbine reshape so it sees the raw
+        # yaw command the env applies; MultiLayoutEnv.action_history permutes it.
+        if args.cond_action_hist:
+            from helpers.action_history import ActionHistoryWrapper, N_FEAT_DEFAULT
+            env = ActionHistoryWrapper(env, n_hist=args.cond_action_hist_len, n_feat=N_FEAT_DEFAULT)
         if args.use_wd_deviation:
             env = EnhancedPerTurbineWrapper(env, wd_scale_range=args.wd_scale_range)
         # DEL hinge penalty BEFORE TransformReward, so the scaler multiplies
@@ -889,6 +895,36 @@ def main():
     # drawn on the same per-env RNG right after the posterior row.
     _turb_ranges = parse_turb_dr(args.turb_dr)
     validate_dr_setup(args, _dr_posterior, _turb_ranges)
+
+    # --- Stage 10: parameter conditioning (RMA / UP-OSI) -----------------------
+    # cond_on => the actor is told the hidden-parameter vector e (token order,
+    # helpers/param_cond.py); the replay buffer stores it per transition and
+    # the normalisation constants ride in the checkpoint (cond_norm_json).
+    from helpers.param_cond import COND_DIM, CondFetcher, ParamNormalizer
+    from helpers.action_history import N_FEAT_DEFAULT as ACTION_HIST_FEAT
+    _cond_on = args.cond_source != "none"
+    _cond_critic_on = _cond_on and args.cond_critic == "raw"
+    cond_normalizer = None
+    if _cond_on:
+        if not _turb_ranges:
+            raise ValueError(
+                f"--cond_source {args.cond_source} needs --turb_dr ranges: the policy is "
+                "conditioned on the parameters that VARY during training."
+            )
+        cond_normalizer = ParamNormalizer.from_args(args, _dr_posterior)  # turbine_farm needs the posterior
+        args.cond_norm_json = cond_normalizer.to_json()
+        print(f"[Cond] source={args.cond_source} dz={args.cond_latent_dim} mode={args.cond_mode} "
+              f"critic={args.cond_critic} action_hist={args.cond_action_hist} "
+              f"(e dim {COND_DIM}; turbine keys scaled by --turb_dr, farm keys z-scored by the posterior)")
+    if args.phase2_loss not in ("latent", "latent_action"):
+        raise ValueError(f"--phase2_loss must be latent | latent_action, got {args.phase2_loss!r}")
+    if args.adapt_rounds > 0 or args.adapt_only:
+        if not _cond_on:
+            raise ValueError("--adapt_rounds / --adapt_only need --cond_source turbine|turbine_farm")
+        if not args.cond_action_hist:
+            raise ValueError("phase 2 (--adapt_rounds) needs --cond_action_hist: phi reads the commanded-action history")
+    if args.eval_dr and not (_dr_posterior is not None or _turb_ranges):
+        raise ValueError("--eval_dr needs a training DR (--dr_posterior_path and/or --turb_dr) to evaluate under")
     _n_turb_dr = int(args.max_turbines or max(l.n_turbines for l in layouts))
     _dr_active = _dr_posterior is not None or bool(_turb_ranges)
     if _dr_posterior is not None:
@@ -1058,7 +1094,48 @@ def main():
     # deadlock for exactly this reason — they fork at startup. Resident cost
     # is num_specs x num_envs idle workers; the eval layouts are capped small
     # (square_2x2), so this is noise next to the 30 training envs.
-    for _ev in evaluators:
+    # Stage 10 --eval_dr: a second evaluator per eval spec under the TRAINING
+    # DR (seeded DWMRandomizationWrapper outside MultiLayoutEnv, same sampler
+    # recipe as make_env_fn), metric prefix eval_dr/. Gate 1: Expert (true e)
+    # vs Robust under randomised params. Built eagerly like the others.
+    eval_dr_evaluators = []
+    if args.eval_dr:
+        def _eval_dr_sampler_factory():
+            return combine_samplers(
+                make_dr_sampler(_dr_posterior, keys=tuple(args.dr_keys))
+                if _dr_posterior is not None else None,
+                make_turbine_sampler(_turb_ranges, _n_turb_dr,
+                                     per_turbine=args.turb_dr_per_turbine)
+                if _turb_ranges else None,
+            )
+        eval_dr_evaluators = [
+            PolicyEvaluator(
+                agent=None,
+                eval_layouts=eval_layout_names,
+                env_factory=_factory,
+                combined_wrapper=combined_wrapper,
+                num_envs=args.num_envs,
+                num_eval_steps=args.num_eval_steps,
+                num_eval_episodes=args.num_eval_episodes,
+                device=device,
+                rotor_diameter=rotor_diameter,
+                wind_turbine=wind_turbine,
+                seed=args.eval_seed + 500_000,
+                max_turbines=n_turbines_max,
+                deterministic=args.eval_deterministic,
+                use_profiles=use_profiles,
+                n_profile_directions=args.n_profile_directions,
+                profile_source=args.profile_source,
+                profile_sigma_smooth=args.profile_sigma_smooth,
+                profile_geom_mode=args.profile_geom_mode,
+                dr_sampler_factory=_eval_dr_sampler_factory,
+                metrics_prefix="eval_dr",
+            )
+            for _factory in eval_env_factories
+        ]
+        print(f"[eval_dr] {len(eval_dr_evaluators)} evaluator(s) under the training DR (prefix eval_dr/)")
+
+    for _ev in evaluators + eval_dr_evaluators:
         _ = _ev.eval_envs  # property; triggers AsyncVectorEnv creation
 
     def run_all_evaluations():
@@ -1081,10 +1158,19 @@ def main():
             if eval_spec_names:
                 metrics.update(m.to_dict(prefix=f"eval/wd/{eval_spec_names[i]}"))
                 print(f"  [{eval_spec_names[i]}] power ratio: {m.power_ratio:.4f}")
+        for i, ev in enumerate(eval_dr_evaluators):
+            m = ev.evaluate()
+            if i == 0:
+                metrics.update(m.to_dict(prefix="eval_dr"))
+            if eval_spec_names:
+                metrics.update(m.to_dict(prefix=f"eval_dr/wd/{eval_spec_names[i]}"))
+                print(f"  [eval_dr {eval_spec_names[i]}] power ratio: {m.power_ratio:.4f}")
+            else:
+                print(f"  [eval_dr] power ratio: {m.power_ratio:.4f}")
         return metrics, primary
 
     def close_all_evaluators():
-        for ev in evaluators:
+        for ev in evaluators + eval_dr_evaluators:
             ev.close()
 
 
@@ -1202,6 +1288,8 @@ def main():
             "profile_fusion_type", "profile_embed_mode",
             "profile_encoder_kwargs",
             "n_profile_directions",
+            # Stage 10 conditioning changes the actor's shapes / modules
+            "cond_source", "cond_latent_dim", "cond_mode", "cond_critic",
         ]
 
         overrides = []
@@ -1319,10 +1407,14 @@ def main():
         # PolicyEvaluator lets the agent fetch wd itself, so the wd source
         # follows the agent into every eval pass too.
         wd_attr=wd_source_attr,
+        # Stage 10: eval envs resolve their own e (nominal or --eval_dr draw)
+        # through the normaliser; the training loop passes params explicitly.
+        cond_normalizer=cond_normalizer,
+        use_action_hist=args.cond_action_hist,
     )
 
     # Update evaluator with actor reference
-    for _ev in evaluators:
+    for _ev in evaluators + eval_dr_evaluators:
         _ev.agent = agent
 
     # Build critic-specific kwargs (DroQ params only go to critics, not actor)
@@ -1704,6 +1796,8 @@ def main():
         rotate_profiles=args.rotate_profiles,
         profile_registry=profile_registry,
         profile_registry_gpu_budget_mb=args.profile_registry_gpu_budget_mb,
+        cond_dim=COND_DIM if _cond_on else 0,
+        action_hist_dim=ACTION_HIST_FEAT if args.cond_action_hist else 0,
     )
 
     # Shared metadata stored alongside every buffer save (also validated on load)
@@ -1715,6 +1809,9 @@ def main():
             "history_length": args.history_length,
             "history_N": args.history_N,
             "window_length": args.window_length,
+            "cond_source": args.cond_source,
+            "cond_norm_json": args.cond_norm_json,
+            "cond_action_hist": bool(args.cond_action_hist),
         }
 
     if args.load_buffer is not None:
@@ -1723,6 +1820,12 @@ def main():
         print(f"{'='*60}")
         buffer_meta_loaded = rb.load(args.load_buffer)
 
+        if buffer_meta_loaded.get("cond_source", "none") != args.cond_source:
+            raise ValueError(
+                f"Replay buffer was generated with cond_source="
+                f"'{buffer_meta_loaded.get('cond_source', 'none')}' but this run uses "
+                f"'{args.cond_source}'"
+            )
         if buffer_meta_loaded.get("layouts") != args.layouts:
             raise ValueError(
                 f"Replay buffer was generated with layouts='{buffer_meta_loaded.get('layouts')}' "
@@ -2092,6 +2195,13 @@ def main():
     # Calculate remaining updates if resuming
     remaining_timesteps = args.total_timesteps - start_step
     num_updates = max(0, remaining_timesteps // args.num_envs)
+    # Stage 10 --adapt_only: no RL iterations at all (the loop below always ran
+    # num_updates + 2 iterations), straight to the phase-2 block.
+    _rl_iterations = 0 if args.adapt_only else num_updates + 2
+    if args.adapt_only:
+        if args.resume_checkpoint is None:
+            raise ValueError("--adapt_only needs --resume_checkpoint (the trained cond actor)")
+        print(f"[adapt_only] skipping the RL loop; phase 2 from {args.resume_checkpoint}")
     
     if start_step > 0:
         print(f"Resuming from step {start_step}, {remaining_timesteps} timesteps remaining")
@@ -2111,7 +2221,16 @@ def main():
 
     signal.signal(signal.SIGTERM, _request_stop)
 
-    for update in range(num_updates + 2):
+    # Stage 10: e / action-history fetch state. prev_dones = ones so the first
+    # iteration fetches; afterwards a done at step k-1 means the env reset
+    # inside that step (SAME_STEP autoreset), so the attrs read at the top of
+    # step k describe the episode obs[i] belongs to.
+    prev_dones = np.ones(args.num_envs, dtype=bool)
+    cond_fetcher = CondFetcher(envs.env, cond_normalizer) if _cond_on else None
+    current_params = None
+    current_action_hist = None
+
+    for update in range(_rl_iterations):
         global_step += args.num_envs
         
         # Unfreeze pretrained encoder after warmup
@@ -2149,11 +2268,22 @@ def main():
             current_receptivity = None
             current_influence = None
 
+        # Stage 10: hidden params e (refetched only for envs that reset) and
+        # the commanded-action history (every step). Both inside the IPC block,
+        # before step_async (--async_overlap forbids IPC while a step is in flight).
+        if _cond_on and prev_dones.any():
+            cond_fetcher.refresh()
+        if _cond_on:
+            current_params = cond_fetcher.values
+        if args.cond_action_hist:
+            current_action_hist = np.array(envs.env.get_attr("action_history"), dtype=np.float32)
+
 
         # Select action
         # Reuse the env state already fetched above to avoid duplicate get_attr IPC
         act_state = dict(wind_dirs=wind_dirs, raw_positions=raw_positions, masks=current_masks,
-                        receptivity=current_receptivity, influence=current_influence)
+                        receptivity=current_receptivity, influence=current_influence,
+                        params=current_params, action_hist=current_action_hist)
         if global_step < args.learning_starts:
             if args.initial_exploration == "policy":
                 # Use the actor network (useful when resuming from checkpoint)
@@ -2245,6 +2375,9 @@ def main():
                 # Get profiles from batch (will be None if not using profiles)
                 batch_receptivity = data.get("receptivity", None)
                 batch_influence = data.get("influence", None)
+                # Stage 10: e per token (None when cond is off -> ALWAYS None, never zeros)
+                batch_params = data.get("params", None)
+                batch_cond_critic = batch_params if _cond_critic_on else None
                 # Single-rose mode: drop the unused influence tensor so it is never a live
                 # input to the compiled critic/actor forwards (phantom cudagraph input).
                 if not actor.use_influence:
@@ -2261,6 +2394,7 @@ def main():
                         batch_mask,
                         recep_profile=batch_receptivity,
                         influence_profile=batch_influence,
+                        cond=batch_params,
                     )
 
                 if args.algorithm == "tqc":
@@ -2272,6 +2406,7 @@ def main():
                             data["positions"], batch_mask,
                             recep_profile=batch_receptivity,
                             influence_profile=batch_influence,
+                            cond=batch_cond_critic,
                         )
                         batch_size_cur = data["rewards"].shape[0]
                         # Flatten across critics, sort, truncate top-d (fp32 for the target math)
@@ -2288,6 +2423,7 @@ def main():
                             data["positions"], batch_mask,
                             recep_profile=batch_receptivity,
                             influence_profile=batch_influence,
+                            cond=batch_cond_critic,
                         )
                         qf_loss = sum(
                             quantile_huber_loss(current_q[i].float(), target_q, taus)
@@ -2346,12 +2482,14 @@ def main():
                             data["positions"], batch_mask,
                             recep_profile=batch_receptivity,
                             influence_profile=batch_influence,
+                            cond=batch_cond_critic,
                         ).clone()
                         qf2_next = qf2_target(
                             data["next_observations"], next_actions,
                             data["positions"], batch_mask,
                             recep_profile=batch_receptivity,
                             influence_profile=batch_influence,
+                            cond=batch_cond_critic,
                         ).clone()
                         min_qf_next = torch.min(qf1_next, qf2_next) - alpha * next_log_pi
                         target_q = data["rewards"] + (1 - data["dones"]) * args.gamma * min_qf_next
@@ -2361,11 +2499,13 @@ def main():
                         qf1_value = qf1(data["observations"], data["actions"],
                                         data["positions"], batch_mask,
                                         recep_profile=batch_receptivity,
-                                        influence_profile=batch_influence).clone()
+                                        influence_profile=batch_influence,
+                                        cond=batch_cond_critic).clone()
                         qf2_value = qf2(data["observations"], data["actions"],
                                         data["positions"], batch_mask,
                                         recep_profile=batch_receptivity,
-                                        influence_profile=batch_influence).clone()
+                                        influence_profile=batch_influence,
+                                        cond=batch_cond_critic).clone()
 
                         if debug_logger.should_log_q_values(total_gradient_steps):
                             debug_logger.log_q_value_stats(
@@ -2424,6 +2564,7 @@ def main():
                             data["observations"], data["positions"], batch_mask,
                             recep_profile=batch_receptivity,
                             influence_profile=batch_influence,
+                            cond=batch_params,
                         )
 
                         # Q-values for policy actions
@@ -2433,6 +2574,7 @@ def main():
                                 data["positions"], batch_mask,
                                 recep_profile=batch_receptivity,
                                 influence_profile=batch_influence,
+                                cond=batch_cond_critic,
                             )  # (n_critics, batch, n_quantiles)
                             batch_size_cur = data["rewards"].shape[0]
                             all_q_flat = all_q.permute(1, 0, 2).reshape(batch_size_cur, -1)
@@ -2444,11 +2586,13 @@ def main():
                             qf1_pi = qf1(data["observations"], actions_pi, data["positions"],
                                          batch_mask,
                                          recep_profile=batch_receptivity,
-                                         influence_profile=batch_influence).clone()
+                                         influence_profile=batch_influence,
+                                         cond=batch_cond_critic).clone()
                             qf2_pi = qf2(data["observations"], actions_pi, data["positions"],
                                          batch_mask,
                                          recep_profile=batch_receptivity,
-                                         influence_profile=batch_influence).clone()
+                                         influence_profile=batch_influence,
+                                         cond=batch_cond_critic).clone()
                             min_qf_pi = torch.min(qf1_pi, qf2_pi)
 
                         # Policy loss (maximize Q - alpha * entropy), fp32 for stability
@@ -2539,6 +2683,7 @@ def main():
                             recep_profile=batch_receptivity[:sample_size] if batch_receptivity is not None else None,
                             influence_profile=batch_influence[:sample_size] if batch_influence is not None else None,
                             need_weights=True, # Need this if we actually want attention
+                            cond=batch_params[:sample_size] if batch_params is not None else None,
                         )
                         
                         # This logs both scalar metrics AND a visualization image!
@@ -2825,6 +2970,7 @@ def main():
                                 data["attention_mask"][:32],
                                 recep_profile=batch_receptivity[:32] if batch_receptivity is not None else None,
                                 influence_profile=batch_influence[:32] if batch_influence is not None else None,
+                                cond=batch_params[:32] if batch_params is not None else None,
                             )
                             policy_entropy = -log_pi_diag.mean().item()
                             # Recompute Q-values fresh: under reduce-overhead the cached
@@ -2834,12 +2980,14 @@ def main():
                                 data["attention_mask"],
                                 recep_profile=batch_receptivity,
                                 influence_profile=batch_influence,
+                                cond=batch_cond_critic,
                             ).clone()
                             qf2_values_diag = qf2(
                                 data["observations"], data["actions"], data["positions"],
                                 data["attention_mask"],
                                 recep_profile=batch_receptivity,
                                 influence_profile=batch_influence,
+                                cond=batch_cond_critic,
                             ).clone()
 
                         log_finetune_diagnostics(
@@ -2885,6 +3033,7 @@ def main():
                 timing["env"] += _t_now - _t0
                 timing["env_span"] += _t_now - _t_async
         next_obs, rewards, terminations, truncations, infos = step_result
+        prev_dones = np.logical_or(terminations, truncations)
 
         # Get current layout names for each env. Under domain randomization the pool
         # is huge, so bucket every training layout under "dr_pool" for debug stats.
@@ -3112,6 +3261,8 @@ def main():
                 wind_dirs[i],
                 layout_index=layout_idx_i,
                 permutation=perm_i,
+                params=current_params[i] if current_params is not None else None,
+                action_hist=current_action_hist[i] if current_action_hist is not None else None,
             )
 
         # One-shot warmup buffer save (buffer pre-generation for ablation runs)
@@ -3206,6 +3357,32 @@ def main():
             f"runs/{run_name}/replay_buffer.npz",
             extra_meta=buffer_meta(global_step),
         )
+
+    # =========================================================================
+    # Stage 10 PHASE 2: adaptation module phi (after the final RL save, so a
+    # crash here never costs the trained actor). Re-saves the final checkpoint
+    # with adapt_state_dict (+ student_actor_state_dict for the Lee arm).
+    # =========================================================================
+    if args.adapt_rounds > 0:
+        from helpers.phase2_adapt import run_phase2
+        _p2 = run_phase2(
+            args, actor, envs, rb, cond_normalizer, device,
+            trunk_kwargs=common_kwargs, rotor_diameter=rotor_diameter, use_profiles=use_profiles,
+            obs_normalizer=obs_normalizer, wd_attr=wd_source_attr, profile_registry=profile_registry,
+            n_turbines_max=n_turbines_max, obs_dim=obs_dim_per_turbine, action_dim=action_dim_per_turbine,
+            global_step=global_step, writer=writer,
+        )
+        if args.save_model:
+            save_checkpoint(
+                actor, qf1, qf2, actor_optimizer, q_optimizer,
+                global_step, run_name, args, log_alpha, alpha_optimizer,
+                tqc_critic=tqc_critic,
+                tqc_critic_target=tqc_critic_target,
+                qf1_target=qf1_target, qf2_target=qf2_target,
+                obs_norm_state=obs_normalizer.state_dict() if obs_normalizer is not None else None,
+                adapt_state_dict=_p2["adapt_state_dict"],
+                student_actor_state_dict=_p2["student_actor_state_dict"],
+            )
 
     print("\n" + "=" * 60)
     print("Training finished!")
