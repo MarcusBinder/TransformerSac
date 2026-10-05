@@ -160,6 +160,56 @@ class Args:
     turb_dr: Tuple[str, ...] = ()
     turb_dr_per_turbine: bool = True   # False = one draw per name for the whole farm
 
+    # === Parameter-conditioned policies (Stage 10: RMA / UP-OSI / teacher-student) ===
+    # cond_source: which hidden parameters the actor is told during training.
+    #   none         = today's history policy (bit-identical: no new modules).
+    #   turbine      = the 6 per-turbine --turb_dr params, scaled to [-1, 1] by
+    #                  their training range (unranged keys -> constant 0).
+    #   turbine_farm = + the 6 farm posterior params (k1 k2 d_particle mann_L
+    #                  mann_GAMMA mann_AE) z-scored by the posterior, clipped +-3.
+    # The vector e is (max_turbines, 12) in token order (helpers/param_cond.py),
+    # stored per transition in the replay buffer, and its normalisation constants
+    # are saved in the checkpoint (cond_norm_json) for the LESRL harnesses.
+    cond_source: str = "none"
+    # Latent size dz of the parameter encoder mu: e -> z. 0 = identity (UP-OSI,
+    # the actor sees raw e, 12-dim); >0 = learned latent (RMA, e.g. 8).
+    cond_latent_dim: int = 0
+    # How z enters the actor: "concat" = appended to each token's 60 obs
+    # features before obs_encoder; "film" = per-layer zero-initialised FiLM
+    # (gamma, beta) on the pre-norm LayerNorm outputs (identity at init).
+    cond_mode: str = "concat"
+    # Critic conditioning: "raw" = raw e concatenated to every token's
+    # (obs, action) features (asymmetric critic); "none" = critic unchanged.
+    cond_critic: str = "raw"
+    # Serialised ParamNormalizer (set by the trainer; read by the harnesses).
+    cond_norm_json: str = ""
+    # Commanded-action history per turbine (ActionHistoryWrapper): the last
+    # cond_action_hist_len delta-yaw commands -> raw15span (15 features), stored
+    # in the replay buffer as the adaptation module's input. Needed for the
+    # in-job phase 2 (adapt_rounds > 0) warm start on the RL buffer.
+    cond_action_hist: bool = False
+    cond_action_hist_len: int = 60
+    # Phase 2 (after the final save): adaptation module phi regresses z (or e)
+    # from [obs | action history] with DAgger: warm start on the RL buffer
+    # (adapt_warm_steps gradient steps), then adapt_rounds rounds of
+    # num_envs x adapt_round_steps env steps with z_hat in the loop, each
+    # followed by adapt_fit_steps gradient steps on the aggregated set.
+    adapt_rounds: int = 0
+    adapt_warm_steps: int = 20000
+    adapt_round_steps: int = 1000
+    adapt_fit_steps: int = 5000
+    adapt_lr: float = 3e-4
+    adapt_only: bool = False          # skip the RL loop; phase 2 from --checkpoint_path
+    # phase2_loss: "latent" = MSE(z_hat, z) only (RMA / UP-OSI, actor frozen);
+    # "latent_action" = + MSE(student mean action | z_hat, teacher mean action | z)
+    # (Lee et al. 2020 teacher-student; needs phase2_train_actor for the student copy).
+    phase2_loss: str = "latent"
+    phase2_train_actor: bool = False
+    # Second in-training evaluator under the TRAINING DR (seeded
+    # DWMRandomizationWrapper around the eval envs), metrics prefix eval_dr/.
+    # Gate 1 of Stage 10: Expert (true e) vs Robust under randomised params.
+    eval_dr: bool = False
+
     # === Evaluation Settings ===
     eval_interval: int = 50000        # How often to evaluate (in env steps)
     eval_initial: bool = False        # Run evaluation before training starts

@@ -38,6 +38,34 @@ class LayoutConfig:
     def has_profiles(self) -> bool: # If we have one, we have both
         return self.receptivity_profiles is not None
     
+    # ------------------------------------------------------------------
+    # Hidden-parameter exposure in TOKEN order (Stage 10: RMA / UP-OSI)
+    # ------------------------------------------------------------------
+    @property
+    def turbine_params_tok(self) -> np.ndarray:
+        """Per-turbine turbine-model parameters ``(max_turbines, 6)``, PHYSICAL
+        units, rows in TOKEN order (permuted by the current shuffle like
+        ``turbine_positions``), padded rows = spec defaults. Column order =
+        ``helpers.param_cond.COND_TURB_KEYS`` (WindGym TURBINE_PARAM_SPECS).
+        Before the first reset (``turbine_params`` None) every row is the
+        default vector. Read through ``AsyncVectorEnv.get_attr``."""
+        from helpers.param_cond import COND_TURB_KEYS, TURB_DEFAULTS, turbine_params_matrix
+        base = self._get_base_env()
+        tp = getattr(base, "turbine_params", None)
+        n = self.n_turbines
+        phys = turbine_params_matrix(tp, n)
+        out = np.array([[TURB_DEFAULTS[k] for k in COND_TURB_KEYS]] * self.max_turbines, dtype=np.float64)
+        out[:n] = phys[self._perm]
+        return out
+
+    @property
+    def farm_params(self) -> Dict[str, float]:
+        """This episode's farm-level DWM / Mann parameters (the six posterior
+        keys), resolved from the base env's active DWM params over its
+        ``dwm_setup`` defaults; see ``helpers.param_cond.farm_params_from_base_env``."""
+        from helpers.param_cond import farm_params_from_base_env
+        return farm_params_from_base_env(self._get_base_env())
+
     @property
     def n_profile_directions(self) -> int:
         if self.receptivity_profiles is None:
@@ -617,6 +645,34 @@ class MultiLayoutEnv(gym.Env):
         padded = np.arange(self.max_turbines, dtype=np.int64)
         padded[:self.n_turbines] = self._perm
         return padded
+
+    # ------------------------------------------------------------------
+    # Hidden-parameter exposure in TOKEN order (Stage 10: RMA / UP-OSI)
+    # ------------------------------------------------------------------
+    @property
+    def turbine_params_tok(self) -> np.ndarray:
+        """Per-turbine turbine-model parameters ``(max_turbines, 6)``, PHYSICAL
+        units, rows in TOKEN order (permuted by the current shuffle like
+        ``turbine_positions``), padded rows = spec defaults. Column order =
+        ``helpers.param_cond.COND_TURB_KEYS`` (WindGym TURBINE_PARAM_SPECS).
+        Before the first reset (``turbine_params`` None) every row is the
+        default vector. Read through ``AsyncVectorEnv.get_attr``."""
+        from helpers.param_cond import COND_TURB_KEYS, TURB_DEFAULTS, turbine_params_matrix
+        base = self._get_base_env()
+        tp = getattr(base, "turbine_params", None)
+        n = self.n_turbines
+        phys = turbine_params_matrix(tp, n)
+        out = np.array([[TURB_DEFAULTS[k] for k in COND_TURB_KEYS]] * self.max_turbines, dtype=np.float64)
+        out[:n] = phys[self._perm]
+        return out
+
+    @property
+    def farm_params(self) -> Dict[str, float]:
+        """This episode's farm-level DWM / Mann parameters (the six posterior
+        keys), resolved from the base env's active DWM params over its
+        ``dwm_setup`` defaults; see ``helpers.param_cond.farm_params_from_base_env``."""
+        from helpers.param_cond import farm_params_from_base_env
+        return farm_params_from_base_env(self._get_base_env())
 
     @property
     def n_profile_directions(self) -> int:
