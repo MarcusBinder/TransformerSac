@@ -42,6 +42,8 @@ class InferenceBatch:
     mask: torch.Tensor                      # (batch, n_turbines)
     receptivity: Optional[torch.Tensor] = None   # (batch, n_turbines, n_directions)
     influence: Optional[torch.Tensor] = None     # (batch, n_turbines, n_directions)
+    params: Optional[torch.Tensor] = None        # (batch, n_turbines, cond_dim) hidden params e (Stage 10)
+    action_hist: Optional[torch.Tensor] = None   # (batch, n_turbines, n_feat) commanded-action history
 
 
 class BatchPreparer:
@@ -65,6 +67,8 @@ class BatchPreparer:
         rotate_profiles: bool = False,
         obs_normalizer=None,
         wd_attr: str = 'wd',
+        cond_normalizer=None,
+        use_action_hist: bool = False,
     ):
         """
         Args:
@@ -73,6 +77,13 @@ class BatchPreparer:
             use_wind_relative: Whether to transform positions to wind-relative frame
             use_profiles: Whether to include receptivity/influence profiles
             rotate_profiles: Whether to rotate profiles to wind-relative frame
+            cond_normalizer: Optional helpers.param_cond.ParamNormalizer. When set
+                and no `params` are passed to from_envs, e is fetched from the
+                GIVEN envs (turbine_params_tok / farm_params / attention_mask
+                get_attrs), so the nominal eval envs resolve their own nominal
+                e without any DR wrapper (Stage 10).
+            use_action_hist: fetch `action_history` from the envs when not
+                passed (needs ActionHistoryWrapper in the chain).
             obs_normalizer: Optional ObsRunningNorm (--obs_norm). Applied to the
                 obs tensor here so training AND eval act() calls are normalized
                 identically (PolicyEvaluator shares this agent).
@@ -88,6 +99,8 @@ class BatchPreparer:
         self.rotate_profiles = rotate_profiles
         self.obs_normalizer = obs_normalizer
         self.wd_attr = wd_attr
+        self.cond_normalizer = cond_normalizer
+        self.use_action_hist = use_action_hist
     
     def from_envs(
         self,
@@ -98,6 +111,8 @@ class BatchPreparer:
         masks: Optional[np.ndarray] = None,
         receptivity: Optional[np.ndarray] = None,
         influence: Optional[np.ndarray] = None,
+        params: Optional[np.ndarray] = None,
+        action_hist: Optional[np.ndarray] = None,
     ) -> InferenceBatch:
         """
         Prepare batch from vectorized environment state.
@@ -114,6 +129,10 @@ class BatchPreparer:
                 use_profiles is on; when None they are fetched from the envs
                 via get_attr (which needs a MultiLayoutEnv-wrapped vector env,
                 so unvectorized eval drivers must pass them in).
+            params/action_hist: optional precomputed (num_envs, n_turbines, d)
+                hidden-parameter vectors / commanded-action histories (Stage 10).
+                When None they are fetched from the envs iff cond_normalizer /
+                use_action_hist are set; otherwise left None.
 
         Returns:
             InferenceBatch ready for actor.get_action()
@@ -170,12 +189,26 @@ class BatchPreparer:
                 receptivity_tensor = rotate_profiles_tensor(receptivity_tensor, wind_dir_tensor)
                 influence_tensor = rotate_profiles_tensor(influence_tensor, wind_dir_tensor)
         
+        params_tensor = None
+        if params is None and self.cond_normalizer is not None:
+            from .param_cond import CondFetcher
+            params = CondFetcher(envs.env, self.cond_normalizer).refresh()
+        if params is not None:
+            params_tensor = torch.as_tensor(np.asarray(params, dtype=np.float32), device=self.device)
+        action_hist_tensor = None
+        if action_hist is None and self.use_action_hist:
+            action_hist = np.array(envs.env.get_attr('action_history'), dtype=np.float32)
+        if action_hist is not None:
+            action_hist_tensor = torch.as_tensor(np.asarray(action_hist, dtype=np.float32), device=self.device)
+
         return InferenceBatch(
             obs=obs_tensor,
             positions=positions_tensor,
             mask=mask_tensor,
             receptivity=receptivity_tensor,
             influence=influence_tensor,
+            params=params_tensor,
+            action_hist=action_hist_tensor,
         )
 
 
@@ -215,6 +248,9 @@ class WindFarmAgent:
         rotate_profiles: bool = False,
         obs_normalizer=None,
         wd_attr: str = 'wd',
+        cond_normalizer=None,
+        use_action_hist: bool = False,
+        adaptation: Optional[nn.Module] = None,
     ):
         """
         Args:
@@ -226,9 +262,19 @@ class WindFarmAgent:
             rotate_profiles: Whether to rotate profiles to wind-relative frame
             obs_normalizer: Optional ObsRunningNorm (--obs_norm), see BatchPreparer
             wd_attr: wd source attribute ('wd' or 'wd_est'), see BatchPreparer
+            cond_normalizer / use_action_hist: see BatchPreparer (Stage 10)
+            adaptation: optional AdaptationModule phi. When set, act() feeds the
+                actor z_hat = phi(obs, action_hist, ...) as a latent instead of
+                the true e (deployment / phase-2 DAgger rollouts).
         """
         self.actor = actor
         self.device = device
+        self.adaptation = adaptation
+        # cond contract: the actor's cond_source decides whether cond is a tensor
+        # (always) or None (always) -- never mixed (torch.compile single graph).
+        self.cond_on = bool(getattr(actor, "cond_on", False))
+        if adaptation is not None and not use_action_hist:
+            use_action_hist = True
 
         self.batch_preparer = BatchPreparer(
             device=device,
@@ -238,7 +284,23 @@ class WindFarmAgent:
             rotate_profiles=rotate_profiles,
             obs_normalizer=obs_normalizer,
             wd_attr=wd_attr,
+            cond_normalizer=cond_normalizer if self.cond_on else None,
+            use_action_hist=use_action_hist,
         )
+
+    def _cond_kwargs(self, batch: InferenceBatch) -> dict:
+        """cond / cond_is_latent for the actor from a prepared batch."""
+        if not self.cond_on:
+            return {}
+        if self.adaptation is not None:
+            if batch.action_hist is None:
+                raise ValueError("adaptation module needs action_hist (use_action_hist / ActionHistoryWrapper)")
+            z_hat = self.adaptation(batch.obs, batch.action_hist, batch.positions, batch.mask,
+                                    batch.receptivity, batch.influence)
+            return {"cond": z_hat, "cond_is_latent": True}
+        if batch.params is None:
+            raise ValueError("cond actor needs params: pass params= or give the agent a cond_normalizer")
+        return {"cond": batch.params}
     
     def act(
         self,
@@ -250,6 +312,8 @@ class WindFarmAgent:
         masks: Optional[np.ndarray] = None,
         receptivity: Optional[np.ndarray] = None,
         influence: Optional[np.ndarray] = None,
+        params: Optional[np.ndarray] = None,
+        action_hist: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Select actions given current environment state.
@@ -269,6 +333,7 @@ class WindFarmAgent:
         batch = self.batch_preparer.from_envs(
             envs, obs, wind_dirs=wind_dirs, raw_positions=raw_positions, masks=masks,
             receptivity=receptivity, influence=influence,
+            params=params, action_hist=action_hist,
         )
         
         with torch.no_grad():
@@ -279,6 +344,7 @@ class WindFarmAgent:
                 deterministic=deterministic,
                 recep_profile=batch.receptivity,
                 influence_profile=batch.influence,
+                **self._cond_kwargs(batch),
             )
         
         # Remove action_dim dimension and convert to numpy
@@ -314,6 +380,7 @@ class WindFarmAgent:
                 deterministic=deterministic,
                 recep_profile=batch.receptivity,
                 influence_profile=batch.influence,
+                **self._cond_kwargs(batch),
             )
         
         return action_tensor.squeeze(-1).cpu().numpy(), log_prob, mean_action, attn_weights

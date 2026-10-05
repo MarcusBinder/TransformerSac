@@ -53,6 +53,8 @@ class TransformerReplayBuffer:
         rotate_profiles: bool = False,
         profile_registry: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
         profile_registry_gpu_budget_mb: int = 256,
+        cond_dim: int = 0,
+        action_hist_dim: int = 0,
     ):
         """
         Args:
@@ -69,6 +71,11 @@ class TransformerReplayBuffer:
             profile_registry_gpu_budget_mb: If the padded profile registry fits under this
                 many MB (and device is CUDA), keep it GPU-resident so sample() transfers only
                 the tiny per-sample index/permutation arrays instead of the full profiles.
+            cond_dim: Stage 10 -- width of the per-token hidden-parameter vector e
+                stored per transition (_params, (capacity, max_turbines, cond_dim)
+                float32; 0 = column absent). sample() returns it as "params".
+            action_hist_dim: Stage 10 -- width of the per-token commanded-action
+                history (_action_hist; 0 = absent). sample() key "action_hist".
         """
         self.capacity = capacity
         self.device = device
@@ -89,6 +96,14 @@ class TransformerReplayBuffer:
         self._raw_positions = np.zeros((capacity, max_turbines, 2), dtype=np.float32)
         self._attention_mask = np.zeros((capacity, max_turbines), dtype=bool)
         self._wind_directions = np.zeros(capacity, dtype=np.float32)
+
+        # --- Stage 10: per-token hidden params e and commanded-action history ---
+        self.cond_dim = int(cond_dim)
+        self.action_hist_dim = int(action_hist_dim)
+        self._params = (np.zeros((capacity, max_turbines, self.cond_dim), dtype=np.float32)
+                        if self.cond_dim > 0 else None)
+        self._action_hist = (np.zeros((capacity, max_turbines, self.action_hist_dim), dtype=np.float32)
+                             if self.action_hist_dim > 0 else None)
 
         # --- Profile-specific storage ---
         if self.use_profiles:
@@ -136,6 +151,8 @@ class TransformerReplayBuffer:
             + self._rewards.nbytes + self._dones.nbytes
             + self._raw_positions.nbytes + self._attention_mask.nbytes
             + self._wind_directions.nbytes
+            + (self._params.nbytes if self._params is not None else 0)
+            + (self._action_hist.nbytes if self._action_hist is not None else 0)
         ) / 1e6
         print(f"[ReplayBuffer] Pre-allocated {alloc_mb:.1f} MB for {capacity} transitions "
               f"(max_turb={max_turbines}, obs_dim={obs_dim}, act_dim={action_dim})")
@@ -152,6 +169,8 @@ class TransformerReplayBuffer:
         wind_direction: float,
         layout_index: Optional[int] = None,
         permutation: Optional[np.ndarray] = None,
+        params: Optional[np.ndarray] = None,
+        action_hist: Optional[np.ndarray] = None,
     ) -> None:
         """
         Store a transition by writing directly into pre-allocated arrays.
@@ -167,8 +186,19 @@ class TransformerReplayBuffer:
             wind_direction: scalar
             layout_index: Index of current layout (for profile lookup)
             permutation: Turbine permutation array (for shuffled profiles)
+            params: (max_turbines, cond_dim) hidden-parameter vector e (required iff cond_dim > 0)
+            action_hist: (max_turbines, action_hist_dim) commanded-action history (iff action_hist_dim > 0)
         """
         i = self.position
+
+        if self._params is not None:
+            if params is None:
+                raise ValueError("replay buffer built with cond_dim > 0: add() needs params")
+            self._params[i] = params
+        if self._action_hist is not None:
+            if action_hist is None:
+                raise ValueError("replay buffer built with action_hist_dim > 0: add() needs action_hist")
+            self._action_hist[i] = action_hist
 
         self._obs[i] = obs
         self._next_obs[i] = next_obs
@@ -248,6 +278,10 @@ class TransformerReplayBuffer:
             "rewards": self._to_device(self._rewards[indices]).unsqueeze(-1),
             "dones": self._to_device(self._dones[indices]).unsqueeze(-1),
         }
+        if self._params is not None:
+            result["params"] = self._to_device(self._params[indices])
+        if self._action_hist is not None:
+            result["action_hist"] = self._to_device(self._action_hist[indices])
 
         # --- Vectorized profile lookup + permutation ---
         if self.use_profiles:
@@ -356,7 +390,13 @@ class TransformerReplayBuffer:
             "action_dim": np.int64(self._actions.shape[2]),
             "use_profiles": np.bool_(self.use_profiles),
             "meta_json": np.str_(json.dumps(extra_meta or {})),
+            "cond_dim": np.int64(self.cond_dim),
+            "action_hist_dim": np.int64(self.action_hist_dim),
         }
+        if self._params is not None:
+            payload["params"] = self._params[:n]
+        if self._action_hist is not None:
+            payload["action_hist"] = self._action_hist[:n]
         if self.use_profiles:
             payload["layout_indices"] = self._layout_indices[:n]
             payload["permutations"] = self._permutations[:n]
@@ -401,6 +441,15 @@ class TransformerReplayBuffer:
             _check("max_turbines", self.max_turbines)
             _check("obs_dim", self._obs.shape[2])
             _check("action_dim", self._actions.shape[2])
+            # Stage 10 columns: files written before them carry no key (= 0),
+            # so a cond-off buffer loads them and a cond-on buffer refuses.
+            for name, expected in (("cond_dim", self.cond_dim), ("action_hist_dim", self.action_hist_dim)):
+                actual = int(data[name]) if name in data.files else 0
+                if actual != expected:
+                    raise ValueError(
+                        f"Replay buffer mismatch on '{name}': saved buffer has "
+                        f"{actual}, current buffer expects {expected} ({path})"
+                    )
             if bool(data["use_profiles"]) != self.use_profiles:
                 raise ValueError(
                     f"Replay buffer mismatch on 'use_profiles': saved buffer has "
@@ -421,6 +470,10 @@ class TransformerReplayBuffer:
             self._raw_positions[:n] = data["raw_positions"]
             self._attention_mask[:n] = data["attention_mask"]
             self._wind_directions[:n] = data["wind_directions"]
+            if self._params is not None:
+                self._params[:n] = data["params"]
+            if self._action_hist is not None:
+                self._action_hist[:n] = data["action_hist"]
 
             if self.use_profiles:
                 _check("n_layouts", self._padded_recep.shape[0])

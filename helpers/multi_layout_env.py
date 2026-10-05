@@ -59,6 +59,25 @@ class LayoutConfig:
         return out
 
     @property
+    def action_history(self) -> np.ndarray:
+        """Commanded-action history ``(max_turbines, n_feat)`` in TOKEN order
+        from the inner ``ActionHistoryWrapper`` (physical order there; the
+        rows are permuted like ``turbine_positions`` and padded with zeros).
+        Raises AttributeError when the wrapper is not in the chain."""
+        env = self._current_env
+        while env is not None and not hasattr(env, "action_history"):
+            env = getattr(env, "env", None)
+        if env is None:
+            raise AttributeError(
+                "MultiLayoutEnv.action_history needs an ActionHistoryWrapper in the "
+                "wrapper chain (trainer flag --cond_action_hist)"
+            )
+        phys = np.asarray(env.action_history, dtype=np.float32)      # (n_turb, n_feat)
+        out = np.zeros((self.max_turbines, phys.shape[1]), dtype=np.float32)
+        out[: self.n_turbines] = phys[self._perm]
+        return out
+
+    @property
     def farm_params(self) -> Dict[str, float]:
         """This episode's farm-level DWM / Mann parameters (the six posterior
         keys), resolved from the base env's active DWM params over its
@@ -664,6 +683,25 @@ class MultiLayoutEnv(gym.Env):
         phys = turbine_params_matrix(tp, n)
         out = np.array([[TURB_DEFAULTS[k] for k in COND_TURB_KEYS]] * self.max_turbines, dtype=np.float64)
         out[:n] = phys[self._perm]
+        return out
+
+    @property
+    def action_history(self) -> np.ndarray:
+        """Commanded-action history ``(max_turbines, n_feat)`` in TOKEN order
+        from the inner ``ActionHistoryWrapper`` (physical order there; the
+        rows are permuted like ``turbine_positions`` and padded with zeros).
+        Raises AttributeError when the wrapper is not in the chain."""
+        env = self._current_env
+        while env is not None and not hasattr(env, "action_history"):
+            env = getattr(env, "env", None)
+        if env is None:
+            raise AttributeError(
+                "MultiLayoutEnv.action_history needs an ActionHistoryWrapper in the "
+                "wrapper chain (trainer flag --cond_action_hist)"
+            )
+        phys = np.asarray(env.action_history, dtype=np.float32)      # (n_turb, n_feat)
+        out = np.zeros((self.max_turbines, phys.shape[1]), dtype=np.float32)
+        out[: self.n_turbines] = phys[self._perm]
         return out
 
     @property

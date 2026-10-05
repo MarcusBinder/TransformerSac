@@ -147,3 +147,79 @@ def test_load_rejects_profile_mismatch(tmp_path):
 
     with pytest.raises(ValueError, match="n_layouts"):
         _make_buffer(use_profiles=True, n_layouts=3).load(path)
+
+
+# ---------------------------------------------------------------------------
+# Stage 10: params / action_hist columns
+# ---------------------------------------------------------------------------
+
+def _make_cond_buffer(capacity=50, cond_dim=12, action_hist_dim=15):
+    return TransformerReplayBuffer(
+        capacity=capacity, device=torch.device("cpu"), rotor_diameter=ROTOR_D,
+        max_turbines=MAX_TURBINES, obs_dim=OBS_DIM, action_dim=ACTION_DIM,
+        cond_dim=cond_dim, action_hist_dim=action_hist_dim,
+    )
+
+
+def _fill_cond(rb, n, seed=7):
+    rng = np.random.default_rng(seed)
+    for _ in range(n):
+        mask = np.zeros(rb.max_turbines, dtype=bool); mask[4:] = True
+        kw = {}
+        if rb.cond_dim:
+            kw["params"] = rng.standard_normal((rb.max_turbines, rb.cond_dim)).astype(np.float32)
+        if rb.action_hist_dim:
+            kw["action_hist"] = rng.standard_normal((rb.max_turbines, rb.action_hist_dim)).astype(np.float32)
+        rb.add(
+            obs=rng.standard_normal((rb.max_turbines, OBS_DIM)).astype(np.float32),
+            next_obs=rng.standard_normal((rb.max_turbines, OBS_DIM)).astype(np.float32),
+            action=rng.standard_normal((rb.max_turbines, ACTION_DIM)).astype(np.float32),
+            reward=float(rng.standard_normal()), done=False,
+            raw_positions=rng.standard_normal((rb.max_turbines, 2)).astype(np.float32),
+            attention_mask=mask, wind_direction=270.0, **kw,
+        )
+
+
+@pytest.mark.parametrize("cond_dim,ah_dim", [(12, 0), (0, 15), (12, 15)])
+def test_cond_columns_roundtrip_and_sample_keys(tmp_path, cond_dim, ah_dim):
+    rb = _make_cond_buffer(cond_dim=cond_dim, action_hist_dim=ah_dim)
+    _fill_cond(rb, 20)
+    batch = rb.sample(8)
+    assert ("params" in batch) == bool(cond_dim)
+    assert ("action_hist" in batch) == bool(ah_dim)
+    if cond_dim:
+        assert batch["params"].shape == (8, MAX_TURBINES, cond_dim) and batch["params"].dtype == torch.float32
+    if ah_dim:
+        assert batch["action_hist"].shape == (8, MAX_TURBINES, ah_dim)
+    p = tmp_path / "rb.npz"
+    rb.save(str(p))
+    rb2 = _make_cond_buffer(cond_dim=cond_dim, action_hist_dim=ah_dim)
+    rb2.load(str(p))
+    if cond_dim:
+        assert np.array_equal(rb._params[:20], rb2._params[:20])
+    if ah_dim:
+        assert np.array_equal(rb._action_hist[:20], rb2._action_hist[:20])
+
+
+def test_cond_add_requires_params_when_column_exists():
+    rb = _make_cond_buffer(cond_dim=12, action_hist_dim=0)
+    with pytest.raises(ValueError, match="params"):
+        _fill_cond(_make_cond_buffer(cond_dim=0, action_hist_dim=0), 1)  # fills fine
+        rb.add(obs=np.zeros((MAX_TURBINES, OBS_DIM), np.float32), next_obs=np.zeros((MAX_TURBINES, OBS_DIM), np.float32),
+               action=np.zeros((MAX_TURBINES, ACTION_DIM), np.float32), reward=0.0, done=False,
+               raw_positions=np.zeros((MAX_TURBINES, 2), np.float32), attention_mask=np.zeros(MAX_TURBINES, bool),
+               wind_direction=270.0)
+
+
+def test_old_file_without_cond_rejected_by_cond_buffer(tmp_path):
+    plain = _make_buffer(capacity=50)
+    _fill(plain, 10)
+    p = tmp_path / "old.npz"
+    plain.save(str(p))
+    # the plain buffer's file has no cond columns: a cond-off buffer loads it...
+    _make_buffer(capacity=50).load(str(p))
+    # ...a cond-on buffer refuses
+    with pytest.raises(ValueError, match="cond_dim"):
+        _make_cond_buffer(cond_dim=12, action_hist_dim=0).load(str(p))
+    with pytest.raises(ValueError, match="action_hist_dim"):
+        _make_cond_buffer(cond_dim=0, action_hist_dim=15).load(str(p))
