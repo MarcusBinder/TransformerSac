@@ -3363,26 +3363,39 @@ def main():
     # crash here never costs the trained actor). Re-saves the final checkpoint
     # with adapt_state_dict (+ student_actor_state_dict for the Lee arm).
     # =========================================================================
-    if args.adapt_rounds > 0:
-        from helpers.phase2_adapt import run_phase2
-        _p2 = run_phase2(
-            args, actor, envs, rb, cond_normalizer, device,
+    if args.adapt_rounds > 0 and stop_requested:
+        print("[adapt] SIGTERM already received: skipping phase 2 (RL checkpoint saved; "
+              "recover with --adapt_only --resume_checkpoint).")
+    elif args.adapt_rounds > 0:
+        from helpers.phase2_adapt import run_phase2, run_phase2_guarded
+
+        def _save_adapt(adapt_sd, _metrics, student_sd=None):
+            if args.save_model:
+                save_checkpoint(
+                    actor, qf1, qf2, actor_optimizer, q_optimizer,
+                    global_step, run_name, args, log_alpha, alpha_optimizer,
+                    tqc_critic=tqc_critic,
+                    tqc_critic_target=tqc_critic_target,
+                    qf1_target=qf1_target, qf2_target=qf2_target,
+                    obs_norm_state=obs_normalizer.state_dict() if obs_normalizer is not None else None,
+                    adapt_state_dict=adapt_sd,
+                    student_actor_state_dict=student_sd,
+                )
+
+        # Guarded: a phase-2 exception never costs the RL checkpoint saved
+        # above (the job exits 0 and the launcher marks the seed done); phi is
+        # re-saved after every round and the SIGTERM flag ends the phase early.
+        _p2 = run_phase2_guarded(
+            run_phase2,
+            args=args, actor=actor, envs=envs, rb=rb, cond_normalizer=cond_normalizer, device=device,
             trunk_kwargs=common_kwargs, rotor_diameter=rotor_diameter, use_profiles=use_profiles,
             obs_normalizer=obs_normalizer, wd_attr=wd_source_attr, profile_registry=profile_registry,
             n_turbines_max=n_turbines_max, obs_dim=obs_dim_per_turbine, action_dim=action_dim_per_turbine,
             global_step=global_step, writer=writer,
+            save_fn=_save_adapt, stop_fn=lambda: stop_requested,
         )
-        if args.save_model:
-            save_checkpoint(
-                actor, qf1, qf2, actor_optimizer, q_optimizer,
-                global_step, run_name, args, log_alpha, alpha_optimizer,
-                tqc_critic=tqc_critic,
-                tqc_critic_target=tqc_critic_target,
-                qf1_target=qf1_target, qf2_target=qf2_target,
-                obs_norm_state=obs_normalizer.state_dict() if obs_normalizer is not None else None,
-                adapt_state_dict=_p2["adapt_state_dict"],
-                student_actor_state_dict=_p2["student_actor_state_dict"],
-            )
+        if _p2 is not None:
+            _save_adapt(_p2["adapt_state_dict"], _p2["metrics"], _p2["student_actor_state_dict"])
 
     print("\n" + "=" * 60)
     print("Training finished!")

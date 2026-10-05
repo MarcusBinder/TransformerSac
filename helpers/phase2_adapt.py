@@ -194,11 +194,41 @@ def _uncompile(module: nn.Module) -> None:
         del module.__dict__["forward"]
 
 
+def run_phase2_guarded(fn, **kwargs):
+    """Run phase 2 so that an exception never costs the already-saved RL
+    checkpoint: logs the traceback loudly, returns None (the trainer then exits
+    0 and the launcher marks the seed done; recovery = ``--adapt_only
+    --resume_checkpoint <final ckpt>``)."""
+    import traceback
+    try:
+        return fn(**kwargs)
+    except Exception:  # noqa: BLE001 - phase 2 is optional post-processing
+        print("\n[adapt] PHASE 2 FAILED (the RL checkpoint is already saved). Traceback:", flush=True)
+        traceback.print_exc()
+        print("[adapt] recover with: --adapt_only --resume_checkpoint runs/<run>/checkpoints/step_<final>.pt "
+              "(same flags, new --exp_name)", flush=True)
+        return None
+
+
+def _adapt_sd(adapt: nn.Module) -> Dict[str, torch.Tensor]:
+    return {k: v.detach().cpu() for k, v in adapt.state_dict().items()}
+
+
 def run_phase2(args, actor: nn.Module, envs, rb, cond_normalizer, device: torch.device,
                *, trunk_kwargs: dict, rotor_diameter: float, use_profiles: bool,
                obs_normalizer, wd_attr: str, profile_registry, n_turbines_max: int,
-               obs_dim: int, action_dim: int, global_step: int, writer=None) -> Dict[str, Any]:
-    """Train phi after the RL phase; returns adapt / student state dicts + metrics."""
+               obs_dim: int, action_dim: int, global_step: int, writer=None,
+               save_fn=None, stop_fn=None) -> Dict[str, Any]:
+    """Train phi after the RL phase; returns adapt / student state dicts + metrics.
+
+    ``save_fn(adapt_state_dict, metrics)`` is called after EVERY round (a
+    SIGTERM mid-phase keeps the last fitted phi); ``stop_fn() -> bool`` is
+    polled after each round (the trainer's SIGTERM flag) and ends the phase
+    early with ``metrics["stopped_early"] = True``. Gate-2 metrics per round:
+    ``heldout_*`` = phi evaluated on the round's NEW pairs before it is fitted
+    on them (true held-out), ``mse`` / ``rel_err`` / ``r2`` = after the fit on
+    the aggregate (held-in).
+    """
     from helpers.action_history import N_FEAT_DEFAULT
     from helpers.agent import WindFarmAgent
     from helpers.helper_funcs import (
@@ -249,13 +279,14 @@ def run_phase2(args, actor: nn.Module, envs, rb, cond_normalizer, device: torch.
 
     # (b) DAgger rounds with z_hat in the loop on the TRAINING envs
     cap = max(1, int(args.adapt_rounds) * int(args.num_envs) * int(args.adapt_round_steps))
-    adapt_rb = TransformerReplayBuffer(
-        capacity=cap, device=device, rotor_diameter=rotor_diameter, max_turbines=n_turbines_max,
-        obs_dim=obs_dim, action_dim=action_dim, use_wind_relative=args.use_wind_relative_pos,
-        use_profiles=use_profiles, rotate_profiles=args.rotate_profiles,
-        profile_registry=profile_registry, cond_dim=cond_normalizer.cond_dim,
-        action_hist_dim=N_FEAT_DEFAULT,
-    )
+    round_cap = max(1, int(args.num_envs) * int(args.adapt_round_steps))
+    _rb_kw = dict(device=device, rotor_diameter=rotor_diameter, max_turbines=n_turbines_max,
+                  obs_dim=obs_dim, action_dim=action_dim, use_wind_relative=args.use_wind_relative_pos,
+                  use_profiles=use_profiles, rotate_profiles=args.rotate_profiles,
+                  profile_registry=profile_registry, cond_dim=cond_normalizer.cond_dim,
+                  action_hist_dim=N_FEAT_DEFAULT)
+    adapt_rb = TransformerReplayBuffer(capacity=cap, **_rb_kw)      # DAgger aggregate
+    round_rb = TransformerReplayBuffer(capacity=round_cap, **_rb_kw)  # this round only (held-out probe)
     agent_phi = WindFarmAgent(
         actor=student if student is not None else actor, device=device, rotor_diameter=rotor_diameter,
         use_wind_relative=args.use_wind_relative_pos, use_profiles=use_profiles,
@@ -265,8 +296,10 @@ def run_phase2(args, actor: nn.Module, envs, rb, cond_normalizer, device: torch.
     fetcher = CondFetcher(envs.env, cond_normalizer)
     obs, _ = envs.reset(seed=int(args.seed) + 7_000_000)
     prev_dones = np.ones(args.num_envs, dtype=bool)
+    metrics["stopped_early"] = False
     for r in range(int(args.adapt_rounds)):
         adapt.eval()
+        round_rb.position = 0; round_rb.size = 0
         for t in range(int(args.adapt_round_steps)):
             # fetch block (all IPC before the step; every stored field captured BEFORE the step)
             wind_dirs = get_env_wind_directions(envs, attr=wd_attr)
@@ -289,39 +322,57 @@ def run_phase2(args, actor: nn.Module, envs, rb, cond_normalizer, device: torch.
             next_obs, rewards, term, trunc, infos = envs.step(actions)
             prev_dones = np.logical_or(term, trunc)
             for i in range(args.num_envs):
-                adapt_rb.add(
-                    obs[i], next_obs[i], np.asarray(actions[i]).reshape(-1, action_dim), float(rewards[i]),
-                    bool(prev_dones[i]), raw_positions[i], masks[i], float(wind_dirs[i]),
+                _add = dict(
+                    obs=obs[i], next_obs=next_obs[i], action=np.asarray(actions[i]).reshape(-1, action_dim),
+                    reward=float(rewards[i]), done=bool(prev_dones[i]), raw_positions=raw_positions[i],
+                    attention_mask=masks[i], wind_direction=float(wind_dirs[i]),
                     layout_index=(layout_idx[i] if layout_idx is not None else None),
                     permutation=(perms[i] if perms is not None else None),
                     params=e[i], action_hist=hist[i],
                 )
+                adapt_rb.add(**_add)
+                round_rb.add(**_add)
             obs = next_obs
+        # held-out probe: phi has not been fitted on this round's pairs yet
+        heldout = identifiability_table(adapt, actor, ReplayBatchSource(round_rb, args.batch_size, obs_normalizer),
+                                        n_batches=8, keys=keys)
         src = ReplayBatchSource(adapt_rb, args.batch_size, obs_normalizer)
         hist_fit = fit_adaptation(adapt, actor, src, args.adapt_fit_steps, opt, args.phase2_loss, device,
                                   student=student, log_every=max(1, args.adapt_fit_steps // 5),
                                   writer=writer, tag="adapt/fit",
                                   step_offset=r * args.adapt_fit_steps)
         table = identifiability_table(adapt, actor, src, n_batches=8, keys=keys)
-        rec = {"round": r + 1, "n_pairs": len(adapt_rb), "fit": hist_fit, **table}
+        rec = {"round": r + 1, "n_pairs": len(adapt_rb), "fit": hist_fit, **table,
+               "heldout_mse": heldout["mse"], "heldout_rel_err": heldout["rel_err"], "heldout_r2": heldout["r2"]}
         metrics["rounds"].append(rec)
         print(f"[adapt] round {r + 1}/{args.adapt_rounds}: {len(adapt_rb)} pairs, "
-              f"fit mse {hist_fit[-1]['mse']:.4g}, held-in z mse {table['mse']:.4g}, "
-              f"rel err per dim {np.array2string(table['rel_err'], precision=2)}")
+              f"held-OUT z mse {heldout['mse']:.4g} (pre-fit, new pairs), fit mse {hist_fit[-1]['mse']:.4g}, "
+              f"held-in z mse {table['mse']:.4g}, held-out rel err per dim "
+              f"{np.array2string(heldout['rel_err'], precision=2)}")
         if writer is not None:
             writer.add_scalar("adapt/mse_round", table["mse"], r + 1)
+            writer.add_scalar("adapt/heldout_mse_round", heldout["mse"], r + 1)
             for k, v in table["r2"].items():
                 if np.isfinite(v):
                     writer.add_scalar(f"adapt/r2_{k}", v, r + 1)
+            for k, v in heldout["r2"].items():
+                if np.isfinite(v):
+                    writer.add_scalar(f"adapt/heldout_r2_{k}", v, r + 1)
             for j, v in enumerate(table["rel_err"]):
                 writer.add_scalar(f"adapt/relerr_dim{j}", float(v), r + 1)
+        if save_fn is not None:
+            save_fn(_adapt_sd(adapt), metrics)
+        if stop_fn is not None and stop_fn():
+            print(f"[adapt] stop requested after round {r + 1}: ending phase 2 early (phi saved)")
+            metrics["stopped_early"] = True
+            break
     if metrics["rounds"]:
-        r2 = metrics["rounds"][-1]["r2"]
-        print("[adapt] identifiability (linear probe R^2 of e from z_hat, last round):")
+        r2 = metrics["rounds"][-1]["heldout_r2"]
+        print("[adapt] identifiability (held-out linear probe R^2 of e from z_hat, last round):")
         print("        " + "  ".join(f"{k}={v:.2f}" if np.isfinite(v) else f"{k}=n/a" for k, v in r2.items()))
     print(f"[adapt] phase 2 done in {(time.time() - t0) / 60:.1f} min")
     return {
-        "adapt_state_dict": {k: v.detach().cpu() for k, v in adapt.state_dict().items()},
+        "adapt_state_dict": _adapt_sd(adapt),
         "student_actor_state_dict": ({k: v.detach().cpu() for k, v in student.state_dict().items()}
                                      if student is not None else None),
         "metrics": metrics,

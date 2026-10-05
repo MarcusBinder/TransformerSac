@@ -38,53 +38,6 @@ class LayoutConfig:
     def has_profiles(self) -> bool: # If we have one, we have both
         return self.receptivity_profiles is not None
     
-    # ------------------------------------------------------------------
-    # Hidden-parameter exposure in TOKEN order (Stage 10: RMA / UP-OSI)
-    # ------------------------------------------------------------------
-    @property
-    def turbine_params_tok(self) -> np.ndarray:
-        """Per-turbine turbine-model parameters ``(max_turbines, 6)``, PHYSICAL
-        units, rows in TOKEN order (permuted by the current shuffle like
-        ``turbine_positions``), padded rows = spec defaults. Column order =
-        ``helpers.param_cond.COND_TURB_KEYS`` (WindGym TURBINE_PARAM_SPECS).
-        Before the first reset (``turbine_params`` None) every row is the
-        default vector. Read through ``AsyncVectorEnv.get_attr``."""
-        from helpers.param_cond import COND_TURB_KEYS, TURB_DEFAULTS, turbine_params_matrix
-        base = self._get_base_env()
-        tp = getattr(base, "turbine_params", None)
-        n = self.n_turbines
-        phys = turbine_params_matrix(tp, n)
-        out = np.array([[TURB_DEFAULTS[k] for k in COND_TURB_KEYS]] * self.max_turbines, dtype=np.float64)
-        out[:n] = phys[self._perm]
-        return out
-
-    @property
-    def action_history(self) -> np.ndarray:
-        """Commanded-action history ``(max_turbines, n_feat)`` in TOKEN order
-        from the inner ``ActionHistoryWrapper`` (physical order there; the
-        rows are permuted like ``turbine_positions`` and padded with zeros).
-        Raises AttributeError when the wrapper is not in the chain."""
-        env = self._current_env
-        while env is not None and not hasattr(env, "action_history"):
-            env = getattr(env, "env", None)
-        if env is None:
-            raise AttributeError(
-                "MultiLayoutEnv.action_history needs an ActionHistoryWrapper in the "
-                "wrapper chain (trainer flag --cond_action_hist)"
-            )
-        phys = np.asarray(env.action_history, dtype=np.float32)      # (n_turb, n_feat)
-        out = np.zeros((self.max_turbines, phys.shape[1]), dtype=np.float32)
-        out[: self.n_turbines] = phys[self._perm]
-        return out
-
-    @property
-    def farm_params(self) -> Dict[str, float]:
-        """This episode's farm-level DWM / Mann parameters (the six posterior
-        keys), resolved from the base env's active DWM params over its
-        ``dwm_setup`` defaults; see ``helpers.param_cond.farm_params_from_base_env``."""
-        from helpers.param_cond import farm_params_from_base_env
-        return farm_params_from_base_env(self._get_base_env())
-
     @property
     def n_profile_directions(self) -> int:
         if self.receptivity_profiles is None:
