@@ -209,6 +209,19 @@ from networks import (
 # MAIN TRAINING SCRIPT
 # =============================================================================
 
+def in_training_eval_enabled(args) -> bool:
+    """True iff the training loop can ever call run_all_evaluations().
+
+    Mirrors the two call sites exactly: the initial eval (``--eval_initial``)
+    and the periodic one, which first fires when ``global_step >=
+    args.eval_interval`` and therefore never fires if that is past
+    ``total_timesteps``. When False the PolicyEvaluators (3 eval specs x
+    num_envs resident AsyncVectorEnv workers, ~170 GB per trainer on LUMI)
+    are not built at all; see the "[eval] in-training eval off" banner.
+    """
+    return bool(args.eval_initial) or (args.eval_interval <= args.total_timesteps)
+
+
 def main():
     """Main training function."""
     
@@ -1059,58 +1072,19 @@ def main():
 
     # Create policy evaluators — one per eval wd schedule. Every evaluator shares the
     # same eval_seed, so the schedules are compared on PAIRED episodes.
-    evaluators = [
-        PolicyEvaluator(
-            agent=None,  # Will be set after actor is created
-            eval_layouts=eval_layout_names,
-            env_factory=_factory,
-            combined_wrapper=combined_wrapper,
-            num_envs=args.num_envs,
-            num_eval_steps=args.num_eval_steps,
-            num_eval_episodes=args.num_eval_episodes,
-            device=device,
-            rotor_diameter=rotor_diameter,
-            wind_turbine=wind_turbine,
-            seed=args.eval_seed,
-            max_turbines=n_turbines_max,
-            deterministic=args.eval_deterministic,
-            use_profiles=use_profiles,  # NEW: Pass profile setting
-            n_profile_directions=args.n_profile_directions,  # NEW: Pass profile resolution
-            profile_source=args.profile_source,
-            profile_sigma_smooth=args.profile_sigma_smooth,
-            profile_geom_mode=args.profile_geom_mode,
-        )
-        for _factory in eval_env_factories
-    ]
-
-    # FORK SAFETY: create every evaluator's AsyncVectorEnv NOW — before the
-    # networks initialize the GPU (HIP/CUDA context) and before any gradient
-    # burst spins up torch/OMP threads — and keep them RESIDENT for the whole
-    # run. Lazily forking eval workers at the first mid-training eval is a
-    # fork-after-threads deadlock: the child inherits a lock some torch thread
-    # holds and hangs in futex_do_wait while the parent blocks on the worker
-    # pipe (observed on local CPU and on LUMI/ROCm, where it froze all six T3
-    # runs at their first 50k eval for 10+ hours). The training envs never
-    # deadlock for exactly this reason — they fork at startup. Resident cost
-    # is num_specs x num_envs idle workers; the eval layouts are capped small
-    # (square_2x2), so this is noise next to the 30 training envs.
-    # Stage 10 --eval_dr: a second evaluator per eval spec under the TRAINING
-    # DR (seeded DWMRandomizationWrapper outside MultiLayoutEnv, same sampler
-    # recipe as make_env_fn), metric prefix eval_dr/. Gate 1: Expert (true e)
-    # vs Robust under randomised params. Built eagerly like the others.
+    # Built ONLY when an evaluation can ever run (in_training_eval_enabled):
+    # with eval off (LUMI Stage 10, --eval_interval 1e9) the resident eval
+    # workers below were ~90 idle processes / ~170 GB per trainer for nothing.
+    eval_enabled = in_training_eval_enabled(args)
+    evaluators = []
     eval_dr_evaluators = []
-    if args.eval_dr:
-        def _eval_dr_sampler_factory():
-            return combine_samplers(
-                make_dr_sampler(_dr_posterior, keys=tuple(args.dr_keys))
-                if _dr_posterior is not None else None,
-                make_turbine_sampler(_turb_ranges, _n_turb_dr,
-                                     per_turbine=args.turb_dr_per_turbine)
-                if _turb_ranges else None,
-            )
-        eval_dr_evaluators = [
+    if not eval_enabled:
+        print(f"[eval] in-training eval off (eval_interval {args.eval_interval} > "
+              f"total {args.total_timesteps}, no --eval_initial): no eval envs built")
+    if eval_enabled:
+        evaluators = [
             PolicyEvaluator(
-                agent=None,
+                agent=None,  # Will be set after actor is created
                 eval_layouts=eval_layout_names,
                 env_factory=_factory,
                 combined_wrapper=combined_wrapper,
@@ -1120,23 +1094,71 @@ def main():
                 device=device,
                 rotor_diameter=rotor_diameter,
                 wind_turbine=wind_turbine,
-                seed=args.eval_seed + 500_000,
+                seed=args.eval_seed,
                 max_turbines=n_turbines_max,
                 deterministic=args.eval_deterministic,
-                use_profiles=use_profiles,
-                n_profile_directions=args.n_profile_directions,
+                use_profiles=use_profiles,  # NEW: Pass profile setting
+                n_profile_directions=args.n_profile_directions,  # NEW: Pass profile resolution
                 profile_source=args.profile_source,
                 profile_sigma_smooth=args.profile_sigma_smooth,
                 profile_geom_mode=args.profile_geom_mode,
-                dr_sampler_factory=_eval_dr_sampler_factory,
-                metrics_prefix="eval_dr",
             )
             for _factory in eval_env_factories
         ]
-        print(f"[eval_dr] {len(eval_dr_evaluators)} evaluator(s) under the training DR (prefix eval_dr/)")
 
-    for _ev in evaluators + eval_dr_evaluators:
-        _ = _ev.eval_envs  # property; triggers AsyncVectorEnv creation
+        # FORK SAFETY: create every evaluator's AsyncVectorEnv NOW — before the
+        # networks initialize the GPU (HIP/CUDA context) and before any gradient
+        # burst spins up torch/OMP threads — and keep them RESIDENT for the whole
+        # run. Lazily forking eval workers at the first mid-training eval is a
+        # fork-after-threads deadlock: the child inherits a lock some torch thread
+        # holds and hangs in futex_do_wait while the parent blocks on the worker
+        # pipe (observed on local CPU and on LUMI/ROCm, where it froze all six T3
+        # runs at their first 50k eval for 10+ hours). The training envs never
+        # deadlock for exactly this reason — they fork at startup. Resident cost
+        # is num_specs x num_envs idle workers; the eval layouts are capped small
+        # (square_2x2), so this is noise next to the 30 training envs.
+        # Stage 10 --eval_dr: a second evaluator per eval spec under the TRAINING
+        # DR (seeded DWMRandomizationWrapper outside MultiLayoutEnv, same sampler
+        # recipe as make_env_fn), metric prefix eval_dr/. Gate 1: Expert (true e)
+        # vs Robust under randomised params. Built eagerly like the others.
+        if args.eval_dr:
+            def _eval_dr_sampler_factory():
+                return combine_samplers(
+                    make_dr_sampler(_dr_posterior, keys=tuple(args.dr_keys))
+                    if _dr_posterior is not None else None,
+                    make_turbine_sampler(_turb_ranges, _n_turb_dr,
+                                         per_turbine=args.turb_dr_per_turbine)
+                    if _turb_ranges else None,
+                )
+            eval_dr_evaluators = [
+                PolicyEvaluator(
+                    agent=None,
+                    eval_layouts=eval_layout_names,
+                    env_factory=_factory,
+                    combined_wrapper=combined_wrapper,
+                    num_envs=args.num_envs,
+                    num_eval_steps=args.num_eval_steps,
+                    num_eval_episodes=args.num_eval_episodes,
+                    device=device,
+                    rotor_diameter=rotor_diameter,
+                    wind_turbine=wind_turbine,
+                    seed=args.eval_seed + 500_000,
+                    max_turbines=n_turbines_max,
+                    deterministic=args.eval_deterministic,
+                    use_profiles=use_profiles,
+                    n_profile_directions=args.n_profile_directions,
+                    profile_source=args.profile_source,
+                    profile_sigma_smooth=args.profile_sigma_smooth,
+                    profile_geom_mode=args.profile_geom_mode,
+                    dr_sampler_factory=_eval_dr_sampler_factory,
+                    metrics_prefix="eval_dr",
+                )
+                for _factory in eval_env_factories
+            ]
+            print(f"[eval_dr] {len(eval_dr_evaluators)} evaluator(s) under the training DR (prefix eval_dr/)")
+
+        for _ev in evaluators + eval_dr_evaluators:
+            _ = _ev.eval_envs  # property; triggers AsyncVectorEnv creation
 
     def run_all_evaluations():
         """Evaluate on every eval wd schedule.
