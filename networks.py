@@ -400,6 +400,7 @@ class TransformerEncoderLayer(nn.Module):
         dropout: float = 0.0,
         attn_logit_scale: str = "none",   # v5: "none" | "logn"
         attn_softmax: str = "softmax",    # v5: "softmax" | "entmax15"
+        film_dim: int = 0,                # Stage 10: per-token FiLM from a cond vector (0 = off)
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -408,6 +409,20 @@ class TransformerEncoderLayer(nn.Module):
         # Pre-norm layers
         self.norm1 = nn.LayerNorm(embed_dim)
         self.norm2 = nn.LayerNorm(embed_dim)
+
+        # Stage 10 (cond_mode film): zero-initialised per-token FiLM on the two
+        # pre-norm outputs, x * (1 + gamma) + beta with (gamma, beta) =
+        # film(cond). Zero init makes the layer forward-identical to the plain
+        # layer at construction (an identity-preserving warm start from a
+        # nominal checkpoint with strict=False). Only built when film_dim > 0,
+        # so the cond-off state_dict is unchanged.
+        self.film_dim = int(film_dim)
+        if self.film_dim > 0:
+            self.film1 = nn.Linear(self.film_dim, 2 * embed_dim)
+            self.film2 = nn.Linear(self.film_dim, 2 * embed_dim)
+            for lin in (self.film1, self.film2):
+                nn.init.zeros_(lin.weight)
+                nn.init.zeros_(lin.bias)
 
         # Multi-head attention (custom: supports log-N scaling + local masking;
         # identical to nn.MultiheadAttention when flags are off)
@@ -436,6 +451,7 @@ class TransformerEncoderLayer(nn.Module):
         attn_bias: Optional[torch.Tensor] = None,
         local_allow: Optional[torch.Tensor] = None,  # v5: (batch, n, n) bool, True = allowed
         need_weights: bool = False,
+        cond: Optional[torch.Tensor] = None,  # Stage 10: (batch, n_tokens, film_dim) for FiLM
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -444,6 +460,7 @@ class TransformerEncoderLayer(nn.Module):
             attn_bias: (batch, n_heads, n_tokens, n_tokens) optional bias added
                        to attention logits (for relative positional encoding)
             local_allow: (batch, n, n) optional bool mask; True = query may attend key
+            cond: (batch, n_tokens, film_dim) per-token conditioning for FiLM (film_dim > 0 only)
 
         Returns:
             x: Transformed tensor, same shape as input
@@ -452,6 +469,9 @@ class TransformerEncoderLayer(nn.Module):
         # Self-attention with pre-norm. The custom attention takes the (B,H,N,N) bias
         # directly (no reshape) and applies optional log-N scaling + local masking.
         x_norm = self.norm1(x)
+        if self.film_dim > 0:
+            g, b = self.film1(cond).chunk(2, dim=-1)
+            x_norm = x_norm * (1 + g) + b
         attn_out, attn_weights = self.attn(
             x_norm,
             key_padding_mask=key_padding_mask,
@@ -462,7 +482,11 @@ class TransformerEncoderLayer(nn.Module):
         x = x + attn_out
 
         # FFN with pre-norm
-        x = x + self.mlp(self.norm2(x))
+        x_norm = self.norm2(x)
+        if self.film_dim > 0:
+            g, b = self.film2(cond).chunk(2, dim=-1)
+            x_norm = x_norm * (1 + g) + b
+        x = x + self.mlp(x_norm)
 
         return x, attn_weights
 
@@ -490,11 +514,13 @@ class TransformerEncoder(nn.Module):
         dropout: float = 0.0,
         attn_logit_scale: str = "none",   # v5
         attn_softmax: str = "softmax",    # v5
+        film_dim: int = 0,                # Stage 10 FiLM conditioning (0 = off)
     ):
         super().__init__()
         self.layers = nn.ModuleList([
             TransformerEncoderLayer(embed_dim, num_heads, mlp_ratio, dropout,
-                                    attn_logit_scale=attn_logit_scale, attn_softmax=attn_softmax)
+                                    attn_logit_scale=attn_logit_scale, attn_softmax=attn_softmax,
+                                    film_dim=film_dim)
             for _ in range(num_layers)
         ])
         self.norm = nn.LayerNorm(embed_dim)  # Final layer norm
@@ -506,6 +532,7 @@ class TransformerEncoder(nn.Module):
         attn_bias: Optional[torch.Tensor] = None,
         local_allow: Optional[torch.Tensor] = None,  # v5
         need_weights: bool = False,
+        cond: Optional[torch.Tensor] = None,  # Stage 10 FiLM
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Args:
@@ -514,6 +541,7 @@ class TransformerEncoder(nn.Module):
             attn_bias: (batch, n_heads, n_tokens, n_tokens) optional attention bias
             local_allow: (batch, n, n) optional bool local-attention mask (same for all layers)
             need_weights: If True, return attention weights (expensive). Default False.
+            cond: (batch, n_tokens, film_dim) FiLM conditioning (film_dim > 0 only)
 
         Returns:
             x: Transformed tensor
@@ -523,7 +551,8 @@ class TransformerEncoder(nn.Module):
 
         for layer in self.layers:
             x, attn_weights = layer(x, key_padding_mask, attn_bias,
-                                    local_allow=local_allow, need_weights=need_weights)
+                                    local_allow=local_allow, need_weights=need_weights,
+                                    cond=cond)
             if need_weights:
                 all_attn_weights.append(attn_weights)
 
@@ -631,6 +660,68 @@ def _read_attn_cfg(args):
     )
 
 
+COND_IN_DIM_DEFAULT = 12   # helpers.param_cond.COND_DIM (6 turbine + 6 farm params)
+COND_SOURCES = ("none", "turbine", "turbine_farm")
+COND_MODES = ("concat", "film")
+COND_CRITIC_MODES = ("raw", "none")
+
+
+def _read_cond_cfg(args, cond_source=None, cond_latent_dim=None, cond_mode=None,
+                   cond_critic=None, cond_in_dim=None):
+    """Stage-10 conditioning flags: explicit kwargs win, else args, else off.
+
+    Returns (source, latent_dim, mode, critic_mode, in_dim). Old checkpoints
+    have no cond_* keys -> ("none", 0, "concat", "raw", 12) = today's networks.
+    """
+    g = (lambda k, d: getattr(args, k, d)) if args is not None else (lambda k, d: d)
+    source = cond_source if cond_source is not None else g("cond_source", "none")
+    latent = int(cond_latent_dim if cond_latent_dim is not None else g("cond_latent_dim", 0))
+    mode = cond_mode if cond_mode is not None else g("cond_mode", "concat")
+    critic = cond_critic if cond_critic is not None else g("cond_critic", "raw")
+    in_dim = int(cond_in_dim if cond_in_dim is not None else g("cond_in_dim", COND_IN_DIM_DEFAULT))
+    if source not in COND_SOURCES:
+        raise ValueError(f"cond_source must be one of {COND_SOURCES}, got {source!r}")
+    if mode not in COND_MODES:
+        raise ValueError(f"cond_mode must be one of {COND_MODES}, got {mode!r}")
+    if critic not in COND_CRITIC_MODES:
+        raise ValueError(f"cond_critic must be one of {COND_CRITIC_MODES}, got {critic!r}")
+    if latent < 0:
+        raise ValueError("cond_latent_dim must be >= 0")
+    return source, latent, mode, critic, in_dim
+
+
+class ParamEncoder(nn.Module):
+    """mu: hidden parameter vector e (…, cond_in_dim) -> latent z (…, latent_dim).
+
+    RMA's env-factor encoder. Applied per token (shared across turbines), so
+    the latent is equivariant like everything else. dz = 0 is handled by the
+    caller as the identity (UP-OSI: the policy sees raw e)."""
+
+    def __init__(self, cond_in_dim: int, latent_dim: int, hidden: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(cond_in_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, latent_dim),
+        )
+        self.out_dim = latent_dim
+
+    def forward(self, e: torch.Tensor) -> torch.Tensor:
+        return self.net(e)
+
+
+def masked_mse(pred: torch.Tensor, target: torch.Tensor,
+               key_padding_mask: Optional[torch.Tensor]) -> torch.Tensor:
+    """Mean squared error over REAL tokens only (mask True = padding), averaged
+    over the last dim too. Used by the phase-2 adaptation fit."""
+    err = (pred - target) ** 2
+    if key_padding_mask is None:
+        return err.mean()
+    valid = (~key_padding_mask).unsqueeze(-1).to(err.dtype)
+    n = valid.sum() * err.shape[-1]
+    return (err * valid).sum() / n.clamp(min=1.0)
+
+
 LOG_STD_MAX = 2
 LOG_STD_MIN = -5
 
@@ -679,6 +770,11 @@ class TransformerActor(nn.Module):
         shared_recep_encoder: Optional[nn.Module] = None,
         shared_influence_encoder: Optional[nn.Module] = None,
         args: Optional[Args] = None,  # For flexible encoder kwargs (e.g. Fourier n_harmonics, MultiRes scales
+        # Stage 10 parameter conditioning (None -> read from args; defaults = off)
+        cond_source: Optional[str] = None,
+        cond_latent_dim: Optional[int] = None,
+        cond_mode: Optional[str] = None,
+        cond_in_dim: Optional[int] = None,
     ):
         """
         Args:
@@ -703,6 +799,16 @@ class TransformerActor(nn.Module):
 
         self.obs_dim_per_turbine = obs_dim_per_turbine
         self.action_dim_per_turbine = action_dim_per_turbine
+        # Stage 10 conditioning: cond_on => forward_trunk REQUIRES cond (the
+        # hidden-parameter vector e, (batch, n_turb, cond_in_dim), or a latent
+        # when cond_is_latent). cond_dim = what reaches the trunk: the latent
+        # size dz, or cond_in_dim when dz == 0 (identity encoder, UP-OSI).
+        (self.cond_source, self.cond_latent_dim, self.cond_mode,
+         _cc, self.cond_in_dim) = _read_cond_cfg(
+            args, cond_source, cond_latent_dim, cond_mode, None, cond_in_dim)
+        self.cond_on = self.cond_source != "none"
+        self.cond_dim = (self.cond_latent_dim or self.cond_in_dim) if self.cond_on else 0
+        self.param_encoder: Optional[nn.Module] = None   # created after fc_logstd (seeded-init order)
         # Entropy aggregation over turbines for the SAC log-prob ("sum" | "mean").
         # "mean" keeps per-turbine entropy pressure size-invariant (see config.entropy_agg).
         self.entropy_agg = getattr(args, "entropy_agg", "sum") if args is not None else "sum"
@@ -773,14 +879,20 @@ class TransformerActor(nn.Module):
         # Observation encoder (shared across turbines). change_wd_4: "per_sensor"
         # swaps in one small MLP per sensor group (see PerSensorObsEncoder);
         # forward() is untouched because the input/output shapes are identical.
+        # Stage 10 concat: z is appended to each token's obs features, so only
+        # the first Linear's input width changes (same state_dict keys).
+        concat_dim = self.cond_dim if (self.cond_on and self.cond_mode == "concat") else 0
+        film_dim = self.cond_dim if (self.cond_on and self.cond_mode == "film") else 0
         if getattr(args, "obs_encoder_mode", "shared") == "per_sensor":
+            if concat_dim:
+                raise ValueError("cond_mode concat is incompatible with --obs_encoder_mode per_sensor (use film)")
             self.obs_encoder = PerSensorObsEncoder(
                 obs_dim_per_turbine, embed_dim,
                 history_length=int(getattr(args, "history_length")),
             )
         else:
             self.obs_encoder = nn.Sequential(
-                nn.Linear(obs_dim_per_turbine, embed_dim),
+                nn.Linear(obs_dim_per_turbine + concat_dim, embed_dim),
                 nn.ReLU(),
                 nn.Linear(embed_dim, embed_dim),
             )
@@ -797,16 +909,47 @@ class TransformerActor(nn.Module):
          self.attn_local_k, self.attn_local_cone_deg) = _read_attn_cfg(args)
         self.transformer = TransformerEncoder(
             embed_dim, num_heads, num_layers, mlp_ratio, dropout,
-            attn_logit_scale=_ls, attn_softmax=_sm,
+            attn_logit_scale=_ls, attn_softmax=_sm, film_dim=film_dim,
         )
 
         # Action heads (shared across turbines)
         self.fc_mean = nn.Linear(embed_dim, action_dim_per_turbine)
         self.fc_logstd = nn.Linear(embed_dim, action_dim_per_turbine)
 
+        # Stage 10: parameter encoder mu AFTER the existing modules so the
+        # seeded init of everything above is unchanged (dz = 0 -> identity).
+        if self.cond_on and self.cond_latent_dim > 0:
+            self.param_encoder = ParamEncoder(self.cond_in_dim, self.cond_latent_dim)
+
         # Action scaling
         self.register_buffer("action_scale", torch.tensor(action_scale, dtype=torch.float32))
         self.register_buffer("action_bias_val", torch.tensor(action_bias, dtype=torch.float32))
+
+    def encode_cond(self, e: torch.Tensor) -> torch.Tensor:
+        """z = mu(e) (identity when cond_latent_dim == 0). Phase 2 regresses this."""
+        if self.param_encoder is None:
+            return e
+        return self.param_encoder(e)
+
+    def _resolve_cond(self, cond: Optional[torch.Tensor], cond_is_latent: bool) -> Optional[torch.Tensor]:
+        """Check the cond contract and return z (or None when cond is off).
+
+        cond is ALWAYS a tensor when the source is on and ALWAYS None when
+        off; mixing the two is a hard error (a stray None would also be a
+        second torch.compile graph, see get_action)."""
+        if not self.cond_on:
+            if cond is not None:
+                raise ValueError("cond passed to an actor whose cond_source is 'none'")
+            return None
+        if cond is None:
+            raise ValueError(f"cond_source={self.cond_source!r} requires cond (batch, n_turb, {self.cond_in_dim})")
+        if cond_is_latent or self.param_encoder is None:
+            if cond.shape[-1] != self.cond_dim:
+                raise ValueError(f"cond latent must have {self.cond_dim} features, got {cond.shape[-1]}")
+            return cond
+        if cond.shape[-1] != self.cond_in_dim:
+            raise ValueError(f"cond must have {self.cond_in_dim} features, got {cond.shape[-1]}")
+        return self.param_encoder(cond)
 
     def forward_trunk(
         self,
@@ -816,6 +959,8 @@ class TransformerActor(nn.Module):
         recep_profile: Optional[torch.Tensor] = None,
         influence_profile: Optional[torch.Tensor] = None,
         need_weights: bool = False,  # Whether to return attention weights for debugging
+        cond: Optional[torch.Tensor] = None,      # Stage 10: e (batch, n_turb, cond_in_dim) or latent z
+        cond_is_latent: bool = False,             # True: cond is already z (phase-2 adaptation output)
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Trunk forward: everything up to (and including) the transformer, i.e.
@@ -829,12 +974,24 @@ class TransformerActor(nn.Module):
             recep_profile: (batch, n_turbines, n_directions) receptivity profiles (optional)
             influence_profile: (batch, n_turbines, n_directions) influence profiles (optional)
             need_weights: If True, compute and return attention weights for all layers
+            cond: hidden-parameter vector e per token (required iff cond_source != "none")
+            cond_is_latent: cond is the latent z (skip the parameter encoder)
 
         Returns:
             h: (batch, n_turbines, embed_dim) final-LayerNorm'd token embeddings
             attn_weights: List of attention weights from each layer
         """
         batch_size, n_turbines, _ = obs.shape
+
+        # Stage 10: resolve the conditioning latent (None when cond is off)
+        z = self._resolve_cond(cond, cond_is_latent)
+        film_cond = None
+        if z is not None:
+            if self.cond_mode == "concat":
+                # cat promotes to obs dtype (fp32 under AMP: e stays fp32 end to end)
+                obs = torch.cat([obs, z.to(obs.dtype)], dim=-1)
+            else:
+                film_cond = z
 
         # Encode observations
         h = self.obs_encoder(obs)  # (batch, n_turb, embed_dim)
@@ -893,7 +1050,8 @@ class TransformerActor(nn.Module):
                 cone_deg=self.attn_local_cone_deg)
 
         h, attn_weights = self.transformer(h, key_padding_mask, attn_bias,
-                                           local_allow=local_allow, need_weights=need_weights)
+                                           local_allow=local_allow, need_weights=need_weights,
+                                           cond=film_cond)
 
         return h, attn_weights
 
@@ -905,6 +1063,8 @@ class TransformerActor(nn.Module):
         recep_profile: Optional[torch.Tensor] = None,
         influence_profile: Optional[torch.Tensor] = None,
         need_weights: bool = False,  # Whether to return attention weights for debugging
+        cond: Optional[torch.Tensor] = None,
+        cond_is_latent: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
         """
         Forward pass returning action distribution parameters.
@@ -925,6 +1085,7 @@ class TransformerActor(nn.Module):
         h, attn_weights = self.forward_trunk(
             obs, positions, key_padding_mask,
             recep_profile, influence_profile, need_weights,
+            cond=cond, cond_is_latent=cond_is_latent,
         )
 
         # Action distribution parameters
@@ -946,6 +1107,8 @@ class TransformerActor(nn.Module):
         recep_profile: Optional[torch.Tensor] = None,
         influence_profile: Optional[torch.Tensor] = None,
         need_weights: bool = False,
+        cond: Optional[torch.Tensor] = None,
+        cond_is_latent: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
         """
         Sample action from policy with log probability.
@@ -972,7 +1135,8 @@ class TransformerActor(nn.Module):
             influence_profile = None
         mean, log_std, attn_weights = self.forward(obs, positions, key_padding_mask,
                                                    recep_profile, influence_profile,
-                                                   need_weights=need_weights)
+                                                   need_weights=need_weights,
+                                                   cond=cond, cond_is_latent=cond_is_latent)
         std = log_std.exp()
 
         # Sample from Gaussian
@@ -1064,6 +1228,8 @@ class TransformerCritic(nn.Module):
         # DroQ settings (dropout + LayerNorm in critic MLPs)
         droq_dropout: float = 0.0,
         droq_layer_norm: bool = False,
+        cond_critic: Optional[str] = None,   # Stage 10: "raw" | "none" (None -> args)
+        cond_in_dim: Optional[int] = None
     ):
         super().__init__()
 
@@ -1115,14 +1281,20 @@ class TransformerCritic(nn.Module):
         # Observation + action encoder (no DroQ here — applied only in q_head per Hiraoka et al.)
         # change_wd_4 "per_sensor": per-sensor MLPs + a dedicated action MLP
         # (see PerSensorObsActionEncoder); same input/output shapes, forward untouched.
+        # Stage 10 asymmetric critic: raw e per token when cond_critic == "raw"
+        # and the actor is conditioned (cond_source != "none"); otherwise 0.
+        (_cs, _cl, _cm, _cc, _cin) = _read_cond_cfg(args, cond_critic=cond_critic, cond_in_dim=cond_in_dim)
+        self.cond_critic_dim = _cin if (_cs != "none" and _cc == "raw") else 0
         if getattr(args, "obs_encoder_mode", "shared") == "per_sensor":
+            if self.cond_critic_dim:
+                raise ValueError("cond_critic raw is incompatible with --obs_encoder_mode per_sensor (use cond_critic none)")
             self.obs_action_encoder = PerSensorObsActionEncoder(
                 obs_dim_per_turbine, action_dim_per_turbine, embed_dim,
                 history_length=int(getattr(args, "history_length")),
             )
         else:
             self.obs_action_encoder = nn.Sequential(
-                nn.Linear(obs_dim_per_turbine + action_dim_per_turbine, embed_dim),
+                nn.Linear(obs_dim_per_turbine + action_dim_per_turbine + self.cond_critic_dim, embed_dim),
                 nn.ReLU(),
                 nn.Linear(embed_dim, embed_dim),
             )
@@ -1171,6 +1343,7 @@ class TransformerCritic(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         recep_profile: Optional[torch.Tensor] = None,
         influence_profile: Optional[torch.Tensor] = None,
+        cond: Optional[torch.Tensor] = None,   # Stage 10: raw e (batch, n_turb, cond_in_dim)
     ) -> torch.Tensor:
         """
         Everything up to (and including) the transformer: encode obs+action,
@@ -1179,8 +1352,15 @@ class TransformerCritic(nn.Module):
         """
         batch_size = obs.shape[0]
 
-        # Concatenate obs and action
-        x = torch.cat([obs, action], dim=-1)
+        # Concatenate obs and action (+ raw e for the asymmetric critic)
+        if self.cond_critic_dim:
+            if cond is None:
+                raise ValueError(f"cond_critic raw requires cond (batch, n_turb, {self.cond_critic_dim})")
+            x = torch.cat([obs, action, cond.to(obs.dtype)], dim=-1)
+        else:
+            if cond is not None:
+                raise ValueError("cond passed to a critic without conditioning (cond_critic none / cond_source none)")
+            x = torch.cat([obs, action], dim=-1)
 
         # Encode
         h = self.obs_action_encoder(x)
@@ -1246,6 +1426,7 @@ class TransformerCritic(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         recep_profile: Optional[torch.Tensor] = None,
         influence_profile: Optional[torch.Tensor] = None,
+        cond: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute Q-value for observation-action pair.
@@ -1262,7 +1443,7 @@ class TransformerCritic(nn.Module):
             q_value: (batch, 1) Q-value for the entire farm
         """
         h = self.forward_trunk(obs, action, positions, key_padding_mask,
-                               recep_profile, influence_profile)
+                               recep_profile, influence_profile, cond=cond)
 
         if self.critic_agg == "vdn":
             # v9 value decomposition: per-turbine Q-head, then masked-SUM over turbines.
@@ -1346,11 +1527,12 @@ class TransformerTQCCritic(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         recep_profile: Optional[torch.Tensor] = None,
         influence_profile: Optional[torch.Tensor] = None,
+        cond: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Returns (n_critics, batch, n_quantiles)."""
         return torch.stack([
             c(obs, action, positions, key_padding_mask,
-              recep_profile, influence_profile)
+              recep_profile, influence_profile, cond=cond)
             for c in self.critics
         ], dim=0)
 
@@ -1391,10 +1573,11 @@ class TransformerTQCSharedCritic(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         recep_profile: Optional[torch.Tensor] = None,
         influence_profile: Optional[torch.Tensor] = None,
+        cond: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Returns (n_critics, batch, n_quantiles)."""
         h = self.trunk.forward_trunk(obs, action, positions, key_padding_mask,
-                                     recep_profile, influence_profile)
+                                     recep_profile, influence_profile, cond=cond)
         # Python loop over heads (N tiny MLPs): measured faster than a vmap
         # ensemble under reduce-overhead cudagraphs (see trainer compile block).
         if self.critic_agg == "vdn":
@@ -1421,6 +1604,58 @@ class TransformerTQCSharedCritic(nn.Module):
             else:
                 h_pooled = h.mean(dim=1)  # (batch, embed_dim)
             return torch.stack([head(h_pooled) for head in self.heads], dim=0)
+
+
+# =============================================================================
+# ADAPTATION MODULE (Stage 10 phase 2: RMA phi / UP-OSI OSI / Lee student encoder)
+# =============================================================================
+
+class AdaptationModule(nn.Module):
+    """phi: per-token [obs | commanded-action history] (+ positions, profiles)
+    -> z_hat (batch, n_turb, out_dim), the estimate of the actor's latent z =
+    mu(e) (or raw e when dz == 0).
+
+    Reuses the actor trunk class with conditioning forced OFF over the widened
+    token (obs_dim + action_hist_dim), drops the action heads (Identity, the
+    PPO shared-trunk precedent) and adds a Linear head. A transformer over
+    turbines on purpose: ct_gain and the farm closure are only identifiable
+    through the DOWNSTREAM turbines' histories, not from one turbine's own.
+    """
+
+    def __init__(self, obs_dim_per_turbine: int, action_hist_dim: int, out_dim: int,
+                 **trunk_kwargs):
+        super().__init__()
+        trunk_kwargs = dict(trunk_kwargs)
+        trunk_kwargs["cond_source"] = "none"      # explicit kwarg beats args.cond_source
+        trunk_kwargs.pop("cond_latent_dim", None)
+        trunk_kwargs.pop("cond_mode", None)
+        trunk_kwargs.pop("cond_in_dim", None)
+        trunk_kwargs.pop("action_scale", None)
+        trunk_kwargs.pop("action_bias", None)
+        self.obs_dim_per_turbine = int(obs_dim_per_turbine)
+        self.action_hist_dim = int(action_hist_dim)
+        self.out_dim = int(out_dim)
+        self.trunk = TransformerActor(
+            obs_dim_per_turbine=self.obs_dim_per_turbine + self.action_hist_dim,
+            action_dim_per_turbine=1, **trunk_kwargs,
+        )
+        self.trunk.fc_mean = nn.Identity()
+        self.trunk.fc_logstd = nn.Identity()
+        self.head = nn.Linear(self.trunk.embed_dim, self.out_dim)
+
+    def forward(
+        self,
+        obs: torch.Tensor,
+        action_hist: torch.Tensor,
+        positions: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        recep_profile: Optional[torch.Tensor] = None,
+        influence_profile: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        x = torch.cat([obs, action_hist.to(obs.dtype)], dim=-1)
+        h, _ = self.trunk.forward_trunk(x, positions, key_padding_mask,
+                                        recep_profile, influence_profile)
+        return self.head(h)
 
 
 def quantile_huber_loss(
