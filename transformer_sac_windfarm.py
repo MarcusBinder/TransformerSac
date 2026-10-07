@@ -95,8 +95,34 @@ def validate_dr_setup(args, dr_posterior, turb_ranges=None):
             "pywake_steady adapter."
         )
     if dr_posterior is not None:
+        names = list(dr_posterior["names"])
+        dr_keys = tuple(args.dr_keys)
+        not_in_posterior = [k for k in dr_keys if k not in names]
+        if not_in_posterior:
+            raise ValueError(
+                f"--dr_keys {not_in_posterior} are not columns of the posterior "
+                f"(columns: {names}); the sampler would KeyError inside the "
+                "env workers."
+            )
+        unknown_to_env = [k for k in dr_keys if k not in WindFarmEnv._DWM_PARAM_KEYS]
+        if unknown_to_env:
+            raise RuntimeError(
+                f"this WindFarmEnv does not accept DR keys {unknown_to_env} in "
+                "dwm_params (hill_vortex_factor needs windgym dev_dynamiks >= "
+                "0b7c7ae; pull the windgym submodule)."
+            )
+        unused = [k for k in names if k not in dr_keys]
+        if unused:
+            msg = (
+                f"[DR] WARNING: posterior columns {unused} are NOT in --dr_keys "
+                f"{list(dr_keys)}; they stay at the env's dwm_setup value every "
+                "episode (fine for the 6-key Stage-7..10 launchers, NOT for a "
+                "v2-posterior run)."
+            )
+            print(msg)
+            print(msg, file=sys.stderr, flush=True)
         mann_in_dr = tuple(
-            k for k in args.dr_keys if k in WindFarmEnv._MANN_PARAM_KEYS
+            k for k in dr_keys if k in WindFarmEnv._MANN_PARAM_KEYS
         )
         if mann_in_dr and args.TI_type != "MannGenerate":
             raise ValueError(
@@ -913,7 +939,7 @@ def main():
     # cond_on => the actor is told the hidden-parameter vector e (token order,
     # helpers/param_cond.py); the replay buffer stores it per transition and
     # the normalisation constants ride in the checkpoint (cond_norm_json).
-    from helpers.param_cond import COND_DIM, CondFetcher, ParamNormalizer
+    from helpers.param_cond import CondFetcher, ParamNormalizer
     from helpers.action_history import N_FEAT_DEFAULT as ACTION_HIST_FEAT
     _cond_on = args.cond_source != "none"
     _cond_critic_on = _cond_on and args.cond_critic == "raw"
@@ -926,9 +952,13 @@ def main():
             )
         cond_normalizer = ParamNormalizer.from_args(args, _dr_posterior)  # turbine_farm needs the posterior
         args.cond_norm_json = cond_normalizer.to_json()
+        # Size the cond nets from the normaliser (13 with the 7 farm keys; the
+        # checkpoint args carry it so the harnesses rebuild the same actor).
+        args.cond_in_dim = cond_normalizer.cond_dim
         print(f"[Cond] source={args.cond_source} dz={args.cond_latent_dim} mode={args.cond_mode} "
               f"critic={args.cond_critic} action_hist={args.cond_action_hist} "
-              f"(e dim {COND_DIM}; turbine keys scaled by --turb_dr, farm keys z-scored by the posterior)")
+              f"(e dim {cond_normalizer.cond_dim}; turbine keys scaled by --turb_dr, "
+              f"farm keys {cond_normalizer.farm_keys} z-scored by the posterior)")
     if args.phase2_loss not in ("latent", "latent_action"):
         raise ValueError(f"--phase2_loss must be latent | latent_action, got {args.phase2_loss!r}")
     if args.adapt_rounds > 0 or args.adapt_only:
@@ -1818,7 +1848,7 @@ def main():
         rotate_profiles=args.rotate_profiles,
         profile_registry=profile_registry,
         profile_registry_gpu_budget_mb=args.profile_registry_gpu_budget_mb,
-        cond_dim=COND_DIM if _cond_on else 0,
+        cond_dim=cond_normalizer.cond_dim if _cond_on else 0,
         action_hist_dim=ACTION_HIST_FEAT if args.cond_action_hist else 0,
     )
 

@@ -24,8 +24,11 @@ from helpers.param_cond import (  # noqa: E402
 from helpers.multi_layout_env import LayoutConfig, MultiLayoutEnv  # noqa: E402
 
 RANGES = {"yaw_exp": (-0.4, 0.6), "cp_gain": (0.95, 1.05), "tau_yaw": (0.0, 20.0)}
-FARM_MEAN = {"k1": 0.09, "k2": 0.008, "d_particle": 0.65, "mann_L": 69.0, "mann_GAMMA": 3.95, "mann_AE": 0.0097}
-FARM_STD = {"k1": 0.009, "k2": 0.0008, "d_particle": 0.04, "mann_L": 7.0, "mann_GAMMA": 0.18, "mann_AE": 0.0006}
+FARM_MEAN = {"k1": 0.09, "k2": 0.008, "d_particle": 0.65, "hill_vortex_factor": 0.30,
+             "mann_L": 69.0, "mann_GAMMA": 3.95, "mann_AE": 0.0097}
+FARM_STD = {"k1": 0.009, "k2": 0.0008, "d_particle": 0.04, "hill_vortex_factor": 0.0175,
+            "mann_L": 7.0, "mann_GAMMA": 0.18, "mann_AE": 0.0006}
+LEGACY_KEYS = ("k1", "k2", "d_particle", "mann_L", "mann_GAMMA", "mann_AE")
 
 
 def _norm(source="turbine_farm"):
@@ -46,8 +49,10 @@ def _turb_tok(max_t, rows):
 def test_key_order_matches_windgym_spec_and_posterior():
     from WindGym.core.turbine_params import TURBINE_PARAM_SPECS
     assert COND_TURB_KEYS == tuple(TURBINE_PARAM_SPECS)
-    assert COND_FARM_KEYS == ("k1", "k2", "d_particle", "mann_L", "mann_GAMMA", "mann_AE")
-    assert COND_DIM == 12
+    assert COND_FARM_KEYS == ("k1", "k2", "d_particle", "hill_vortex_factor", "mann_L", "mann_GAMMA", "mann_AE")
+    assert COND_DIM == 13
+    from helpers.param_cond import LEGACY_FARM_KEYS
+    assert LEGACY_FARM_KEYS == LEGACY_KEYS
 
 
 # -------------------------------------------------------------------- vector --
@@ -74,7 +79,7 @@ def test_farm_zscore_clip_and_source_turbine_zeroes_farm():
     farm["mann_L"] = FARM_MEAN["mann_L"] + 50 * FARM_STD["mann_L"]  # way out -> clipped
     e = _norm().vector(tok, farm, mask)
     assert e[0, 6] == pytest.approx(2.0)
-    assert e[0, 9] == pytest.approx(3.0)
+    assert e[0, 10] == pytest.approx(3.0)
     assert e[0, 7] == pytest.approx(0.0)       # at the mean
     assert np.array_equal(e[0], e[1])          # farm params broadcast to every real token
     e_t = _norm("turbine").vector(tok, farm, mask)
@@ -109,21 +114,72 @@ def test_json_round_trip():
                           m.vector(tok, farm, np.array([False, True])))
 
 
+def test_normalizer_constant_columns_zero():
+    """v2 posterior: k1 / d_particle are held fixed, stored with sd ~1e-17 (not 0).
+    Those columns must z-score to exactly 0, never to +-clip."""
+    std = dict(FARM_STD)
+    std["k1"] = 4.5e-15
+    std["d_particle"] = 7.1e-15
+    n = ParamNormalizer(RANGES, FARM_MEAN, std, clip=3.0, source="turbine_farm")
+    farm = dict(FARM_MEAN)
+    farm["k1"] = FARM_MEAN["k1"] + 1e-12          # float noise on a "constant" column
+    farm["d_particle"] = FARM_MEAN["d_particle"] - 1e-12
+    e = n.vector(_turb_tok(1, []), farm, np.array([False]))
+    assert e[0, 6] == 0.0 and e[0, 8] == 0.0
+    assert e[0, 9] == pytest.approx(0.0)           # hill_vortex_factor at its mean
+
+
+def test_from_json_accepts_legacy_six_keys():
+    """Stage-10 rma/uposi checkpoints serialised the 6-key farm vector; they
+    must still load (12-dim e) with the legacy key order."""
+    legacy_mean = {k: FARM_MEAN[k] for k in LEGACY_KEYS}
+    legacy_std = {k: FARM_STD[k] for k in LEGACY_KEYS}
+    s = json.dumps({
+        "turb_keys": list(COND_TURB_KEYS), "farm_keys": list(LEGACY_KEYS),
+        "turb_ranges": {k: list(v) for k, v in RANGES.items()},
+        "farm_mean": legacy_mean, "farm_std": legacy_std, "clip": 3.0, "source": "turbine_farm",
+    })
+    n = ParamNormalizer.from_json(s)
+    assert n.farm_keys == LEGACY_KEYS and n.cond_dim == 12
+    farm = dict(legacy_mean)
+    farm["mann_L"] = legacy_mean["mann_L"] + legacy_std["mann_L"]
+    e = n.vector(_turb_tok(1, []), farm, np.array([False]))
+    assert e.shape == (1, 12) and e[0, 9] == pytest.approx(1.0)
+    # a 7-key farm dict (superset, as farm_params_from_base_env now returns) is fine
+    farm7 = dict(FARM_MEAN)
+    e7 = n.vector(_turb_tok(1, []), farm7, np.array([False]))
+    assert e7.shape == (1, 12) and np.all(e7[0, 6:] == 0.0)
+    assert json.loads(n.to_json())["farm_keys"] == list(LEGACY_KEYS)
+
+
+def test_from_json_rejects_other_order():
+    keys = list(COND_FARM_KEYS)
+    keys[0], keys[1] = keys[1], keys[0]
+    s = json.dumps({
+        "turb_keys": list(COND_TURB_KEYS), "farm_keys": keys,
+        "turb_ranges": {}, "farm_mean": FARM_MEAN, "farm_std": FARM_STD, "clip": 3.0,
+        "source": "turbine_farm",
+    })
+    with pytest.raises(ValueError, match="key order"):
+        ParamNormalizer.from_json(s)
+
+
 def test_from_args_uses_turb_dr_ranges_and_posterior_stats():
     args = SimpleNamespace(turb_dr=("yaw_exp=-0.4:0.6", "cp_gain=0.95:1.05"), cond_source="turbine_farm")
     rng = np.random.default_rng(0)
-    samples = rng.normal(size=(500, 6)) * np.array([FARM_STD[k] for k in COND_FARM_KEYS]) \
+    samples = rng.normal(size=(500, 7)) * np.array([FARM_STD[k] for k in COND_FARM_KEYS]) \
         + np.array([FARM_MEAN[k] for k in COND_FARM_KEYS])
     posterior = {"samples": samples, "names": list(COND_FARM_KEYS)}
     n = ParamNormalizer.from_args(args, posterior)
     assert n.turb_ranges == {"yaw_exp": (-0.4, 0.6), "cp_gain": (0.95, 1.05)}
     assert n.farm_mean["k1"] == pytest.approx(samples[:, 0].mean())
-    assert n.farm_std["mann_L"] == pytest.approx(samples[:, 3].std())
+    assert n.farm_std["mann_L"] == pytest.approx(samples[:, 4].std())
+    assert n.farm_keys == COND_FARM_KEYS and n.cond_dim == 13
     # turbine-only source needs no posterior
     n2 = ParamNormalizer.from_args(SimpleNamespace(turb_dr=("yaw_exp=-0.4:0.6",), cond_source="turbine"), None)
     assert n2.source == "turbine"
     # turbine_farm with a missing posterior key fails fast
-    bad = {"samples": samples[:, :5], "names": list(COND_FARM_KEYS[:5])}
+    bad = {"samples": samples[:, :6], "names": list(COND_FARM_KEYS[:6])}
     with pytest.raises(ValueError, match="mann_AE"):
         ParamNormalizer.from_args(args, bad)
     with pytest.raises(ValueError, match="posterior"):
@@ -141,7 +197,7 @@ class _FakeBase(gym.Env):
         self.action_space = gym.spaces.Box(-1, 1, shape=(self.n,), dtype=np.float32)
         self._perturb = perturb or {}
         self._active_dwm_params = dict(active or {})
-        self.dwm_setup = SimpleNamespace(k1=k1, k2=0.0216, d_particle=0.48,
+        self.dwm_setup = SimpleNamespace(k1=k1, k2=0.0216, d_particle=0.48, hill_vortex_factor=0.4,
                                          mann=SimpleNamespace(L=29.4, gamma=3.9, alphaepsilon=1.0))
         self._tp = None
 
@@ -197,6 +253,7 @@ def test_farm_params_merge_active_over_setup_defaults():
     assert list(f) == list(COND_FARM_KEYS)
     assert f["k1"] == 0.1 and f["mann_L"] == 50.0          # drawn this episode
     assert f["k2"] == 0.0216 and f["d_particle"] == 0.48     # setup fallbacks
+    assert f["hill_vortex_factor"] == 0.4
     assert f["mann_GAMMA"] == 3.9 and f["mann_AE"] == 1.0
     # a setup with k1=None (plain dynamiks) -> NaN, which the normaliser maps to 0
     ml2 = _mle(k1=None)

@@ -83,9 +83,10 @@ def test_evaluate_runs_with_cond_agent_through_dr_wrapper(evaluator):
     from helpers.param_cond import ParamNormalizer
     from networks import TransformerActor
     obs_dim = evaluator.eval_envs.single_observation_space.shape[-1]
-    args = Args(cond_source="turbine", cond_latent_dim=8, turb_dr=("yaw_exp=-0.4:0.6", "tau_yaw=0:20"))
-    actor = TransformerActor(obs_dim_per_turbine=obs_dim, args=args)
     norm = ParamNormalizer({"yaw_exp": (-0.4, 0.6), "tau_yaw": (0.0, 20.0)}, source="turbine")
+    args = Args(cond_source="turbine", cond_latent_dim=8, turb_dr=("yaw_exp=-0.4:0.6", "tau_yaw=0:20"),
+                cond_in_dim=norm.cond_dim)
+    actor = TransformerActor(obs_dim_per_turbine=obs_dim, args=args)
     evaluator.agent = WindFarmAgent(actor, torch.device("cpu"), 178.3, use_wind_relative=True,
                                     cond_normalizer=norm)
     m = evaluator.evaluate()

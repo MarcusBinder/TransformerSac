@@ -660,7 +660,7 @@ def _read_attn_cfg(args):
     )
 
 
-COND_IN_DIM_DEFAULT = 12   # helpers.param_cond.COND_DIM (6 turbine + 6 farm params)
+COND_IN_DIM_DEFAULT = 12   # legacy e width (6 turbine + 6 farm keys) for checkpoints without args.cond_in_dim; Stage 11+ carries 13
 COND_SOURCES = ("none", "turbine", "turbine_farm")
 COND_MODES = ("concat", "film")
 COND_CRITIC_MODES = ("raw", "none")

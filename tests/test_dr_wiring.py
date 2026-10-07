@@ -134,6 +134,38 @@ def test_guard_launch_config_passes(trainer, posterior):
     trainer.validate_dr_setup(_args(), posterior)
 
 
+def _fake_posterior(names, n=50):
+    rng = np.random.default_rng(0)
+    return {"samples": rng.normal(size=(n, len(names))), "names": list(names)}
+
+
+V2_NAMES = ("k1", "d_particle", "hill_vortex_factor", "k2", "mann_L", "mann_GAMMA", "mann_AE")
+
+
+def test_guard_warns_on_unused_posterior_columns(trainer, capsys):
+    # A 7-column posterior randomised over the 6 legacy keys is allowed (the
+    # Stage-7..10 launchers) but must announce the column it leaves fixed.
+    trainer.validate_dr_setup(_args(), _fake_posterior(V2_NAMES))
+    out = capsys.readouterr()
+    assert "[DR] WARNING" in out.out and "hill_vortex_factor" in out.out
+    assert "[DR] WARNING" in out.err
+    # all columns used -> silent
+    trainer.validate_dr_setup(_args(dr_keys=V2_NAMES), _fake_posterior(V2_NAMES))
+    assert "[DR] WARNING" not in capsys.readouterr().out
+
+
+def test_guard_rejects_dr_key_missing_from_posterior(trainer):
+    with pytest.raises(ValueError, match="not_a_param"):
+        trainer.validate_dr_setup(_args(dr_keys=LES_KEYS + ("not_a_param",)), _fake_posterior(LES_KEYS))
+
+
+def test_guard_rejects_dr_key_the_env_lacks(trainer, monkeypatch):
+    env_cls = trainer.WindFarmEnv
+    monkeypatch.setattr(env_cls, "_DWM_PARAM_KEYS", frozenset(env_cls._DWM_PARAM_KEYS) - {"hill_vortex_factor"})
+    with pytest.raises(RuntimeError, match="hill_vortex_factor"):
+        trainer.validate_dr_setup(_args(dr_keys=V2_NAMES), _fake_posterior(V2_NAMES))
+
+
 # ---- Stage-9 turbine-parameter DR (--turb_dr) ------------------------------
 
 def test_turb_dr_args_default_off():

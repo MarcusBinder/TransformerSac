@@ -2,9 +2,11 @@
 
 The DR wrappers draw, per episode, six per-turbine turbine-model parameters
 (``WindGym.core.turbine_params``: yaw_exp cp_gain ct_gain tau_yaw delay_yaw
-tau_power, PHYSICAL units) and six farm-level DWM / Mann parameters from the
-LES-calibrated posterior (k1 k2 d_particle mann_L mann_GAMMA mann_AE). This
-module turns them into one normalised ``(max_turbines, 12)`` float32 vector in
+tau_power, PHYSICAL units) and seven farm-level DWM / Mann parameters from the
+LES-calibrated posterior (k1 k2 d_particle hill_vortex_factor mann_L
+mann_GAMMA mann_AE; Stage-10 checkpoints predate hill_vortex_factor and carry
+the LEGACY six). This module turns them into one normalised
+``(max_turbines, 6 + len(farm_keys))`` float32 vector (13 today, 12 legacy) in
 TOKEN order (the actor's per-turbine tokens, i.e. after MultiLayoutEnv's
 shuffle and padding):
 
@@ -13,7 +15,8 @@ shuffle and padding):
   column (the policy is not told about a parameter it never saw vary);
 * farm columns z-scored by the posterior mean / std and clipped to ``+-clip``
   (``source="turbine"`` -> zeros); non-finite inputs (a plain-dynamiks setup
-  with ``k1=None``) map to 0;
+  with ``k1=None``) map to 0; a column whose posterior sd is numerically zero
+  (the v2 posterior holds k1 / d_particle fixed, sd ~1e-17) is a constant 0;
 * padded rows are all zero (masked everywhere downstream; finite and small).
 
 The normalisation constants are serialised into the checkpoint
@@ -39,6 +42,10 @@ COND_TURB_KEYS: Tuple[str, ...] = (
     "yaw_exp", "cp_gain", "ct_gain", "tau_yaw", "delay_yaw", "tau_power",
 )
 COND_FARM_KEYS: Tuple[str, ...] = (
+    "k1", "k2", "d_particle", "hill_vortex_factor", "mann_L", "mann_GAMMA", "mann_AE",
+)
+# Stage-10 (rma / uposi) checkpoints serialised this 6-key farm vector.
+LEGACY_FARM_KEYS: Tuple[str, ...] = (
     "k1", "k2", "d_particle", "mann_L", "mann_GAMMA", "mann_AE",
 )
 COND_DIM = len(COND_TURB_KEYS) + len(COND_FARM_KEYS)
@@ -65,6 +72,7 @@ class ParamNormalizer:
         farm_std: Optional[Mapping[str, float]] = None,
         clip: float = 3.0,
         source: str = "turbine_farm",
+        farm_keys: Sequence[str] = COND_FARM_KEYS,
     ):
         if source not in COND_SOURCES or source == "none":
             raise ValueError(
@@ -80,8 +88,9 @@ class ParamNormalizer:
         self.farm_std: Dict[str, float] = {k: float(v) for k, v in (farm_std or {}).items()}
         self.clip = float(clip)
         self.source = source
+        self.farm_keys: Tuple[str, ...] = tuple(farm_keys)
         if source == "turbine_farm":
-            missing = [k for k in COND_FARM_KEYS if k not in self.farm_mean or k not in self.farm_std]
+            missing = [k for k in self.farm_keys if k not in self.farm_mean or k not in self.farm_std]
             if missing:
                 raise ValueError(f"cond_source turbine_farm needs farm stats for {missing}")
         # Precomputed affine coefficients, turbine: e = a*v + b (a = 0 when unranged)
@@ -95,12 +104,16 @@ class ParamNormalizer:
                     b[i] = -1.0 - a[i] * lo
         self._turb_a, self._turb_b = a, b
         if source == "turbine_farm":
-            self._farm_mu = np.array([self.farm_mean[k] for k in COND_FARM_KEYS], dtype=np.float64)
-            sd = np.array([self.farm_std[k] for k in COND_FARM_KEYS], dtype=np.float64)
-            self._farm_inv_sd = np.where(sd > 0, 1.0 / np.where(sd > 0, sd, 1.0), 0.0)
+            self._farm_mu = np.array([self.farm_mean[k] for k in self.farm_keys], dtype=np.float64)
+            sd = np.array([self.farm_std[k] for k in self.farm_keys], dtype=np.float64)
+            # Constant-column rule: a posterior column with no spread (absolute
+            # or relative to its mean, e.g. sd 1e-17 on a fixed k1) is inert.
+            tol = np.maximum(1e-9, 1e-9 * np.abs(self._farm_mu))
+            sd_eff = np.where(sd > tol, sd, 0.0)
+            self._farm_inv_sd = np.where(sd_eff > 0, 1.0 / np.where(sd_eff > 0, sd_eff, 1.0), 0.0)
         else:
-            self._farm_mu = np.zeros(len(COND_FARM_KEYS))
-            self._farm_inv_sd = np.zeros(len(COND_FARM_KEYS))
+            self._farm_mu = np.zeros(len(self.farm_keys))
+            self._farm_inv_sd = np.zeros(len(self.farm_keys))
 
     # ------------------------------------------------------------ factories --
     @classmethod
@@ -127,7 +140,7 @@ class ParamNormalizer:
 
     def to_json(self) -> str:
         return json.dumps({
-            "turb_keys": list(COND_TURB_KEYS), "farm_keys": list(COND_FARM_KEYS),
+            "turb_keys": list(COND_TURB_KEYS), "farm_keys": list(self.farm_keys),
             "turb_ranges": {k: list(v) for k, v in self.turb_ranges.items()},
             "farm_mean": self.farm_mean, "farm_std": self.farm_std,
             "clip": self.clip, "source": self.source,
@@ -136,31 +149,36 @@ class ParamNormalizer:
     @classmethod
     def from_json(cls, s: str) -> "ParamNormalizer":
         d = json.loads(s)
+        farm_keys = tuple(d.get("farm_keys", COND_FARM_KEYS))
         if tuple(d.get("turb_keys", COND_TURB_KEYS)) != COND_TURB_KEYS or \
-                tuple(d.get("farm_keys", COND_FARM_KEYS)) != COND_FARM_KEYS:
-            raise ValueError("cond_norm_json key order does not match this code's COND_*_KEYS")
+                farm_keys not in (COND_FARM_KEYS, LEGACY_FARM_KEYS):
+            raise ValueError("cond_norm_json key order does not match this code's COND_*_KEYS "
+                             "(nor the legacy 6-key farm vector)")
         return cls({k: tuple(v) for k, v in d["turb_ranges"].items()},
                    d.get("farm_mean", {}), d.get("farm_std", {}),
-                   clip=d.get("clip", 3.0), source=d.get("source", "turbine_farm"))
+                   clip=d.get("clip", 3.0), source=d.get("source", "turbine_farm"),
+                   farm_keys=farm_keys)
 
     # ------------------------------------------------------------- vectors --
     @property
     def cond_dim(self) -> int:
-        return COND_DIM
+        return len(COND_TURB_KEYS) + len(self.farm_keys)
 
     def _farm_array(self, farm: Optional[FarmLike]) -> np.ndarray:
+        n_farm = len(self.farm_keys)
         if farm is None:
-            return np.full(len(COND_FARM_KEYS), np.nan)
+            return np.full(n_farm, np.nan)
         if isinstance(farm, Mapping):
-            return np.array([float(farm.get(k, np.nan)) for k in COND_FARM_KEYS], dtype=np.float64)
+            # A superset mapping (7 keys into a legacy 6-key normaliser) is fine.
+            return np.array([float(farm.get(k, np.nan)) for k in self.farm_keys], dtype=np.float64)
         arr = np.asarray(farm, dtype=np.float64).reshape(-1)
-        if arr.shape[0] != len(COND_FARM_KEYS):
-            raise ValueError(f"farm params must have {len(COND_FARM_KEYS)} entries, got {arr.shape}")
+        if arr.shape[0] != n_farm:
+            raise ValueError(f"farm params must have {n_farm} entries ({self.farm_keys}), got {arr.shape}")
         return arr
 
     def vector(self, turb_tok: np.ndarray, farm: Optional[FarmLike], mask: np.ndarray) -> np.ndarray:
-        """``turb_tok`` (max_t, 6) physical in token order, ``farm`` 6 values /
-        dict, ``mask`` (max_t,) True = padding -> e (max_t, 12) float32."""
+        """``turb_tok`` (max_t, 6) physical in token order, ``farm`` len(farm_keys)
+        values / dict, ``mask`` (max_t,) True = padding -> e (max_t, cond_dim) float32."""
         turb_tok = np.asarray(turb_tok, dtype=np.float64)
         if turb_tok.ndim != 2 or turb_tok.shape[1] != len(COND_TURB_KEYS):
             raise ValueError(f"turb_tok must be (max_turbines, {len(COND_TURB_KEYS)}), got {turb_tok.shape}")
@@ -168,7 +186,7 @@ class ParamNormalizer:
         if mask.shape[0] != turb_tok.shape[0]:
             raise ValueError("mask length must equal turb_tok rows")
         max_t = turb_tok.shape[0]
-        e = np.zeros((max_t, COND_DIM), dtype=np.float64)
+        e = np.zeros((max_t, self.cond_dim), dtype=np.float64)
         e[:, : len(COND_TURB_KEYS)] = turb_tok * self._turb_a + self._turb_b
         if self.source == "turbine_farm":
             z = (self._farm_array(farm) - self._farm_mu) * self._farm_inv_sd
@@ -230,10 +248,11 @@ def turbine_params_matrix(tp: Optional[Mapping[str, Any]], n_turb: int) -> np.nd
 
 
 def farm_params_from_base_env(base_env: Any) -> Dict[str, float]:
-    """The six farm keys resolved: this episode's active DWM params
+    """The seven farm keys resolved: this episode's active DWM params
     (``active_dwm_params`` or the private ``_active_dwm_params``) over the
-    env's ``dwm_setup`` (k1 / k2 / d_particle, mann.L / gamma / alphaepsilon).
-    Missing or None values -> NaN (the normaliser maps NaN to 0)."""
+    env's ``dwm_setup`` (k1 / k2 / d_particle / hill_vortex_factor, mann.L /
+    gamma / alphaepsilon). Missing or None values -> NaN (the normaliser maps
+    NaN to 0). A legacy 6-key normaliser simply ignores the extra key."""
     active = getattr(base_env, "active_dwm_params", None)
     if active is None:
         active = getattr(base_env, "_active_dwm_params", None) or {}
@@ -242,6 +261,7 @@ def farm_params_from_base_env(base_env: Any) -> Dict[str, float]:
     fallback = {
         "k1": getattr(setup, "k1", None), "k2": getattr(setup, "k2", None),
         "d_particle": getattr(setup, "d_particle", None),
+        "hill_vortex_factor": getattr(setup, "hill_vortex_factor", None),
         "mann_L": getattr(mann, "L", None), "mann_GAMMA": getattr(mann, "gamma", None),
         "mann_AE": getattr(mann, "alphaepsilon", None),
     }
@@ -260,7 +280,7 @@ class CondFetcher:
 
     ``envs`` must expose ``get_attr(name) -> list`` (the trainer passes
     ``envs.env``, an AsyncVectorEnv of MultiLayoutEnv). ``values`` is the
-    cached ``(num_envs, max_turbines, 12)`` float32 array from the last
+    cached ``(num_envs, max_turbines, cond_dim)`` float32 array from the last
     ``refresh()`` (None before the first); callers copy it into the step's
     state so a later refresh cannot alias stored transitions.
     """

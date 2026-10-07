@@ -236,11 +236,11 @@ def run_phase2(args, actor: nn.Module, envs, rb, cond_normalizer, device: torch.
         get_env_permutations, get_env_raw_positions, get_env_receptivity_profiles,
         get_env_wind_directions,
     )
-    from helpers.param_cond import COND_FARM_KEYS, COND_TURB_KEYS, CondFetcher
+    from helpers.param_cond import COND_TURB_KEYS, CondFetcher
     from replay_buffer import TransformerReplayBuffer
 
     t0 = time.time()
-    keys = COND_TURB_KEYS + COND_FARM_KEYS
+    keys = COND_TURB_KEYS + tuple(cond_normalizer.farm_keys)   # 7 farm keys, or the legacy 6
     _uncompile(actor)
     actor.eval()
     for p in actor.parameters():

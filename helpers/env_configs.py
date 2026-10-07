@@ -378,6 +378,24 @@ ENV_CONFIGS: Dict[str, Dict[str, Any]] = {
         },
     },
 
+    # LES-3x3 Stage 11: les_recipe_pin270 on the DWM re-calibration v2 eval
+    # point (windgym LES_V2: k2 0.020, d_particle 0.2, hill_vortex_factor 0.30,
+    # fitted Mann inflow L 72.7 / Gamma 2.0 / ae 0.0129; LESRL
+    # calibration/RECAL_V2.md 3.8 / 3.11). The setup MUST be explicit here:
+    # _base_config() keeps "les_calibrated" so every other preset keeps the
+    # Keck physics. Trained with the v2 posterior (7 DR keys incl.
+    # hill_vortex_factor) through run_exp11_lumi.sh.
+    "les_recipe_pin270_v2": {
+        "dwm_setup": "les_v2",
+        "power_def": {"Power_reward": "Wake_recovery", "Power_avg": 5, "Power_scaling": 1.0},
+        "farm": {"yaw_min": -45, "yaw_max": 45},
+        "wind": {
+            "wd_min": 270, "wd_max": 270,
+            "ws_min": 8, "ws_max": 11,
+            "TI_min": 0.038, "TI_max": 0.038,
+        },
+    },
+
     # LES-3x3 Stage 5 static-band CONTROL: les_recipe with static wd ~ U[235, 270]
     # per episode (no --train_wd_function) -- the same wd support the cycle arms
     # sweep through, but never a transition inside an episode.
@@ -527,22 +545,28 @@ def make_env_config(name: str = "default") -> Dict[str, Any]:
 
 
 def require_les_calibrated(dwm_setup) -> None:
-    """Raise unless ``dwm_setup`` (a preset name, a DWMSetup, or None) is LES_CALIBRATED.
+    """Raise unless ``dwm_setup`` (a preset name, a DWMSetup, or None) is one of
+    the LES-calibrated points: LES_CALIBRATED (Keck, Stages 1-10) or LES_V2
+    (re-calibration v2, Stage 11; only on windgym >= W11).
 
     WindGym dev_dynamiks defaults to plain dynamiks; LESRL never trains or
     evaluates on that, so a config or env that lost the preset must fail loudly.
+    The function keeps its historical name; both trainer call sites use it.
     """
     try:
-        from WindGym.core.calibrated_values import LES_CALIBRATED, resolve_dwm_setup
+        from WindGym.core import calibrated_values as cv
     except ImportError:
         # Pre-dev_dynamiks windgym (e.g. paper-derating's old pin): there is
         # no opt-in DWM preset to check, every env is the calibrated stack.
         return
 
-    if resolve_dwm_setup(dwm_setup) != LES_CALIBRATED:
+    allowed = [cv.LES_CALIBRATED]
+    if hasattr(cv, "LES_V2"):
+        allowed.append(cv.LES_V2)
+    if cv.resolve_dwm_setup(dwm_setup) not in allowed:
         raise RuntimeError(
-            f"DWM setup {dwm_setup!r} is not LES_CALIBRATED; set "
-            f'"dwm_setup": "les_calibrated" in the env preset'
+            f"DWM setup {dwm_setup!r} is not LES_CALIBRATED (or LES_V2); set "
+            f'"dwm_setup": "les_calibrated" (or "les_v2") in the env preset'
         )
 
 

@@ -22,7 +22,8 @@ class _Inner:
         self.rng = np.random.default_rng(seed)
         self.t = 0
         self.tok = np.zeros((T, 6)); self.tok[:, 1] = 1.0
-        self.farm = {"k1": 0.09, "k2": 0.008, "d_particle": 0.65, "mann_L": 69.0, "mann_GAMMA": 3.95, "mann_AE": 0.0097}
+        self.farm = {"k1": 0.09, "k2": 0.008, "d_particle": 0.65, "hill_vortex_factor": 0.30,
+                     "mann_L": 69.0, "mann_GAMMA": 3.95, "mann_AE": 0.0097}
         self.reset()
 
     def reset(self):
@@ -67,8 +68,9 @@ def _setup(rounds=2, steps=6):
     args = Args(cond_source="turbine_farm", cond_latent_dim=8, cond_action_hist=True, adapt_rounds=rounds,
                 adapt_round_steps=steps, adapt_warm_steps=0, adapt_fit_steps=3, batch_size=4, num_envs=N,
                 turb_dr=("yaw_exp=-0.4:0.6",))
-    actor = TransformerActor(obs_dim_per_turbine=OBS, args=args)
     norm = ParamNormalizer({"yaw_exp": (-0.4, 0.6)}, _Inner(0).farm, {k: 1.0 for k in _Inner(0).farm})
+    args.cond_in_dim = norm.cond_dim            # as the trainer does after ParamNormalizer.from_args
+    actor = TransformerActor(obs_dim_per_turbine=OBS, args=args)
     kw = dict(trunk_kwargs={"args": args}, rotor_diameter=100.0, use_profiles=False, obs_normalizer=None,
               wd_attr="wd", profile_registry=None, n_turbines_max=T, obs_dim=OBS, action_dim=1, global_step=0)
     return args, actor, norm, kw

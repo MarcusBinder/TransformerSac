@@ -165,11 +165,14 @@ class Args:
     #   none         = today's history policy (bit-identical: no new modules).
     #   turbine      = the 6 per-turbine --turb_dr params, scaled to [-1, 1] by
     #                  their training range (unranged keys -> constant 0).
-    #   turbine_farm = + the 6 farm posterior params (k1 k2 d_particle mann_L
-    #                  mann_GAMMA mann_AE) z-scored by the posterior, clipped +-3.
-    # The vector e is (max_turbines, 12) in token order (helpers/param_cond.py),
-    # stored per transition in the replay buffer, and its normalisation constants
-    # are saved in the checkpoint (cond_norm_json) for the LESRL harnesses.
+    #   turbine_farm = + the 7 farm posterior params (k1 k2 d_particle
+    #                  hill_vortex_factor mann_L mann_GAMMA mann_AE) z-scored
+    #                  by the posterior, clipped +-3 (13-dim e for new runs;
+    #                  Stage-10 checkpoints carry the legacy 6-key / 12-dim e).
+    # The vector e is (max_turbines, cond_in_dim) in token order
+    # (helpers/param_cond.py), stored per transition in the replay buffer, and
+    # its normalisation constants are saved in the checkpoint (cond_norm_json)
+    # for the LESRL harnesses.
     cond_source: str = "none"
     # Latent size dz of the parameter encoder mu: e -> z. 0 = identity (UP-OSI,
     # the actor sees raw e, 12-dim); >0 = learned latent (RMA, e.g. 8).
@@ -183,6 +186,10 @@ class Args:
     cond_critic: str = "raw"
     # Serialised ParamNormalizer (set by the trainer; read by the harnesses).
     cond_norm_json: str = ""
+    # Width of e (set by the trainer from the normaliser: 6 turbine + len(farm_keys)
+    # farm columns). 12 = the Stage-10 default so old checkpoints without the
+    # key size their nets as before; 13 for Stage-11 runs on the v2 posterior.
+    cond_in_dim: int = 12
     # Commanded-action history per turbine (ActionHistoryWrapper): the last
     # cond_action_hist_len delta-yaw commands -> raw15span (15 features), stored
     # in the replay buffer as the adaptation module's input. Needed for the
