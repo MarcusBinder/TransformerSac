@@ -240,6 +240,51 @@ def make_cycle(wd_a: float, wd_b: float, t_hold: float, t_ramp: float, phase: fl
     return _cycle
 
 
+def make_cycle_knots(levels, t_hold: float, t_ramp: float, phase: float = 0.0):
+    """Build a periodic multi-level hold/ramp eval schedule ``f(t) -> wd`` from knots.
+
+    ``levels = (L0, L1, ..., Ln-1)``: hold ``L0`` for ``t_hold``, ramp linearly to
+    ``L1`` over ``t_ramp``, hold ``L1``, ... ramp from ``Ln-1`` back to ``L0``; then
+    repeat (period ``n * (t_hold + t_ramp)``). Evaluated with ``np.interp`` over
+    the knots, so two levels reproduce ``make_cycle`` exactly. ``phase`` shifts
+    where t=0 lands (``f(0) == L0`` for ``0 <= phase < t_hold``).
+
+    LES-3x3 Stage 12 (exp_12 `sym`): ``(270, 235, 270, 305)`` at the _slow timing
+    (1600 s holds, 320 s ramps, 0.1094 deg/s) is the two-sided training cycle,
+    period 7680 s, 42 % of the time at exactly 270.
+    """
+    levels = tuple(float(v) for v in levels)
+    t_hold, t_ramp, phase = float(t_hold), float(t_ramp), float(phase)
+    if len(levels) < 2:
+        raise ValueError(f"need at least two levels, got {levels}")
+    if t_ramp <= 0 or t_hold < 0:
+        raise ValueError(f"need t_ramp > 0 and t_hold >= 0, got {t_ramp}, {t_hold}")
+    seg = t_hold + t_ramp
+    period = len(levels) * seg
+    knots_t, knots_v = [], []
+    for k, v in enumerate(levels):
+        knots_t += [k * seg, k * seg + t_hold]
+        knots_v += [v, v]
+    knots_t.append(period)
+    knots_v.append(levels[0])
+    knots_t = np.asarray(knots_t, dtype=float)
+    knots_v = np.asarray(knots_v, dtype=float)
+
+    def _cycle(t):
+        t = np.asarray(t, dtype=float)
+        tau = np.mod(t + phase, period)
+        return np.interp(tau, knots_t, knots_v)
+
+    _cycle.__name__ = "cycle_" + "_".join(f"{v:g}" for v in levels)
+    _cycle.__doc__ = (
+        f"Periodic {' -> '.join(f'{v:g}' for v in levels)} -> {levels[0]:g} deg: {t_hold:g} s holds, "
+        f"{t_ramp:g} s ramps, period {period:g} s, phase {phase:g} s."
+    )
+    _cycle.period = period
+    _cycle.levels = levels
+    return _cycle
+
+
 WD_FUNCTIONS = {
     "step_ramp_270_315": step_ramp_270_315,
     "hold_ramp_270_315": hold_ramp_270_315,
@@ -284,6 +329,12 @@ WD_FUNCTIONS = {
     # 800 s holds -> period 2240 s = exactly the 224-step in-training eval
     # window (--num_eval_steps 224).
     "cycle_270_235_slow_short": make_cycle(270.0, 235.0, 800.0, 320.0),
+    # --- LES-3x3 Stage 12 (exp_12 `sym`): two-sided _slow cycle ---
+    # Deterministic eval twin of cycle_270_235_305_slow_phase (phase 0): 270 ->
+    # 235 -> 270 -> 305 -> 270, 1600 s holds, 320 s ramps (0.1094 deg/s), period
+    # 7680 s; wd is at exactly 270 for 42 % of the period and above / below it
+    # for equal shares, so the yaw sign is defined on BOTH sides of 270.
+    "cycle_270_235_305_slow": make_cycle_knots((270.0, 235.0, 270.0, 305.0), 1600.0, 320.0),
     # Rate-transfer hold/ramp at the _slow ramp rate: 6 flow passthroughs of
     # the IEA22 les_3x3 max pairwise extent (4886.1 m) at the nominal 9 m/s
     # -> 3257 s pre-hold, then the 35 deg / 320 s ramp. 470-step cell like
@@ -495,7 +546,7 @@ class _CycleTrainSchedule:
     takes_base_wd = False
 
     def __init__(self, seed: int, wd_a: float, wd_b: float, t_hold: float,
-                 t_ramp: float, phase_max: float):
+                 t_ramp: float, phase_max: float, levels=None):
         phase_max = float(phase_max)
         if not (0.0 <= phase_max <= float(t_hold)):
             raise ValueError(
@@ -506,12 +557,26 @@ class _CycleTrainSchedule:
         self._wd_a, self._wd_b = float(wd_a), float(wd_b)
         self._t_hold, self._t_ramp = float(t_hold), float(t_ramp)
         self._phase_max = phase_max
-        self._base = make_cycle(wd_a, wd_b, t_hold, t_ramp)
+        if levels is None:
+            self._base = make_cycle(wd_a, wd_b, t_hold, t_ramp)
+            self._hold_starts = [0.0]
+        else:
+            # Stage 12 multi-level cycle: the phase is drawn inside ANY hold of the
+            # first level (for (270, 235, 270, 305): [0, t_hold) or [2 seg, 2 seg +
+            # t_hold), equal probability), so f(0) == levels[0] always and either
+            # excursion can come first.
+            self._base = make_cycle_knots(levels, t_hold, t_ramp)
+            seg = float(t_hold) + float(t_ramp)
+            self._hold_starts = [k * seg for k, v in enumerate(self._base.levels)
+                                 if v == self._base.levels[0]]
         self.period = self._base.period
         self.phase = 0.0
 
     def _draw(self) -> None:
-        self.phase = float(self._rng.uniform(0.0, self._phase_max)) if self._phase_max > 0 else 0.0
+        start = self._hold_starts[0]
+        if len(self._hold_starts) > 1:
+            start = self._hold_starts[int(self._rng.integers(len(self._hold_starts)))]
+        self.phase = start + (float(self._rng.uniform(0.0, self._phase_max)) if self._phase_max > 0 else 0.0)
 
     def __call__(self, t):
         t = float(t)
@@ -521,10 +586,17 @@ class _CycleTrainSchedule:
 
 
 def make_cycle_train(wd_a: float, wd_b: float, t_hold: float, t_ramp: float,
-                     seed: int, phase_max: float):
-    """Build a seeded ABSOLUTE cyclic training schedule, ``f(t) -> wd``."""
+                     seed: int, phase_max: float, levels=None):
+    """Build a seeded ABSOLUTE cyclic training schedule, ``f(t) -> wd``.
+
+    ``levels`` (Stage 12) replaces the two-level ``wd_a <-> wd_b`` cycle by the
+    knot cycle ``make_cycle_knots(levels, ...)``; ``wd_a`` / ``wd_b`` are then
+    only informative (``levels[0]`` must equal ``wd_a``).
+    """
+    if levels is not None and float(levels[0]) != float(wd_a):
+        raise ValueError(f"levels[0]={levels[0]} must equal wd_a={wd_a} (the pinned burn-in wd)")
     return _CycleTrainSchedule(seed=seed, wd_a=wd_a, wd_b=wd_b, t_hold=t_hold,
-                               t_ramp=t_ramp, phase_max=phase_max)
+                               t_ramp=t_ramp, phase_max=phase_max, levels=levels)
 
 
 # dr_ramp: broad DR. The rate band brackets the eval schedule's 0.0925 and
@@ -575,13 +647,25 @@ TRAIN_WD_FACTORIES = {
     # burn-in wd (les_recipe_pin270) and there is never a jump at t=0.
     "cycle_270_235_slow_phase": partial(make_cycle_train, 270.0, 235.0, 1600.0,
                                         320.0, phase_max=1600.0),
+    # cycle_270_235_305_slow_phase: Stage 12 (exp_12 `sym` / `symveer`) -- the
+    # TWO-SIDED _slow cycle 270 -> 235 -> 270 -> 305 -> 270 (1600 s holds, 320 s
+    # ramps, period 7680 s, band [235, 305], rate 0.1094 deg/s as the Stage-6..11
+    # schedule). Stage 11's one-sided schedule never showed wd > 270, so the
+    # policy's yaw sign above 270 was undefined and some seeds toggled at the
+    # est-wd jitter around 270. Phase rule: start inside EITHER 270 hold ([0,
+    # 1600) or [3840, 5440), equal probability), so f(0) == 270 == the pinned
+    # burn-in wd and either excursion can come first.
+    "cycle_270_235_305_slow_phase": partial(make_cycle_train, 270.0, 305.0, 1600.0,
+                                            320.0, phase_max=1600.0,
+                                            levels=(270.0, 235.0, 270.0, 305.0)),
 }
 
 # Training schedules that are ABSOLUTE (1-arg ``f(t)``): the preset's wd band
 # must be pinned to ``f(0)`` (checked by the trainer) and the env's wd domain
 # randomization is replaced, not composed with.
 ABSOLUTE_TRAIN_NAMES = frozenset({"cycle_270_235_phase",
-                                  "cycle_270_235_slow_phase"})
+                                  "cycle_270_235_slow_phase",
+                                  "cycle_270_235_305_slow_phase"})
 
 
 def get_train_wd_factory(name: str, seed: int):

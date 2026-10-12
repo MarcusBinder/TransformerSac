@@ -1669,7 +1669,9 @@ def quantile_huber_loss(
 
     Args:
         quantiles_pred: (batch, n_quantiles) predicted quantile values
-        target: (batch, 1) target Q-values
+        target: (batch, 1) scalar target Q-values, or (batch, n_targets) target
+            atoms (Stage-12 --tqc_atom_targets): the pairwise TD errors broadcast
+            to (batch, n_targets, n_quantiles) and the loss averages over all of them
         taus: (n_quantiles,) quantile midpoints
         kappa: Huber loss threshold
     Returns:

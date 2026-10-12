@@ -36,7 +36,8 @@ import json
 from config import Args
 from replay_buffer import TransformerReplayBuffer
 from helpers.training_utils import (
-    clear_gpu_memory, compute_adaptive_target_entropy,
+    buffer_done, clear_gpu_memory, compute_adaptive_target_entropy, env_seed_base, initial_log_alpha,
+    tqc_n_keep, tqc_td_target, lr_multiplier, lr_progress, alpha_learning_rate,
     get_env_current_layout, log_optimizer_effective_lr,
     compute_optimizer_diagnostics, log_finetune_diagnostics,
 )
@@ -835,6 +836,12 @@ def main():
             "wd_function": get_train_wd_factory(args.train_wd_function, seed=env_seed),
         })
 
+    # Stage 12: per-env seeds are env_seed_base_ + i (stride 1 = the old seed + i).
+    env_seed_base_ = env_seed_base(args.seed, args.env_seed_stride)
+    if args.env_seed_stride != 1:
+        print(f"Env seed stride: {args.env_seed_stride} -> per-env seeds "
+              f"{env_seed_base_}..{env_seed_base_ + args.num_envs - 1} (disjoint across seeds)")
+
     if args.train_wd_function is not None:
         from helpers.wd_functions import ABSOLUTE_TRAIN_NAMES, get_train_wd_factory
         if args.train_wd_function in ABSOLUTE_TRAIN_NAMES:
@@ -854,11 +861,11 @@ def main():
                 )
             print(f"Train wd_function: {args.train_wd_function} "
                   f"(ABSOLUTE; phase-randomised per episode; wd pinned by preset "
-                  f"to {_f0}; per-env seeds {args.seed}..{args.seed + args.num_envs - 1})")
+                  f"to {_f0}; per-env seeds {env_seed_base_}..{env_seed_base_ + args.num_envs - 1})")
         else:
             print(f"Train wd_function: {args.train_wd_function} "
                   f"(relative schedule; wd domain randomization preserved, "
-                  f"per-env seeds {args.seed}..{args.seed + args.num_envs - 1})")
+                  f"per-env seeds {env_seed_base_}..{env_seed_base_ + args.num_envs - 1})")
 
     def combined_wrapper(env: gym.Env) -> gym.Env:
         """
@@ -1046,10 +1053,13 @@ def main():
     # Daemonic workers cannot have children ("daemonic processes are not allowed
     # to have children"), so run them non-daemonic when --htc_path is set.
     envs = gym.vector.AsyncVectorEnv(
-        [make_env_fn(args.seed + i, warmup_lengths[i]) for i in range(args.num_envs)],
+        [make_env_fn(env_seed_base_ + i, warmup_lengths[i]) for i in range(args.num_envs)],
         autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,
         daemon=(args.htc_path is None),
     )
+    # The random warm-up actions (envs.action_space.sample() before
+    # learning_starts) were unseeded until Stage 12.
+    envs.action_space.seed(env_seed_base_)
     envs = RecordEpisodeVals(envs)
     # Non-daemonic workers won't auto-die with the parent, so make sure they
     # (and their HAWC2 atexit handlers) are joined on normal exit and on
@@ -1528,8 +1538,16 @@ def main():
         print(f"Actor parameters: {actor_params:,}")
         shared_note = (f" [shared trunk: 1 trunk x {args.tqc_n_critics} heads]"
                        if args.tqc_share_trunk else "")
-        print(f"TQC Critic parameters: {critic_params:,} ({args.tqc_n_critics} critics x {args.tqc_n_quantiles} quantiles){shared_note}")
+        # Stage 12: the truncation is resolved ONCE here (default 2 of 125 dropped
+        # in total = 123 kept; --tqc_drop_per_net 2 = the paper's 115).
+        tqc_n_keep_ = tqc_n_keep(args.tqc_n_critics, args.tqc_n_quantiles,
+                                 args.tqc_top_quantiles_to_drop, args.tqc_drop_per_net)
+        print(f"TQC Critic parameters: {critic_params:,} ({args.tqc_n_critics} critics x {args.tqc_n_quantiles} quantiles){shared_note}; "
+              f"truncation keeps {tqc_n_keep_} of {args.tqc_n_critics * args.tqc_n_quantiles} atoms"
+              f"{' (per-net drop ' + str(args.tqc_drop_per_net) + ')' if args.tqc_drop_per_net is not None else ''}, "
+              f"targets {'per atom' if args.tqc_atom_targets else 'truncated mean'}")
     else:
+        tqc_n_keep_ = None
         # SAC: standard dual-critic setup (DroQ regularization applied via critic_kwargs if enabled)
         qf1 = TransformerCritic(**critic_kwargs).to(device)
         qf2 = TransformerCritic(**critic_kwargs).to(device)
@@ -1574,16 +1592,25 @@ def main():
     if args.use_droq:
         algo_str += " + DroQ"
     print(f"Algorithm: {algo_str}")
+    # Stage 12 (exp_12) flags, one greppable line (the LUMI smoke reads n_keep).
+    lr_multiplier(args.lr_schedule, 0.0, args.lr_final_frac)   # unknown schedule name fails here, not mid-run
+    print(f"[Stage12] bootstrap_truncated={args.bootstrap_truncated} env_seed_stride={args.env_seed_stride} "
+          f"alpha_init={args.alpha_init} lr_schedule={args.lr_schedule} lr_final_frac={args.lr_final_frac} "
+          f"tqc_drop_per_net={args.tqc_drop_per_net} tqc_atom_targets={args.tqc_atom_targets} n_keep={tqc_n_keep_} "
+          f"alpha_lr={alpha_learning_rate(args.alpha_lr, args.q_lr):g}")
 
 
     # Entropy tuning
+    # Stage 12: --alpha_init starts log_alpha at log(alpha_init) (default 0 = alpha 1.0);
+    # validated here even without autotune so a misplaced flag fails loudly.
+    _log_alpha0 = initial_log_alpha(args.alpha_init, args.autotune)
     if args.autotune:
         # Initial target entropy (will be adapted per-batch)
-        log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        log_alpha = torch.full((1,), _log_alpha0, requires_grad=True, device=device)
         # Keep alpha a detached GPU tensor (not a Python float) so the in-graph
         # loss math never forces a per-step .item() sync; materialized only at logging.
         alpha = log_alpha.exp().detach()
-        alpha_optimizer = make_adam([log_alpha], lr=args.q_lr)
+        alpha_optimizer = make_adam([log_alpha], lr=alpha_learning_rate(args.alpha_lr, args.q_lr))
     else:
         alpha = torch.tensor(float(args.alpha), device=device)
         log_alpha = None
@@ -2178,7 +2205,7 @@ def main():
     # deterministic but distinct per continuation chunk — otherwise every
     # resumed job would replay the same wind/DR episode sequence from scratch.
     # Unchanged when start_step == 0.
-    obs, infos = envs.reset(seed=args.seed + start_step)
+    obs, infos = envs.reset(seed=env_seed_base_ + start_step)
 
     # Tracking
     step_reward_window = deque(maxlen=1000)
@@ -2396,6 +2423,17 @@ def main():
         if global_step > args.learning_starts and len(rb) >= args.batch_size:
             _t_upd0 = time.perf_counter()
 
+            # Stage 12 --lr_schedule: actor + critic lr follow the schedule over
+            # the update budget (python floats into fused Adam); alpha untouched.
+            if args.lr_schedule != "none":
+                _lr_mult = lr_multiplier(args.lr_schedule,
+                                         lr_progress(global_step, args.learning_starts, args.total_timesteps),
+                                         args.lr_final_frac)
+                for _g in actor_optimizer.param_groups:
+                    _g["lr"] = args.policy_lr * _lr_mult
+                for _g in q_optimizer.param_groups:
+                    _g["lr"] = args.q_lr * _lr_mult
+
             # Calculate number of gradient updates for this iteration
             # This scales with num_envs to maintain consistent sample efficiency
             num_gradient_updates = max(1, int(args.num_envs * args.utd_ratio))
@@ -2464,9 +2502,12 @@ def main():
                         # Flatten across critics, sort, truncate top-d (fp32 for the target math)
                         all_target_q = target_quantiles.float().permute(1, 0, 2).reshape(batch_size_cur, -1)
                         sorted_q, _ = all_target_q.sort(dim=1)
-                        n_keep = args.tqc_n_critics * args.tqc_n_quantiles - args.tqc_top_quantiles_to_drop
-                        truncated_mean = sorted_q[:, :n_keep].mean(dim=1, keepdim=True)
-                        target_q = data["rewards"] + (1 - data["dones"]) * args.gamma * (truncated_mean - alpha * next_log_pi)
+                        # Stage 12: n_keep resolved once at startup (tqc_n_keep_); the
+                        # default target is bitwise the old truncated mean, (batch, 1);
+                        # --tqc_atom_targets keeps the (batch, n_keep) atoms.
+                        kept = sorted_q[:, :tqc_n_keep_]
+                        target_q = tqc_td_target(kept, data["rewards"], data["dones"], args.gamma,
+                                                 alpha, next_log_pi, args.tqc_atom_targets)
 
                     # Current quantiles: (n_critics, batch, n_quantiles)
                     with amp_ctx:
@@ -2631,8 +2672,8 @@ def main():
                             batch_size_cur = data["rewards"].shape[0]
                             all_q_flat = all_q.permute(1, 0, 2).reshape(batch_size_cur, -1)
                             sorted_q, _ = all_q_flat.sort(dim=1)
-                            n_keep = args.tqc_n_critics * args.tqc_n_quantiles - args.tqc_top_quantiles_to_drop
-                            min_qf_pi = sorted_q[:, :n_keep].mean(dim=1, keepdim=True)
+                            # the actor keeps the truncated mean (same n_keep as the critic target)
+                            min_qf_pi = sorted_q[:, :tqc_n_keep_].mean(dim=1, keepdim=True)
                         else:
                             # .clone(): see target-critic note above (shared CUDA-graph pool).
                             qf1_pi = qf1(data["observations"], actions_pi, data["positions"],
@@ -2797,6 +2838,8 @@ def main():
 
                 writer.add_scalar("losses/actor_loss", mean_actor_loss, global_step)
                 writer.add_scalar("losses/alpha", alpha_val, global_step)
+                writer.add_scalar("charts/lr_actor", float(actor_optimizer.param_groups[0]["lr"]), global_step)
+                writer.add_scalar("charts/lr_critic", float(q_optimizer.param_groups[0]["lr"]), global_step)
 
                 # --- losses/* : health of the value function and the updates ---
                 writer.add_scalar("losses/critic_grad_norm",
@@ -3296,7 +3339,9 @@ def main():
 
         # Store in replay buffer
         for i in range(args.num_envs):
-            done = terminations[i] or truncations[i]
+            # Stage 12: --bootstrap_truncated keeps the bootstrap through the
+            # time-limit truncation (the only `done` windgym ever produces).
+            done = buffer_done(terminations[i], truncations[i], args.bootstrap_truncated)
             action_reshaped = actions[i].reshape(-1, action_dim_per_turbine)
 
             layout_idx_i = current_layout_indices[i] if current_layout_indices is not None else None

@@ -443,6 +443,14 @@ class Args:
     # ~4x fewer critic params / 2 trunk passes per grad-step instead of 2*n_critics; relies
     # on TQC's quantile truncation (not ensemble independence) to control overestimation.
     # Checkpoints are NOT interchangeable with the independent TQC critic.
+    # Stage 12 (exp_12 `tqc_std`): paper-form TQC pessimism. tqc_drop_per_net = d
+    # atoms dropped PER critic (n_keep = N*M - d*N; 5 x 25 with d 2 keeps 115 of
+    # 125) instead of tqc_top_quantiles_to_drop dropped in TOTAL (123 kept).
+    # tqc_atom_targets regresses every quantile head against the (batch, n_keep)
+    # target atoms (the paper's form) instead of their truncated mean (a scalar).
+    # Both default to the Stage-8..11 behaviour; the actor keeps the truncated mean.
+    tqc_drop_per_net: Optional[int] = None
+    tqc_atom_targets: bool = False
 
     # === DroQ Hyperparameters (only used when use_droq=True) ===
     droq_dropout: float = 0.01           # Dropout rate for DroQ critic MLPs
@@ -463,6 +471,13 @@ class Args:
     target_network_frequency: int = 1
     alpha: float = 0.2            # Initial entropy coefficient
     autotune: bool = True         # Auto-tune entropy coefficient
+    # Stage 12 (exp_12) learning-signal flags, every default = the Stage-11 behaviour.
+    alpha_init: Optional[float] = None   # autotune only: log_alpha starts at log(alpha_init) instead of 0 (alpha 1.0)
+    lr_schedule: str = "none"            # "none" | "cosine" | "linear": actor + critic lr decay over the update budget
+    lr_final_frac: float = 0.1           # lr at the end of the schedule as a fraction of the peak (alpha lr untouched)
+    alpha_lr: Optional[float] = None     # entropy-coefficient optimizer lr; None = q_lr (the old coupling)
+    bootstrap_truncated: bool = False    # store done = terminated only (time-limit truncations keep their bootstrap)
+    env_seed_stride: int = 1             # per-env seeds = seed * stride + i; stride 1000 gives seeds 1..6 disjoint env streams
     entropy_agg: str = "sum"      # Per-farm entropy aggregation over turbines: "sum"
     # (standard SAC: log_pi summed -> O(N), target entropy -N) or "mean" (per-turbine
     # MEAN -> O(1), target entropy -1/dim). "mean" makes the entropy regularization

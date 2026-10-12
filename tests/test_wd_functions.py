@@ -23,6 +23,7 @@ from helpers.wd_functions import (
     get_train_wd_factory,
     get_wd_function,
     make_cycle,
+    make_cycle_knots,
     make_cycle_train,
     make_dr_ramp,
     make_hold_ramp,
@@ -153,7 +154,7 @@ def test_wd_stays_inside_the_training_wd_domain(name):
 @pytest.mark.parametrize(
     "name, rate_lo, rate_hi",
     [("dr_ramp", 0.02, 0.25), ("dr_ramp_narrow", 0.09, 0.14),
-     ("dr_ramp_les", 0.03, 0.08)],
+     ("dr_ramp_les", 0.03, 0.08), ("cycle_270_235_305_slow_phase", 35.0 / 320.0, 35.0 / 320.0)],
 )
 def test_instantaneous_rate_never_exceeds_the_declared_band(name, rate_lo, rate_hi):
     fn = get_train_wd_factory(name, seed=5)
@@ -166,7 +167,7 @@ def test_instantaneous_rate_never_exceeds_the_declared_band(name, rate_lo, rate_
 @pytest.mark.parametrize(
     "name, rate_lo, rate_hi",
     [("dr_ramp", 0.02, 0.25), ("dr_ramp_narrow", 0.09, 0.14),
-     ("dr_ramp_les", 0.03, 0.08)],
+     ("dr_ramp_les", 0.03, 0.08), ("cycle_270_235_305_slow_phase", 35.0 / 320.0, 35.0 / 320.0)],
 )
 def test_every_episode_actually_ramps(name, rate_lo, rate_hi):
     """A hold-only episode would silently turn the arm into a static-wd control."""
@@ -715,3 +716,93 @@ def test_slow_cycle_rate_vs_iea22_frame_slew_limit():
         rates = np.abs(np.diff(wd)) / DT_SIM
         assert rates.max() == pytest.approx(SLOW_RATE)
         assert rates.max() < _frame_slew_iea22(30.0)
+
+
+# ---------------------------------------------------------------------------
+# LES-3x3 Stage 12 (exp_12 `sym` / `symveer`): the two-sided _slow cycle
+# 270 -> 235 -> 270 -> 305 -> 270 (knot-based make_cycle_knots)
+# ---------------------------------------------------------------------------
+
+SYM_LEVELS = (270.0, 235.0, 270.0, 305.0)
+SYM_PERIOD = 4 * (1600.0 + 320.0)   # 7680 s
+LONG_GRID = np.arange(0.0, 10000.0 + DT_SIM, DT_SIM)
+
+
+def test_make_cycle_knots_with_two_levels_is_make_cycle():
+    knots = make_cycle_knots((270.0, 235.0), 1600.0, 320.0)
+    base = make_cycle(270.0, 235.0, 1600.0, 320.0)
+    t = np.arange(0.0, 3 * 3840.0, 1.0)
+    np.testing.assert_allclose(knots(t), base(t))
+    assert knots.period == pytest.approx(base.period)
+    assert float(knots(0.0)) == pytest.approx(270.0)
+    # a phase shifts where t=0 lands, as in make_cycle
+    np.testing.assert_allclose(make_cycle_knots((270.0, 235.0), 1600.0, 320.0, phase=500.0)(t), base(t + 500.0))
+
+
+def test_make_cycle_knots_rejects_bad_timing():
+    with pytest.raises(ValueError):
+        make_cycle_knots(SYM_LEVELS, 1600.0, 0.0)
+    with pytest.raises(ValueError):
+        make_cycle_knots((270.0,), 1600.0, 320.0)
+
+
+def test_cycle_270_235_305_slow_shape_period_rate_and_270_share():
+    fn = get_wd_function("cycle_270_235_305_slow")
+    assert fn.period == pytest.approx(SYM_PERIOD)
+    for t, wd in ((0.0, 270.0), (1599.0, 270.0), (1760.0, 252.5), (1920.0, 235.0), (3519.0, 235.0),
+                  (3680.0, 252.5), (3840.0, 270.0), (5439.0, 270.0), (5600.0, 287.5), (5760.0, 305.0),
+                  (7359.0, 305.0), (7520.0, 287.5), (7680.0, 270.0)):
+        assert float(fn(t)) == pytest.approx(wd), t
+    t = np.arange(0.0, SYM_PERIOD, 1.0)
+    np.testing.assert_allclose(fn(t), fn(t + SYM_PERIOD))
+    rates = np.diff(np.asarray(fn(np.arange(0.0, 2 * SYM_PERIOD + 1.0, 1.0)), dtype=float))
+    assert np.abs(rates).max() == pytest.approx(SLOW_RATE)
+    assert set(np.round(np.abs(rates), 9)) == {0.0, round(SLOW_RATE, 9)}
+    wd = np.asarray(fn(t), dtype=float)
+    assert wd.min() == pytest.approx(235.0) and wd.max() == pytest.approx(305.0)
+    # 42 % of the time at exactly 270 (two 1600 s holds of 7680 s), the rest split evenly
+    share_270 = np.mean(np.isclose(wd, 270.0))
+    assert share_270 == pytest.approx(3200.0 / SYM_PERIOD, abs=0.002)
+    assert np.mean(wd > 270.0) == pytest.approx(np.mean(wd < 270.0), abs=0.002)
+
+
+def test_cycle_270_235_305_slow_phase_is_absolute_starts_in_a_270_hold_and_phases_vary():
+    from WindGym.core.wind_manager import WindManager
+    fn = get_train_wd_factory("cycle_270_235_305_slow_phase", seed=5)
+    assert fn.takes_base_wd is False
+    assert WindManager._wd_function_takes_base_wd(fn) is False
+    base = get_wd_function("cycle_270_235_305_slow")
+    phases, first_dir = [], []
+    for _ in range(200):
+        wd = _trajectory(fn)
+        assert wd[0] == pytest.approx(270.0)
+        phase = fn.phase
+        # either 270 hold: [0, 1600) or [3840, 5440)
+        assert (0.0 <= phase < 1600.0) or (3840.0 <= phase < 5440.0)
+        np.testing.assert_allclose(wd, np.asarray(base(EPISODE_GRID + phase), dtype=float))
+        phases.append(phase)
+        first = wd[np.nonzero(np.abs(wd - 270.0) > 1e-9)[0][0]]
+        first_dir.append(np.sign(first - 270.0))
+    phases = np.asarray(phases)
+    assert (phases < 1600.0).sum() > 60 and (phases >= 3840.0).sum() > 60   # both holds are used
+    assert len(np.unique(np.round(phases, 3))) > 180
+    first_dir = np.asarray(first_dir)
+    assert (first_dir < 0).sum() > 60 and (first_dir > 0).sum() > 60   # either excursion comes first
+
+
+def test_cycle_270_235_305_slow_phase_visits_both_excursions_in_a_10000_s_episode():
+    fn = get_train_wd_factory("cycle_270_235_305_slow_phase", seed=9)
+    for _ in range(50):
+        wd = _trajectory(fn, grid=LONG_GRID)
+        assert wd.min() == pytest.approx(235.0) and wd.max() == pytest.approx(305.0)
+        rates = np.abs(np.diff(wd)) / DT_SIM
+        assert rates.max() == pytest.approx(SLOW_RATE)
+
+
+def test_cycle_270_235_305_registries_are_disjoint_and_absolute():
+    assert "cycle_270_235_305_slow" in WD_FUNCTIONS and "cycle_270_235_305_slow" not in TRAIN_WD_FACTORIES
+    assert "cycle_270_235_305_slow_phase" in TRAIN_WD_FACTORIES and "cycle_270_235_305_slow_phase" not in WD_FUNCTIONS
+    assert "cycle_270_235_305_slow_phase" in ABSOLUTE_TRAIN_NAMES
+    assert set(ABSOLUTE_TRAIN_NAMES) & set(WD_FUNCTIONS) == set()
+    with pytest.raises(ValueError):
+        get_train_wd_factory("cycle_270_235_305_slow", seed=0)
