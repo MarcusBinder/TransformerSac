@@ -396,6 +396,36 @@ ENV_CONFIGS: Dict[str, Dict[str, Any]] = {
         },
     },
 
+    # LES-3x3 Stage 14 (exp_14): static wd ~ U[235, 270] per episode, no
+    # --train_wd_function (WindManager._sample_uniform); the les_v2 twin of
+    # les_recipe_band235 (arm `static`, run_exp14_lumi.sh).
+    "les_recipe_band235_v2": {
+        "dwm_setup": "les_v2",
+        "power_def": {"Power_reward": "Wake_recovery", "Power_avg": 5, "Power_scaling": 1.0},
+        "farm": {"yaw_min": -45, "yaw_max": 45},
+        "wind": {
+            "wd_min": 235, "wd_max": 270,
+            "ws_min": 8, "ws_max": 11,
+            "TI_min": 0.038, "TI_max": 0.038,
+        },
+    },
+
+    # LES-3x3 Stage 14 (exp_14): static wd ~ U[225, 315] per episode, no
+    # --train_wd_function, so 235 and 270 are INTERIOR points of the band
+    # (arms `static_wide*`, `mix`, `walk`, `*_stat`, `grid_held`); also the
+    # base_wd band of the relative wd functions (`mix_static_ramp`,
+    # `dr_ramp_narrow`) when one is passed.
+    "les_recipe_band_v2": {
+        "dwm_setup": "les_v2",
+        "power_def": {"Power_reward": "Wake_recovery", "Power_avg": 5, "Power_scaling": 1.0},
+        "farm": {"yaw_min": -45, "yaw_max": 45},
+        "wind": {
+            "wd_min": 225, "wd_max": 315,
+            "ws_min": 8, "ws_max": 11,
+            "TI_min": 0.038, "TI_max": 0.038,
+        },
+    },
+
     # LES-3x3 Stage 5 static-band CONTROL: les_recipe with static wd ~ U[235, 270]
     # per episode (no --train_wd_function) -- the same wd support the cycle arms
     # sweep through, but never a transition inside an episode.

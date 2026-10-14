@@ -21,7 +21,7 @@ from helpers.obs_agg import (  # noqa: E402
 )
 
 TRAINED_MODES = ["latest", "mean_std", "ema", "trend", "minmax", "quantiles",
-                 "raw15", "raw15span", "spectral", "spatial_rel"]
+                 "raw15", "raw15span", "spectral", "spatial_rel", "raw15span_dev"]
 ALL_MODES = ["raw3"] + TRAINED_MODES
 RANGES = {"ws": (0.0, 30.0), "wd": (0.0, 360.0), "yaw": (-45.0, 45.0),
           "power": (0.0, 10e6)}
@@ -41,7 +41,7 @@ def test_registry_matches_plan():
     K = {m: AGG_MODES[m].K for m in AGG_MODES}
     assert K == {"raw3": 3, "latest": 1, "mean_std": 3, "ema": 4, "trend": 4,
                  "minmax": 4, "quantiles": 3, "raw15": 15, "raw15span": 15,
-                 "spectral": 5, "spatial_rel": 3}
+                 "spectral": 5, "spatial_rel": 3, "raw15span_dev": 15}
 
 
 @pytest.mark.parametrize("mode", ALL_MODES)
@@ -50,10 +50,11 @@ def test_shapes_and_scaled_range(mode, q):
     rng = np.random.default_rng(0)
     lo, hi = RANGES[q]
     buf = _buf(rng, lo=lo + 0.3 * (hi - lo), hi=lo + 0.4 * (hi - lo))
-    feats = reduce_quantity(mode, q, buf, L=L, dt_env=DT, front=0)
+    feats = reduce_quantity(mode, q, buf, L=L, dt_env=DT, front=0,
+                            frame_wd=float(buf[-1].mean()))
     assert feats.shape == (4, AGG_MODES[mode].K)
     assert np.isfinite(feats).all()
-    scaled = scale_features(feats, AGG_MODES[mode].kinds, q, lo, hi)
+    scaled = scale_features(feats, AGG_MODES[mode].kinds_for(q), q, lo, hi)
     assert scaled.dtype == np.float32 and scaled.shape == feats.shape
     assert (scaled >= -1).all() and (scaled <= 1).all()
 
@@ -226,6 +227,76 @@ def test_raw15span_short_buffer_pads_with_the_oldest_sample():
     padded = np.concatenate([np.full(Lspan - m, 3.0), np.arange(m) + 3.0])
     assert np.allclose(f[0], padded[idx])
     assert f[0, -1] == 12.0                                # newest still last
+
+
+# ---------------------------------------------------------------------------
+# Stage 14: raw15span_dev (wd block relative to the policy-frame wd)
+# ---------------------------------------------------------------------------
+
+def test_raw15span_dev_wd_block_is_relative_to_the_frame():
+    buf = np.full((L, 3), 250.0)
+    out = reduce_quantity("raw15span_dev", "wd", buf, L=L, dt_env=DT, front=0, frame_wd=270.0)
+    ref = reduce_quantity("raw15span", "wd", buf, L=L, dt_env=DT, front=0)   # shape only
+    assert out.shape == ref.shape == (3, N_RAW)
+    assert np.allclose(out, -20.0)                       # physical: local wd - frame
+    raw = AGG_MODES["raw15span_dev"].fn(
+        buf - 250.0, {"L": L, "raw": buf, "center": np.full(3, 250.0), "frame_wd": 270.0,
+                      "q": "wd", "circular": True})
+    assert np.allclose(raw, -20.0)
+
+
+def test_raw15span_dev_wraps_the_circular_difference():
+    buf = np.full((L, 2), 5.0)        # local wd 5 deg, frame 350 deg -> +15, not -345
+    out = reduce_quantity("raw15span_dev", "wd", buf, L=L, dt_env=DT, front=0, frame_wd=350.0)
+    assert np.allclose(out, 15.0)
+
+
+def test_raw15span_dev_wd_block_is_signed_and_scaled_as_sdev():
+    """-20 deg must land strictly inside (-1, 0): a 'disp' (0..D) kind would clip
+    every negative deviation to -1."""
+    buf = np.full((L, 3), 250.0)
+    feats = reduce_quantity("raw15span_dev", "wd", buf, L=L, dt_env=DT, front=0, frame_wd=270.0)
+    kinds = AGG_MODES["raw15span_dev"].kinds_for("wd")
+    assert kinds == ("sdev",) * N_RAW
+    scaled = scale_features(feats, kinds, "wd", 0.0, 360.0)
+    lo, hi = scale_table("sdev", "wd", 0.0, 360.0)
+    assert (lo, hi) == (-30.0, 30.0)
+    assert np.allclose(scaled, -20.0 / 30.0)
+    # the level kinds still apply to ws / yaw / power
+    assert AGG_MODES["raw15span_dev"].kinds_for("ws") == ("level",) * N_RAW
+
+
+def test_raw15span_dev_equals_raw15span_for_ws_yaw_power():
+    rng = np.random.default_rng(5)
+    buf = rng.uniform(8, 11, size=(L, 3))
+    for q in ("ws", "yaw", "power"):
+        a = reduce_quantity("raw15span_dev", q, buf, L=L, dt_env=DT, front=0)
+        b = reduce_quantity("raw15span", q, buf, L=L, dt_env=DT, front=0)
+        np.testing.assert_array_equal(a, b)
+
+
+def test_raw15span_dev_takes_the_same_linspace_samples():
+    Lspan = 60
+    buf = (np.arange(Lspan, dtype=float)[:, None] * np.ones((1, 2))) + 240.0   # 240..299
+    out = reduce_quantity("raw15span_dev", "wd", buf, L=Lspan, dt_env=DT, front=0, frame_wd=270.0)
+    idx = np.round(np.linspace(0, Lspan - 1, N_RAW)).astype(int)
+    assert np.allclose(out[0], buf[idx, 0] - 270.0)
+    assert out[0, -1] == 29.0                              # newest included
+
+
+def test_raw15span_dev_wd_without_a_frame_is_refused():
+    buf = np.full((L, 2), 250.0)
+    with pytest.raises(ValueError, match="frame_wd"):
+        reduce_quantity("raw15span_dev", "wd", buf, L=L, dt_env=DT, front=0)
+
+
+def test_other_modes_ignore_frame_wd():
+    rng = np.random.default_rng(8)
+    buf = rng.uniform(260, 280, size=(L, 3))
+    for mode in ("raw15span", "mean_std", "trend"):
+        a = reduce_quantity(mode, "wd", buf, L=L, dt_env=DT, front=0)
+        b = reduce_quantity(mode, "wd", buf, L=L, dt_env=DT, front=0, frame_wd=123.0)
+        np.testing.assert_array_equal(a, b)
 
 
 # ---------------------------------------------------------------------------

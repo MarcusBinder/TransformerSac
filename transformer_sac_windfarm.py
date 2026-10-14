@@ -249,6 +249,72 @@ def in_training_eval_enabled(args) -> bool:
     return bool(args.eval_initial) or (args.eval_interval <= args.total_timesteps)
 
 
+def build_dr_layout_pool(args, wind_turbine, build=None):
+    """Stage 14: the domain-randomization layout pool as ``(name, x, y)`` tuples.
+
+    Factored out of ``main()`` so the include / exclude logic is unit-testable
+    (tests/test_stage14_presets.py). ``generate_layout_pool`` draws
+    ``args.dr_pool_size`` procedural farms (``args.dr_generator``, grid spacing
+    band ``args.dr_grid_spacing_lo/hi`` D, ``args.dr_grid_exclude_D``); then every
+    name in ``args.dr_include_layouts`` is appended ``round(dr_include_weight *
+    dr_pool_size)`` times (the env draws layouts uniformly, so k copies = that
+    sampling share; the first copy keeps the plain name, later ones are
+    ``<name>_inc<i>`` because layout names must be unique). Prints the pool's
+    extent / span bounds, which the LUMI launcher's reset-sync and frame-slew
+    guards recompute from the same generator and seed. ``build`` (optional)
+    maps each tuple to a LayoutConfig.
+    """
+    from helpers.layout_gen import (generate_layout_pool, parse_grid_exclude,
+                                    pool_extent_bounds, pool_span_bounds)
+    from helpers.layouts import get_layout_positions
+
+    print(f"Domain randomization: generating {args.dr_pool_size} layouts "
+          f"with n in [{args.dr_n_lo}, {args.dr_n_hi}] (seed={args.seed}, "
+          f"generator={args.dr_generator}, grid spacing "
+          f"{args.dr_grid_spacing_lo}-{args.dr_grid_spacing_hi} D, "
+          f"exclude={args.dr_grid_exclude_D})...")
+    pool = generate_layout_pool(
+        pool_size=args.dr_pool_size,
+        n_lo=args.dr_n_lo,
+        n_hi=args.dr_n_hi,
+        D=float(wind_turbine.diameter()),
+        seed=args.seed,
+        min_dist_D=args.dr_min_dist_D,
+        screen_headroom=args.dr_screen_headroom,
+        min_involved_frac=args.dr_min_involved_frac,
+        generator=args.dr_generator,
+        grid_spacing_lo_D=args.dr_grid_spacing_lo,
+        grid_spacing_hi_D=args.dr_grid_spacing_hi,
+        grid_exclude=parse_grid_exclude(args.dr_grid_exclude_D),
+    )
+    pool = list(pool)
+    include = [n.strip() for n in (args.dr_include_layouts or "").split(",") if n.strip()]
+    if include:
+        k = int(round(float(args.dr_include_weight) * args.dr_pool_size))
+        if k <= 0:
+            raise ValueError(
+                f"--dr_include_layouts {args.dr_include_layouts!r} with "
+                f"--dr_include_weight {args.dr_include_weight} gives 0 copies; "
+                f"raise the weight or drop the flag")
+        for name in include:
+            x_pos, y_pos = get_layout_positions(name, wind_turbine)
+            for i in range(k):
+                nm = name if i == 0 else f"{name}_inc{i}"
+                pool.append((nm, np.asarray(x_pos, float), np.asarray(y_pos, float)))
+            print(f"  included named layout {name!r} x {k} "
+                  f"(share {k / len(pool):.3f} of {len(pool)} entries)")
+    names = [n for n, _, _ in pool]
+    if len(set(names)) != len(names):
+        raise ValueError("layout pool names are not unique")
+    elo, ehi = pool_extent_bounds(pool)
+    slo, shi = pool_span_bounds(pool)
+    print(f"[layout_pool] extent from centre: min {elo:.0f} m, max {ehi:.0f} m; "
+          f"max pairwise span: min {slo:.0f} m, max {shi:.0f} m")
+    if build is not None:
+        return [build(n, x, y) for n, x, y in pool]
+    return pool
+
+
 def main():
     """Main training function."""
     
@@ -431,23 +497,9 @@ def main():
         # Domain randomization (v8): training layouts are a large procedurally
         # generated pool instead of the fixed named set. Pool seeded from --seed so
         # different seeds draw different layout sets. See helpers/layout_gen.py.
-        from helpers.layout_gen import generate_layout_pool
-        print(f"Domain randomization: generating {args.dr_pool_size} layouts "
-              f"with n in [{args.dr_n_lo}, {args.dr_n_hi}] (seed={args.seed}, "
-              f"generator={args.dr_generator})...")
-        pool = generate_layout_pool(
-            pool_size=args.dr_pool_size,
-            n_lo=args.dr_n_lo,
-            n_hi=args.dr_n_hi,
-            D=wind_turbine.diameter(),
-            seed=args.seed,
-            min_dist_D=args.dr_min_dist_D,
-            screen_headroom=args.dr_screen_headroom,
-            min_involved_frac=args.dr_min_involved_frac,
-            generator=args.dr_generator,
-        )
-        for name, x_pos, y_pos in pool:
-            layouts.append(build_layout_config(name, x_pos, y_pos, verbose=False))
+        layouts = build_dr_layout_pool(
+            args, wind_turbine,
+            build=lambda name, x_pos, y_pos: build_layout_config(name, x_pos, y_pos, verbose=False))
         layout_names = [l.name for l in layouts]
         print(f"  generated {len(layouts)} layouts; "
               f"turbine counts {min(l.n_turbines for l in layouts)}..{max(l.n_turbines for l in layouts)}")

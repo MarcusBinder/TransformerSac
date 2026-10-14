@@ -389,7 +389,14 @@ class Args:
     dr_min_dist_D: float = 3.0       # minimum turbine spacing in rotor diameters
     dr_screen_headroom: bool = True  # reject generated layouts with no wake-steering headroom
     dr_min_involved_frac: float = 0.5  # min fraction of turbines in a wake interaction to keep a layout
-    dr_generator: str = "irregular"  # {"irregular","cluster","grid"}: procedural pool generator (cluster = PLayGen Poisson-disc; grid = rotated regular grids, dr_n_lo/hi bound nx*ny)
+    dr_generator: str = "irregular"  # {"irregular","cluster","grid","mixed"}: procedural pool generator (cluster = PLayGen Poisson-disc; grid = rotated regular grids, dr_n_lo/hi bound nx*ny; mixed = alternating grid / cluster)
+    # Stage 14 (exp_14) layout-pool knobs (helpers/layout_gen.py). Defaults = the
+    # old behaviour (grid spacing 4-7 D, nothing excluded, nothing included).
+    dr_grid_spacing_lo: float = 4.0        # grid generator: per-axis spacing band lower bound (D)
+    dr_grid_spacing_hi: float = 7.0        # grid generator: per-axis spacing band upper bound (D)
+    dr_grid_exclude_D: Optional[str] = None  # "sx:sy:tol" in D: re-draw grids within tol of that pair in either ordering (grid_held: "7:5:0.5")
+    dr_include_layouts: Optional[str] = None  # comma-separated NAMED layouts (helpers/layouts.py) appended to the pool, e.g. "les_3x3"
+    dr_include_weight: float = 0.0         # sampling share per included name: round(weight * dr_pool_size) copies are appended (uniform draw -> that share)
 
     # === Observation Settings ===
     history_length: int = 15            # Raw measurements buffered per feature (deque size; sets warm-up length)

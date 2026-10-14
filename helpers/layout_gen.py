@@ -65,7 +65,8 @@ def make_cluster(n_turbines, seed, D):
     return xy[:, 0].astype(float), xy[:, 1].astype(float)
 
 
-def make_grid(n_lo, n_hi, seed, D, spacing_lo_D=4.0, spacing_hi_D=7.0, jitter_D=0.0):
+def make_grid(n_lo, n_hi, seed, D, spacing_lo_D=4.0, spacing_hi_D=7.0, jitter_D=0.0,
+              return_spacing=False):
     """One random rotated nx x ny grid layout with n_lo <= nx*ny <= n_hi turbines.
 
     Regular-grid archetype for the change_wd sweep: real farms are mostly (rotated)
@@ -77,7 +78,9 @@ def make_grid(n_lo, n_hi, seed, D, spacing_lo_D=4.0, spacing_hi_D=7.0, jitter_D=
     then the centred grid is rotated by theta ~ U[0, 2pi). ``jitter_D`` adds optional
     per-turbine uniform jitter (default 0 = pure grids). With spacing >= 4D the
     3D min-spacing constraint used elsewhere is always satisfied.
-    Returns ``(x_array, y_array)`` to mirror ``make_irregular``.
+    Returns ``(x_array, y_array)`` to mirror ``make_irregular``; with
+    ``return_spacing=True`` also the drawn ``(sx_D, sy_D)`` (Stage 14: the
+    ``grid_exclude`` rule of ``generate_layout_pool`` needs them).
     """
     rng = np.random.default_rng(seed)
     shapes = [(nx, ny) for nx in range(2, n_hi + 1) for ny in range(2, n_hi + 1)
@@ -96,7 +99,60 @@ def make_grid(n_lo, n_hi, seed, D, spacing_lo_D=4.0, spacing_hi_D=7.0, jitter_D=
     if jitter_D > 0.0:
         x = x + rng.uniform(-jitter_D, jitter_D, size=x.shape) * D
         y = y + rng.uniform(-jitter_D, jitter_D, size=y.shape) * D
+    if return_spacing:
+        return x, y, sx / D, sy / D
     return x, y
+
+
+def grid_is_excluded(sx_D: float, sy_D: float, exclude) -> bool:
+    """Stage 14 ``grid_held``: True if the drawn per-axis spacings (in D) lie
+    within ``tol`` of the excluded pair ``(ex, ey)`` in EITHER ordering (a grid
+    is rotated by U[0, 2pi), so 7 x 5 and 5 x 7 are the same farm)."""
+    if exclude is None:
+        return False
+    ex, ey, tol = (float(v) for v in exclude)
+    return bool((abs(sx_D - ex) <= tol and abs(sy_D - ey) <= tol)
+                or (abs(sx_D - ey) <= tol and abs(sy_D - ex) <= tol))
+
+
+def parse_grid_exclude(spec):
+    """``"sx:sy:tol"`` (rotor diameters, trainer flag ``--dr_grid_exclude_D``)
+    -> ``(sx, sy, tol)`` or None for an empty / None spec."""
+    if spec is None or str(spec).strip() == "":
+        return None
+    parts = str(spec).split(":")
+    if len(parts) != 3:
+        raise ValueError(f"--dr_grid_exclude_D expects 'sx:sy:tol' in D, got {spec!r}")
+    sx, sy, tol = (float(v) for v in parts)
+    if tol < 0 or sx <= 0 or sy <= 0:
+        raise ValueError(f"--dr_grid_exclude_D needs sx, sy > 0 and tol >= 0, got {spec!r}")
+    return (sx, sy, tol)
+
+
+def pool_extent_bounds(pool, D=None):
+    """(min, max) over the pool of each layout's max distance from its
+    BOUNDING-BOX centre (m) -- exactly the ``max_dist`` of windgym
+    ``core/episode_timing.max_wd_step``, whose wd_slow frame-slew cap is
+    ``max_turb_move * 360 / (2 pi max_dist)`` deg per sim step. ``D`` is
+    accepted for call symmetry with ``generate_layout_pool`` and unused."""
+    per = []
+    for _, x, y in pool:
+        x = np.asarray(x, float); y = np.asarray(y, float)
+        cx, cy = (x.max() + x.min()) / 2.0, (y.max() + y.min()) / 2.0
+        per.append(float(np.hypot(x - cx, y - cy).max()))
+    return min(per), max(per)
+
+
+def pool_span_bounds(pool, D=None):
+    """(min, max) over the pool of each layout's max pairwise turbine distance
+    (m) -- exactly the ``max_distance`` of windgym ``core/episode_timing.py``,
+    whose reset-sync cap is ``time_max = max_distance * n_passthrough / ws``.
+    The min bounds the episode length the SMALLEST pool layout allows."""
+    per = []
+    for _, x, y in pool:
+        d = np.sqrt((x[:, None] - x[None, :]) ** 2 + (y[:, None] - y[None, :]) ** 2)
+        per.append(float(d.max()))
+    return min(per), max(per)
 
 
 # Operating wind rose for these experiments (matches layout_tools.WDIRS = 225..315),
@@ -167,6 +223,9 @@ def generate_layout_pool(
     screen_headroom: bool = True,
     min_involved_frac: float = 0.5,
     generator: str = "irregular",
+    grid_spacing_lo_D: float = 4.0,
+    grid_spacing_hi_D: float = 7.0,
+    grid_exclude=None,
 ) -> List[Tuple[str, np.ndarray, np.ndarray]]:
     """Build a pool of ``pool_size`` procedural layouts for DR training.
 
@@ -181,7 +240,13 @@ def generate_layout_pool(
         spacing; ``min_dist_D``/spread ignored). Names ``drc_n{n}_k{k}``.
       * ``"grid"`` — rotated regular grids via ``make_grid``; (nx, ny) is sampled
         inside the generator so n_lo/n_hi bound nx*ny (the loop's per-entry n is
-        ignored; names use the actual count). Names ``drg_n{n}_k{k}``.
+        ignored; names use the actual count). Names ``drg_n{n}_k{k}``. Per-axis
+        spacing ~ U[grid_spacing_lo_D, grid_spacing_hi_D] (Stage 14 default 4-7 D as
+        before; the exp_14 grid arms use 5-9 D); ``grid_exclude=(sx, sy, tol)`` in D
+        re-draws any grid within ``tol`` of that spacing pair in either ordering
+        (Stage 14 ``grid_held``: hold out the les_3x3 7 x 5 D farm).
+      * ``"mixed"`` — alternates ``grid`` / ``cluster`` per pool entry (even k =
+        grid, odd k = cluster); names follow the entry's archetype.
 
     Returns a list of ``(name, x_pos, y_pos)`` tuples with unique names. Profiles are
     intentionally NOT computed here — the caller attaches them (geometric or pywake)
@@ -189,12 +254,16 @@ def generate_layout_pool(
     """
     if n_lo > n_hi:
         raise ValueError(f"dr_n_lo ({n_lo}) must be <= dr_n_hi ({n_hi})")
-    if generator not in ("irregular", "cluster", "grid"):
-        raise ValueError(f"unknown generator '{generator}' (expected 'irregular', 'cluster' or 'grid')")
-    name_prefix = {"cluster": "drc", "grid": "drg"}.get(generator, "dr")
+    if generator not in ("irregular", "cluster", "grid", "mixed"):
+        raise ValueError(f"unknown generator '{generator}' (expected 'irregular', 'cluster', 'grid' or 'mixed')")
+    if not (grid_spacing_lo_D > 0 and grid_spacing_hi_D >= grid_spacing_lo_D):
+        raise ValueError(f"bad grid spacing band [{grid_spacing_lo_D}, {grid_spacing_hi_D}] D")
+    if grid_exclude is not None and len(grid_exclude) != 3:
+        raise ValueError(f"grid_exclude must be (sx_D, sy_D, tol_D), got {grid_exclude!r}")
     rng = np.random.default_rng(seed)
     pool: List[Tuple[str, np.ndarray, np.ndarray]] = []
     rejected = 0
+    excluded = 0
     max_attempts = 50 * pool_size  # guard against an impossible (n_lo, spread) combo
     attempts = 0
     while len(pool) < pool_size and attempts < max_attempts:
@@ -202,12 +271,22 @@ def generate_layout_pool(
         n = int(rng.integers(n_lo, n_hi + 1))
         # Per-layout seed from the pool RNG keeps generation reproducible per (seed, k).
         layout_seed = int(rng.integers(0, 2**31 - 1))
-        if generator == "cluster":
+        # "mixed" alternates the archetype by the NEXT pool index (even = grid, odd =
+        # cluster), so a rejected draw re-tries the same archetype.
+        gen_k = ("grid", "cluster")[len(pool) % 2] if generator == "mixed" else generator
+        name_prefix = {"cluster": "drc", "grid": "drg"}.get(gen_k, "dr")
+        if gen_k == "cluster":
             x, y = make_cluster(n, layout_seed, D)
-        elif generator == "grid":
+        elif gen_k == "grid":
             # make_grid samples (nx, ny) itself; the loop's n is ignored (grid counts
             # are not uniform over [n_lo, n_hi] — they follow the factor-pair density).
-            x, y = make_grid(n_lo, n_hi, layout_seed, D)
+            x, y, sx_D, sy_D = make_grid(n_lo, n_hi, layout_seed, D,
+                                         spacing_lo_D=grid_spacing_lo_D,
+                                         spacing_hi_D=grid_spacing_hi_D,
+                                         return_spacing=True)
+            if grid_is_excluded(sx_D, sy_D, grid_exclude):
+                excluded += 1
+                continue
             n = len(x)
         else:
             sx, sy = 6.0 + 1.6 * n, 4.0 + 1.0 * n
@@ -227,4 +306,6 @@ def generate_layout_pool(
     if screen_headroom and rejected:
         print(f"[layout_gen] headroom screen rejected {rejected} layouts "
               f"({100*rejected/(rejected+pool_size):.1f}% of candidates)")
+    if excluded:
+        print(f"[layout_gen] grid_exclude {grid_exclude} re-drew {excluded} grids")
     return pool

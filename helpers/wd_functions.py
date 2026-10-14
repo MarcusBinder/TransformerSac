@@ -599,6 +599,51 @@ def make_cycle_train(wd_a: float, wd_b: float, t_hold: float, t_ramp: float,
                                t_ramp=t_ramp, phase_max=phase_max, levels=levels)
 
 
+class _MixStaticRamp:
+    """Stage 14 ``mix_static_ramp``: per episode, with probability ``p_static``
+    hold ``base_wd`` for the whole episode (the static-band control, so the
+    policy sees the preset's U[wd_min, wd_max] directions as static states),
+    otherwise run a ``_DrRampSchedule`` walk (hold / ramp transients at many
+    directions). Relative (2-arg ``f(t, base_wd)``), re-draws the coin at
+    ``t == 0.0``; the ramp's own ``t == 0`` redraw fires on the same call, so a
+    static episode never advances the ramp's RNG and a ramp episode always
+    starts from ``base_wd`` (``delta(0) = 0``).
+    """
+
+    def __init__(self, seed: int, p_static: float, **ramp_kwargs):
+        if not 0.0 <= float(p_static) <= 1.0:
+            raise ValueError(f"p_static must be in [0, 1], got {p_static}")
+        self._rng = np.random.default_rng(seed)
+        self._p = float(p_static)
+        self._ramp = _DrRampSchedule(seed=int(self._rng.integers(2**31 - 1)), **ramp_kwargs)
+        self._static = True
+
+    def __call__(self, t, base_wd):
+        t = float(t)
+        if t == 0.0:
+            self._static = bool(self._rng.random() < self._p)
+        if self._static:
+            return float(base_wd)
+        return self._ramp(t, base_wd)
+
+
+def make_mix_static_ramp(
+    seed: int,
+    p_static: float = 0.7,
+    rate_lo: float = 0.09,
+    rate_hi: float = 0.14,
+    exc_lo: float = 30.0,
+    exc_hi: float = 45.0,
+    wd_lo: float = 225.0,
+    wd_hi: float = 315.0,
+    **kwargs,
+):
+    """Build the Stage-14 static / ramp mixture (see ``_MixStaticRamp``)."""
+    return _MixStaticRamp(seed, p_static, rate_lo=rate_lo, rate_hi=rate_hi,
+                          exc_lo=exc_lo, exc_hi=exc_hi, wd_lo=wd_lo, wd_hi=wd_hi,
+                          **kwargs)
+
+
 # dr_ramp: broad DR. The rate band brackets the eval schedule's 0.0925 and
 # 0.1325 deg/s by roughly a factor of 2 on each side.
 # dr_ramp_narrow: a *family* around the eval instance (45 deg total at ~0.1
@@ -617,6 +662,13 @@ TRAIN_WD_FACTORIES = {
                        exc_lo=10.0, exc_hi=60.0),
     "dr_ramp_narrow": partial(make_dr_ramp, rate_lo=0.09, rate_hi=0.14,
                               exc_lo=40.0, exc_hi=50.0),
+    # mix_static_ramp: Stage 14 (exp_14 `mix`) -- 70 % of the episodes hold
+    # the preset's per-episode base_wd (static control, band 225-315 in
+    # les_recipe_band_v2), 30 % run a dr_ramp_narrow-style walk at the Stage-12
+    # ramp rate band (0.09-0.14 deg/s, below the 0.1407 deg/s les_3x3 frame
+    # slew limit at max_turb_move 30) with 30-45 deg excursions (~ the 35 deg
+    # 270 <-> 235 transition). RELATIVE: composes with the preset band.
+    "mix_static_ramp": partial(make_mix_static_ramp, p_static=0.7),
     "dr_ramp_slow": partial(make_dr_ramp, rate_lo=0.005, rate_hi=0.015,
                             exc_lo=40.0, exc_hi=50.0),
     # dr_ramp_les: LES-3x3 campaign DR. Brackets the target scenario's

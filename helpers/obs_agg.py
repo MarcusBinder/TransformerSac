@@ -131,10 +131,24 @@ class AggSpec:
     fn: Callable[[np.ndarray, dict], np.ndarray]
     kinds: tuple  # per-feature kind, len K
     doc: str
+    # Stage 14: an optional kind tuple for the wd block only (raw15span_dev
+    # emits signed frame deviations for wd but levels for ws / yaw / power);
+    # None -> `kinds` for every quantity.
+    wd_kinds: Optional[tuple] = None
+    # True if the wd reduction needs ctx["frame_wd"] (the policy-frame wd the
+    # trainer rotates the layout by): reduce_quantity refuses a wd call
+    # without it, so train and eval can never silently use different frames.
+    needs_frame: bool = False
 
     @property
     def K(self) -> int:
         return len(self.kinds)
+
+    def kinds_for(self, q: str) -> tuple:
+        """Per-feature kinds of quantity q (the wd block may differ)."""
+        if q == "wd" and self.wd_kinds is not None:
+            return self.wd_kinds
+        return self.kinds
 
 
 def _level(ctx, stat):
@@ -235,6 +249,28 @@ def _f_raw15span(buf, ctx):
     return _level(ctx, tail[idx]).T                   # (n, 15) oldest..newest
 
 
+def _f_raw15span_dev(buf, ctx):
+    """Stage 14 (exp_14 `static_wide_dev`): raw15span whose wd block is the
+    CIRCULAR DIFFERENCE between each raw sample and the policy-frame wd
+    (``ctx["frame_wd"]``, the env's wd_est the trainer rotates the layout by),
+    wrapped to [-180, 180) and scaled as a signed deviation (+-2 D_wd = +-30
+    deg). The absolute wd never enters the observation, so a policy trained
+    on the 225-315 band sees the same input at 235 and at 270 once the frame
+    has caught up. ws / yaw / power are byte-identical to raw15span. Without
+    ``frame_wd`` in ctx (aggregator unit tests only) the wd block falls back
+    to the deviation around the buffer's per-turbine circular mean.
+    """
+    if ctx.get("q", "wd") != "wd":
+        return _f_raw15span(buf, ctx)
+    L = int(ctx["L"])
+    idx = np.round(np.linspace(0, L - 1, N_RAW)).astype(int)
+    if "frame_wd" in ctx and ctx["frame_wd"] is not None:
+        raw = _pad_oldest(np.asarray(ctx["raw"], dtype=np.float64), L)
+        return wrap180(raw[idx] - float(ctx["frame_wd"])).T       # (n, 15)
+    tail = _pad_oldest(buf, L)
+    return tail[idx].T
+
+
 def _f_spectral(buf, ctx):
     L = int(ctx["L"])
     d = buf - buf.mean(axis=0)
@@ -276,6 +312,10 @@ AGG_MODES: Dict[str, AggSpec] = {
     "raw15span": AggSpec(_f_raw15span, ("level",) * N_RAW,
                          "15 samples evenly spanning the L-buffer, "
                          "chronological (== raw15 when L == 15)"),
+    "raw15span_dev": AggSpec(_f_raw15span_dev, ("level",) * N_RAW,
+                             "raw15span with the wd block = wrap180(wd - frame_wd), "
+                             "signed deviation scale (Stage 14)",
+                             wd_kinds=("sdev",) * N_RAW, needs_frame=True),
     "spectral": AggSpec(_f_spectral, ("level", "level") + ("amp",) * N_SPECTRAL,
                         "[t, mean_L, |F_1|, |F_2|, |F_3|] (periods L/1, L/2, L/3)"),
     "spatial_rel": AggSpec(_f_spatial_rel, ("level", "rel", "rel"),
@@ -310,9 +350,12 @@ def scale_table(kind: str, q: str, lo: float, hi: float) -> tuple:
 
 
 def reduce_quantity(mode: str, q: str, buf: np.ndarray, *, L: int,
-                    dt_env: float, front: int) -> np.ndarray:
+                    dt_env: float, front: int,
+                    frame_wd: Optional[float] = None) -> np.ndarray:
     """PHYSICAL (n_turb, K) features of one quantity from a chronological
-    (m, n_turb) buffer. wd is handled circularly (see module doc)."""
+    (m, n_turb) buffer. wd is handled circularly (see module doc).
+    ``frame_wd`` (deg) is the policy-frame wd for modes with ``needs_frame``
+    (Stage 14 raw15span_dev); ignored by every other mode."""
     spec = AGG_MODES[mode]
     buf = np.asarray(buf, dtype=np.float64)
     assert buf.ndim == 2 and buf.shape[0] >= 1, buf.shape
@@ -325,6 +368,11 @@ def reduce_quantity(mode: str, q: str, buf: np.ndarray, *, L: int,
         dev = buf
     ctx = {"circular": circular, "raw": buf, "center": center, "L": int(L),
            "dt_env": float(dt_env), "front": int(front), "q": q}
+    if spec.needs_frame and circular:
+        if frame_wd is None or not np.isfinite(float(frame_wd)):
+            raise ValueError(f"obs_agg mode {mode!r} needs frame_wd (the "
+                             f"policy-frame wd) for the wd block, got {frame_wd!r}")
+        ctx["frame_wd"] = float(frame_wd)
     out = np.asarray(spec.fn(dev, ctx), dtype=np.float64)
     assert out.shape == (buf.shape[1], spec.K), (mode, q, out.shape)
     return out
@@ -435,12 +483,27 @@ class ObsAggWrapper(gym.ObservationWrapper):
         bufs = self._buffers(fm)
         if bufs is None:
             return self._last_obs
+        frame_wd = self.frame_wd() if self.agg_spec.needs_frame else None
         blocks: List[np.ndarray] = []
         for q in QUANTITIES:
             feats = reduce_quantity(self.mode, q, bufs[q], L=self.L,
-                                    dt_env=self.dt_env, front=self._front)
+                                    dt_env=self.dt_env, front=self._front,
+                                    frame_wd=frame_wd)
             lo, hi = self._ranges[q]
-            blocks.append(scale_features(feats, self.agg_spec.kinds, q, lo, hi))
+            blocks.append(scale_features(feats, self.agg_spec.kinds_for(q), q, lo, hi))
         out = np.concatenate(blocks, axis=1).astype(np.float32)
         self._last_obs = out
         return out
+
+    def frame_wd(self) -> float:
+        """The policy-frame wd (deg) for ``needs_frame`` modes: the env's
+        sensor-derived estimate ``wd_est`` when the env runs one and it is
+        finite (--wd_source est), else the true ``fs.wind_direction`` -- the
+        same rule as the LESRL harnesses' ``_wd_for_policy`` and the trainer's
+        info["wind_direction"] under --wd_source est."""
+        base = self.env.unwrapped
+        if getattr(base, "_wd_estimator", None) is not None:
+            est = float(base.wd_est)
+            if np.isfinite(est):
+                return est
+        return float(base.fs.wind_direction)

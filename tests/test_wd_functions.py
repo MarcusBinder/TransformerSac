@@ -44,6 +44,12 @@ TRAIN_NAMES = sorted(TRAIN_WD_FACTORIES)
 # Relative (f(t, base_wd)) vs absolute (f(t)) training families.
 RELATIVE_TRAIN_NAMES = sorted(set(TRAIN_WD_FACTORIES) - set(ABSOLUTE_TRAIN_NAMES))
 ABSOLUTE_NAMES = sorted(ABSOLUTE_TRAIN_NAMES)
+# Stage 14: training schedules that hold base_wd for a random FRACTION of their
+# episodes (mix_static_ramp, p_static 0.7). Exempt from the "every episode
+# moves / consecutive episodes differ" tests; they keep the domain, redraw and
+# seed tests and get their own static-fraction / rate test below.
+STATIC_EPISODE_TRAIN_NAMES = frozenset({"mix_static_ramp"})
+MOVING_TRAIN_NAMES = [n for n in TRAIN_NAMES if n not in STATIC_EPISODE_TRAIN_NAMES]
 
 
 def _takes_base_wd(fn) -> bool:
@@ -101,7 +107,7 @@ def test_delta_at_t0_is_zero(name, base_wd):
 # Re-draw semantics
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("name", TRAIN_NAMES)
+@pytest.mark.parametrize("name", MOVING_TRAIN_NAMES)
 def test_consecutive_episodes_differ(name):
     fn = get_train_wd_factory(name, seed=3)
     first = _trajectory(fn)
@@ -178,7 +184,7 @@ def test_every_episode_actually_ramps(name, rate_lo, rate_hi):
         assert rates.max() >= rate_lo - 1e-6
 
 
-@pytest.mark.parametrize("name", TRAIN_NAMES)
+@pytest.mark.parametrize("name", MOVING_TRAIN_NAMES)
 def test_schedule_keeps_moving_across_the_whole_episode(name):
     """The eval ramp ends at t=1000 s but a training episode is 5000 s long; a
     single ramp would leave 80 % of the episode static."""
@@ -806,3 +812,40 @@ def test_cycle_270_235_305_registries_are_disjoint_and_absolute():
     assert set(ABSOLUTE_TRAIN_NAMES) & set(WD_FUNCTIONS) == set()
     with pytest.raises(ValueError):
         get_train_wd_factory("cycle_270_235_305_slow", seed=0)
+
+
+# ---------------------------------------------------------------------------
+# Stage 14: mix_static_ramp (70 % static episodes, 30 % dr_ramp-style walks)
+# ---------------------------------------------------------------------------
+
+def test_mix_static_ramp_static_fraction_and_rate():
+    fn = get_train_wd_factory("mix_static_ramp", seed=7)
+    n_static = 0
+    for _ in range(400):
+        tr = _trajectory(fn, base_wd=250.0)      # t == 0 first -> redraw
+        if np.allclose(tr, 250.0):
+            n_static += 1
+        else:
+            rate = np.abs(np.diff(tr)) / DT_SIM
+            # frame slew limit at max_turb_move 30 on les_3x3 (0.1407 deg/s)
+            assert rate.max() <= 0.1407 + 1e-9
+            assert 225.0 - 1e-9 <= tr.min() and tr.max() <= 315.0 + 1e-9
+    assert 0.6 <= n_static / 400 <= 0.8
+
+
+def test_mix_static_ramp_is_relative_and_zero_at_t0():
+    fn = get_train_wd_factory("mix_static_ramp", seed=3)
+    assert "mix_static_ramp" not in ABSOLUTE_TRAIN_NAMES
+    assert _takes_base_wd(fn)
+    for base in (225.0, 270.0, 315.0):
+        assert fn(0.0, base) == base
+
+
+def test_mix_static_ramp_ramp_episodes_actually_ramp():
+    """A ramp episode must reach the dr_ramp_narrow rate floor; the static
+    fraction is the ONLY way an episode may sit still."""
+    fn = get_train_wd_factory("mix_static_ramp", seed=9)
+    for _ in range(100):
+        tr = _trajectory(fn, base_wd=270.0)
+        if not np.allclose(tr, 270.0):
+            assert np.abs(np.diff(tr)).max() / DT_SIM >= 0.09 - 1e-6
