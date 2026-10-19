@@ -27,6 +27,7 @@ from helpers.wd_functions import (
     make_cycle_train,
     make_dr_ramp,
     make_hold_ramp,
+    make_richards_segment,
     make_static,
     parse_eval_ws,
     static_235,
@@ -48,7 +49,8 @@ ABSOLUTE_NAMES = sorted(ABSOLUTE_TRAIN_NAMES)
 # episodes (mix_static_ramp, p_static 0.7). Exempt from the "every episode
 # moves / consecutive episodes differ" tests; they keep the domain, redraw and
 # seed tests and get their own static-fraction / rate test below.
-STATIC_EPISODE_TRAIN_NAMES = frozenset({"mix_static_ramp"})
+# Stage 15: mix_static_richards (p_static 0.5) holds base_wd on half its episodes too.
+STATIC_EPISODE_TRAIN_NAMES = frozenset({"mix_static_ramp", "mix_static_richards"})
 MOVING_TRAIN_NAMES = [n for n in TRAIN_NAMES if n not in STATIC_EPISODE_TRAIN_NAMES]
 
 
@@ -160,7 +162,14 @@ def test_wd_stays_inside_the_training_wd_domain(name):
 @pytest.mark.parametrize(
     "name, rate_lo, rate_hi",
     [("dr_ramp", 0.02, 0.25), ("dr_ramp_narrow", 0.09, 0.14),
-     ("dr_ramp_les", 0.03, 0.08), ("cycle_270_235_305_slow_phase", 35.0 / 320.0, 35.0 / 320.0)],
+     ("dr_ramp_les", 0.03, 0.08), ("cycle_270_235_305_slow_phase", 35.0 / 320.0, 35.0 / 320.0),
+     # Stage 15 (cell R): Emily's Richards shape peaks at 0.0336 deg/s (tau 322, nu 0.39);
+     # the DR cycle spans tau 160-640 x nu 0.25-1.0 -> 0.0149-0.0727 deg/s (see the
+     # Stage-15 block below); the stair steps are 11-12 deg over 340 s.
+     ("richards_270_235_phase", 0.0336 - 2e-3, 0.0336 + 2e-3),
+     ("richards_270_235_dr_phase", 0.014, 0.074),
+     ("mix_cycle_richards_phase", 0.014, 35.0 / 320.0),
+     ("cycle_stair_phase", 11.0 / 340.0 - 1e-4, 12.0 / 340.0 + 1e-4)],
 )
 def test_instantaneous_rate_never_exceeds_the_declared_band(name, rate_lo, rate_hi):
     fn = get_train_wd_factory(name, seed=5)
@@ -173,7 +182,14 @@ def test_instantaneous_rate_never_exceeds_the_declared_band(name, rate_lo, rate_
 @pytest.mark.parametrize(
     "name, rate_lo, rate_hi",
     [("dr_ramp", 0.02, 0.25), ("dr_ramp_narrow", 0.09, 0.14),
-     ("dr_ramp_les", 0.03, 0.08), ("cycle_270_235_305_slow_phase", 35.0 / 320.0, 35.0 / 320.0)],
+     ("dr_ramp_les", 0.03, 0.08), ("cycle_270_235_305_slow_phase", 35.0 / 320.0, 35.0 / 320.0),
+     # Stage 15 (cell R): Emily's Richards shape peaks at 0.0336 deg/s (tau 322, nu 0.39);
+     # the DR cycle spans tau 160-640 x nu 0.25-1.0 -> 0.0149-0.0727 deg/s (see the
+     # Stage-15 block below); the stair steps are 11-12 deg over 340 s.
+     ("richards_270_235_phase", 0.0336 - 2e-3, 0.0336 + 2e-3),
+     ("richards_270_235_dr_phase", 0.014, 0.074),
+     ("mix_cycle_richards_phase", 0.014, 35.0 / 320.0),
+     ("cycle_stair_phase", 11.0 / 340.0 - 1e-4, 12.0 / 340.0 + 1e-4)],
 )
 def test_every_episode_actually_ramps(name, rate_lo, rate_hi):
     """A hold-only episode would silently turn the arm into a static-wd control."""
@@ -849,3 +865,210 @@ def test_mix_static_ramp_ramp_episodes_actually_ramp():
         tr = _trajectory(fn, base_wd=270.0)
         if not np.allclose(tr, 270.0):
             assert np.abs(np.diff(tr)).max() / DT_SIM >= 0.09 - 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Stage 15 (exp_15, cell R): Emily's Richards wd profile as TRAINING schedules
+# ---------------------------------------------------------------------------
+# Cell R (2026-10-19): on Emily's LES profile richards:270:235:1690:322:0.39 (3600 s)
+# no Stage-14 arm beat greedy; the loss sits in the first 10 deg of the slow turn
+# (265 -> 255), which training (0.109-0.14 deg/s linear ramps) never dwelt in.
+# The new schedules put the slow generalized-logistic turn (peak 0.0336 deg/s)
+# into training: the exact Emily shape (richards_270_235_phase), a tau / nu / hold
+# randomised version (richards_270_235_dr_phase), a 50/50 mixture with the R3
+# linear cycle (mix_cycle_richards_phase), a linear stair with dwells at 258 / 246
+# on both sides of the 250.3 deg wake-alignment crossing (cycle_stair_phase), and
+# a RELATIVE static / Richards-walk mixture inside [235, 270] (mix_static_richards).
+
+# Emily's profile, verbatim LESRL dwm_cli.make_richards(270, 235, 1690, 322, 0.39):
+# wd(t) = 270 + (235 - 270) * (1 + exp(-(t - 1690) / 322)) ** (-1 / 0.39), t from the
+# first control step. The training segment is her window t in [900, 3500] s
+# (u = t - 900, u0 = 1690 - 900 = 790) renormalised to EXACT endpoints 270 / 235,
+# so the match is bounded by what her curve still has to go at t = 3500 (0.32 deg).
+EMILY_T0, EMILY_TAU, EMILY_NU = 1690.0, 322.0, 0.39
+EMILY_WINDOW = (900.0, 3500.0)
+RICH_T_TR = EMILY_WINDOW[1] - EMILY_WINDOW[0]      # 2600 s
+RICH_T_HOLD = 1225.0
+RICH_PERIOD = 2.0 * (RICH_T_HOLD + RICH_T_TR)      # 7650 s
+RICH_NAMES = ("richards_270_235_phase", "richards_270_235_dr_phase",
+              "mix_cycle_richards_phase", "cycle_stair_phase")
+RICH_ABS_NAMES = RICH_NAMES
+STAIR_LEVELS = (270.0, 258.0, 246.0, 235.0, 246.0, 258.0)
+STAIR_PERIOD = len(STAIR_LEVELS) * (700.0 + 340.0)   # 6240 s
+MTM30_SLEW = 0.1407     # les_3x3 frame slew cap at max_turb_move 30, dt_sim 5 (deg/s)
+EPISODE_10000 = np.arange(0.0, 10000.0 + DT_SIM, DT_SIM)   # the exp_14/15 episode (1000 x dt_env 10)
+
+
+def _emily(t):
+    t = np.asarray(t, dtype=float)
+    with np.errstate(over="ignore"):
+        s = (1.0 + np.exp(-(t - EMILY_T0) / EMILY_TAU)) ** (-1.0 / EMILY_NU)
+    return 270.0 + (235.0 - 270.0) * s
+
+
+def _draw_episode_with_phase_zero(fn):
+    """Trigger the t == 0 redraw, then pin the phase to 0 so the episode clock equals
+    the cycle clock (t_episode = t_emily - 900 on the first transition)."""
+    fn(0.0)
+    fn.phase = 0.0
+
+
+def test_stage15_names_are_registered_as_train_schedules_with_the_right_family():
+    for name in RICH_NAMES + ("mix_static_richards",):
+        assert name in TRAIN_WD_FACTORIES, name
+        assert name not in WD_FUNCTIONS, name
+        assert callable(get_train_wd_factory(name, seed=0))
+    for name in RICH_ABS_NAMES:
+        assert name in ABSOLUTE_TRAIN_NAMES, name
+    assert "mix_static_richards" not in ABSOLUTE_TRAIN_NAMES
+
+
+@pytest.mark.parametrize("name", RICH_ABS_NAMES)
+def test_stage15_absolute_schedules_return_exactly_270_at_t0(name):
+    """The trainer compares f(0) with the preset's pinned wd using ==, not approx
+    (transformer_sac_windfarm.py pin-270 check): the renormalised segment must hand
+    the hold value through bit-exactly on every episode."""
+    from WindGym.core.wind_manager import WindManager
+    fn = get_train_wd_factory(name, seed=5)
+    assert fn.takes_base_wd is False
+    assert WindManager._wd_function_takes_base_wd(fn) is False
+    for _ in range(50):
+        assert float(fn(0.0)) == 270.0
+
+
+def test_make_richards_segment_hits_both_endpoints_exactly_and_is_monotone():
+    g = make_richards_segment(270.0, 235.0, EMILY_TAU, EMILY_NU, RICH_T_TR)
+    assert float(g(0.0)) == 270.0
+    assert float(g(RICH_T_TR)) == 235.0
+    u = np.arange(0.0, RICH_T_TR + 1.0, 1.0)
+    wd = np.asarray(g(u), dtype=float)
+    assert np.all(np.diff(wd) <= 0.0)
+    assert g.T_tr == pytest.approx(RICH_T_TR)
+    # reversed endpoints: the same shape going back up
+    h = make_richards_segment(235.0, 270.0, EMILY_TAU, EMILY_NU, RICH_T_TR)
+    assert float(h(0.0)) == 235.0 and float(h(RICH_T_TR)) == 270.0
+    np.testing.assert_allclose(np.asarray(h(u)), 505.0 - wd)
+
+
+def test_richards_270_235_phase_reproduces_emilys_profile_on_her_window():
+    """phase = 0: the first 270 hold lasts 1225 s, then the transition is Emily's
+    curve with t_emily = t_episode - 1225 + 900 = t_episode - 325. Max deviation on
+    her window = the 0.32 deg her curve still has to go at t = 3500 (renormalised
+    away); mean deviation well under 0.1 deg."""
+    fn = get_train_wd_factory("richards_270_235_phase", seed=1)
+    assert fn.period == pytest.approx(RICH_PERIOD)
+    _draw_episode_with_phase_zero(fn)
+    t_emily = np.arange(EMILY_WINDOW[0], EMILY_WINDOW[1] + 1.0, 1.0)
+    t_episode = t_emily - EMILY_WINDOW[0] + RICH_T_HOLD
+    wd = np.array([float(fn(t)) for t in t_episode])
+    signed = wd - _emily(t_emily)
+    dev = np.abs(signed)
+    assert dev.max() < 0.35
+    # the residual is the renormalisation of her tails: +0.05 deg at 900 s (her curve
+    # has already left 270), falling monotonically to -0.32 deg at 3500 s (she is still
+    # above 235); < 0.15 deg up to her peak-rate point (t_emily ~ 1990 s)
+    assert np.all(np.diff(signed) <= 1e-9)
+    assert dev[t_emily <= 1990.0].max() < 0.15
+    # the segment is bracketed by exact holds and the period closes back at 270
+    assert float(fn(RICH_T_HOLD - 1.0)) == 270.0
+    assert float(fn(RICH_T_HOLD + RICH_T_TR + 1.0)) == 235.0
+    assert float(fn(2.0 * RICH_T_HOLD + RICH_T_TR - 1.0)) == 235.0
+    assert float(fn(RICH_PERIOD)) == 270.0
+    # the return transition is the mirror image of the first one
+    u = np.arange(0.0, RICH_T_TR + 1.0, 10.0)
+    down = np.array([float(fn(RICH_T_HOLD + x)) for x in u])
+    up = np.array([float(fn(2.0 * RICH_T_HOLD + RICH_T_TR + x)) for x in u])
+    np.testing.assert_allclose(up, 505.0 - down, atol=1e-9)
+
+
+def test_richards_270_235_phase_starts_inside_the_270_hold_and_phases_vary():
+    fn = get_train_wd_factory("richards_270_235_phase", seed=5)
+    phases = []
+    for _ in range(100):
+        wd = _trajectory(fn, grid=EPISODE_10000)
+        assert wd[0] == 270.0
+        assert 0.0 <= fn.phase < RICH_T_HOLD
+        phases.append(fn.phase)
+        first_move = EPISODE_10000[np.nonzero(np.abs(wd - 270.0) > 1e-9)[0][0]]
+        assert first_move <= RICH_T_HOLD + DT_SIM
+        assert wd.min() >= 235.0 - 1e-9 and wd.max() <= 270.0 + 1e-9
+        assert np.isclose(wd, 235.0).any()          # the 235 hold is reached in a 10000 s episode
+    phases = np.asarray(phases)
+    assert phases.std() > 120.0
+    assert len(np.unique(np.round(phases, 3))) > 90
+
+
+def test_richards_dr_phase_redraws_tau_nu_and_hold_per_episode_inside_their_bands():
+    fn = get_train_wd_factory("richards_270_235_dr_phase", seed=3)
+    taus, nus, holds = [], [], []
+    for _ in range(200):
+        wd = _trajectory(fn, grid=EPISODE_10000)
+        assert wd[0] == 270.0
+        assert 160.0 <= fn.tau <= 640.0 and 0.25 <= fn.nu <= 1.0 and 800.0 <= fn.t_hold <= 1600.0
+        assert 0.0 <= fn.phase < fn.t_hold
+        assert fn.T_tr == pytest.approx(max(RICH_T_TR * fn.tau / EMILY_TAU, 400.0))
+        assert fn.period == pytest.approx(2.0 * (fn.t_hold + fn.T_tr))
+        assert wd.min() >= 235.0 - 1e-9 and wd.max() <= 270.0 + 1e-9
+        rates = np.abs(np.diff(wd)) / DT_SIM
+        assert rates.max() < MTM30_SLEW
+        taus.append(fn.tau); nus.append(fn.nu); holds.append(fn.t_hold)
+    assert np.std(taus) > 80.0 and np.std(nus) > 0.1 and np.std(holds) > 120.0
+
+
+def test_mix_cycle_richards_phase_uses_both_branches_and_each_is_the_named_schedule():
+    fn = get_train_wd_factory("mix_cycle_richards_phase", seed=7)
+    branches = {"cycle": 0, "richards": 0}
+    for _ in range(200):
+        wd = _trajectory(fn, grid=EPISODE_10000)
+        assert wd[0] == 270.0
+        branches[fn.branch] += 1
+        rates = np.abs(np.diff(wd)) / DT_SIM
+        if fn.branch == "cycle":
+            assert rates.max() == pytest.approx(SLOW_RATE)      # the R3 320 s linear ramps
+        else:
+            assert rates.max() < 0.074 and rates.max() >= 0.014
+        assert wd.min() >= 235.0 - 1e-9 and wd.max() <= 270.0 + 1e-9
+    assert branches["cycle"] >= 60 and branches["richards"] >= 60
+
+
+def test_cycle_stair_phase_dwells_at_258_and_246_on_both_sides_of_the_crossing():
+    fn = get_train_wd_factory("cycle_stair_phase", seed=2)
+    assert fn.period == pytest.approx(STAIR_PERIOD)
+    _draw_episode_with_phase_zero(fn)
+    t = np.arange(1.0, STAIR_PERIOD + 1.0, 1.0)       # never t == 0 again: that would redraw the phase
+    wd = np.array([float(fn(x)) for x in t])
+    for level in (258.0, 246.0):
+        assert np.mean(np.isclose(wd, level)) == pytest.approx(2 * 700.0 / STAIR_PERIOD, abs=0.002)
+    assert np.mean(np.isclose(wd, 235.0)) == pytest.approx(700.0 / STAIR_PERIOD, abs=0.002)
+    assert np.mean(np.isclose(wd, 270.0)) == pytest.approx(700.0 / STAIR_PERIOD, abs=0.002)
+    rates = np.abs(np.diff(wd))
+    assert set(np.round(rates[rates > 0], 6)) == {round(12.0 / 340.0, 6), round(11.0 / 340.0, 6)}
+    # phase rule: only the 270 hold ([0, 700)) seeds the episode
+    for _ in range(50):
+        wd = _trajectory(fn)
+        assert wd[0] == 270.0 and 0.0 <= fn.phase < 700.0
+
+
+def test_mix_static_richards_is_relative_half_static_and_walks_inside_235_270():
+    fn = get_train_wd_factory("mix_static_richards", seed=7)
+    assert _takes_base_wd(fn)
+    n_static, n_walk = 0, 0
+    for base in (235.0, 250.0, 270.0):
+        for _ in range(100):
+            tr = _trajectory(fn, base_wd=base, grid=EPISODE_10000)
+            assert tr[0] == base
+            if np.allclose(tr, base):
+                n_static += 1
+                assert fn.branch == "static"
+            else:
+                n_walk += 1
+                assert fn.branch == "walk"
+                assert 235.0 - 1e-9 <= tr.min() and tr.max() <= 270.0 + 1e-9
+                rates = np.abs(np.diff(tr)) / DT_SIM
+                assert rates.max() <= 0.074 and rates.max() >= 0.006
+                # the walk is a sequence of holds and Richards excursions, never a linear ramp:
+                # the rate during a move is not constant
+                moving = rates[rates > 1e-6]
+                assert moving.std() > 1e-4
+    assert 0.4 <= n_static / 300 <= 0.6
+    assert n_walk > 0

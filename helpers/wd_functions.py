@@ -458,16 +458,25 @@ class _DrRampSchedule:
         self._knot_t = np.zeros(1)
         self._knot_d = np.zeros(1)
 
+    def _draw_ramp_shapes(self, n: int):
+        """Per-ramp shape draw (hook): the linear walk draws a rate per ramp."""
+        return self._rng.uniform(self._rate_lo, self._rate_hi, size=n)
+
+    def _ramp_duration(self, shape, mag: float) -> float:
+        """Seconds a ramp of ``mag`` deg takes for the drawn ``shape`` (hook)."""
+        return mag / float(shape)
+
     def _draw(self, base_wd: float) -> None:
         rng = self._rng
         n = self._n_pairs
         holds = rng.uniform(self._hold_lo, self._hold_hi, size=n)
         mags = rng.uniform(self._exc_lo, self._exc_hi, size=n)
-        rates = rng.uniform(self._rate_lo, self._rate_hi, size=n)
+        shapes = self._draw_ramp_shapes(n)
         signs = rng.choice(np.array([-1.0, 1.0]), size=n)
 
         ts = [0.0]
         ds = [0.0]
+        ramps = []   # (ramp index i, knot index of the ramp start) for every realised ramp
         t = 0.0
         d = 0.0
         for i in range(n):
@@ -491,7 +500,8 @@ class _DrRampSchedule:
             if mag <= 0.0:
                 continue  # pinned against a degenerate domain; just keep holding
 
-            t += mag / float(rates[i])
+            ramps.append((i, len(ts) - 1))
+            t += self._ramp_duration(shapes[i], mag)
             d += sign * mag
             ts.append(t)
             ds.append(d)
@@ -501,6 +511,8 @@ class _DrRampSchedule:
 
         self._knot_t = np.asarray(ts, dtype=float)
         self._knot_d = np.asarray(ds, dtype=float)
+        self._ramps = ramps
+        self._shapes = shapes
 
     def __call__(self, t, base_wd):
         t = float(t)
@@ -644,6 +656,275 @@ def make_mix_static_ramp(
                           **kwargs)
 
 
+# ---------------------------------------------------------------------------
+# Stage 15 (exp_15, cell R): Emily's generalized-logistic (Richards) wd turn
+# ---------------------------------------------------------------------------
+# Emily's LES profile (LESRL dwm_cli richards:270:235:1690:322:0.39):
+#   wd(t) = 270 + (235 - 270) * (1 + exp(-(t - 1690) / 322)) ** (-1 / 0.39)
+# (t from the first control step, 3600 s). Its slow turn peaks at 0.0336 deg/s
+# and crosses the les_3x3 wake-alignment direction 250.3 deg over ~5 min; the
+# Stage-14 arms (0.109-0.14 deg/s linear ramps) never dwelt there and lost
+# 7-18 % to greedy on wd 265 -> 255 (cell R, 2026-10-19). The schedules below
+# train on that shape. The training segment is Emily's window t in [900, 3500]
+# s (|wd - 270| < 0.06 deg at 900 s; her curve is still 0.32 deg above 235 at
+# 3500 s), renormalised so the segment starts and ends EXACTLY on the holds:
+# the trainer's pin-270 check compares f(0) with the preset wd using ==.
+RICHARDS_TAU = 322.0            # Emily's tau [s]
+RICHARDS_NU = 0.39              # Emily's nu (asymmetry)
+RICHARDS_T_TR = 2600.0          # her 900 -> 3500 s transition window [s]
+RICHARDS_U0 = 1690.0 - 900.0    # her t0 inside that window [s]
+RICHARDS_T_TR_MIN = 400.0       # floor on a DR-scaled transition [s]
+RICHARDS_T_HOLD = 1225.0        # holds of the fixed cycle: period 7650 s
+# DR bands (richards_270_235_dr_phase / mix_cycle_richards_phase / mix_static_richards):
+# tau 160-640 s x nu 0.25-1.0 -> peak rates 0.0149-0.0727 deg/s for a 35 deg
+# turn (all below the 0.1407 deg/s les_3x3 frame slew cap at max_turb_move 30).
+RICHARDS_DR = {"tau": (160.0, 640.0), "nu": (0.25, 1.0), "t_hold": (800.0, 1600.0)}
+
+
+def make_richards_segment(wd_a: float, wd_b: float, tau: float, nu: float, T_tr: float,
+                          u0: float | None = None):
+    """Richards transition ``g(u) -> wd`` on ``u in [0, T_tr]`` from ``wd_a`` to ``wd_b``.
+
+    ``s(u) = (1 + exp(-(u - u0) / tau)) ** (-1 / nu)`` (Emily's formula), with
+    ``u0 = T_tr * 790 / 2600`` by default so the shape sits in the segment where
+    it sits in her 900-3500 s window for any ``T_tr = 2600 * tau / 322``, then
+    renormalised ``(s(u) - s(0)) / (s(T_tr) - s(0))`` so ``g(0) == wd_a`` and
+    ``g(T_tr) == wd_b`` EXACTLY (0.0 and 1.0 in IEEE arithmetic). For u << u0 the
+    exp overflows to inf -> s = 0, the right limit, so the warning is silenced
+    (as LESRL ``dwm_cli.make_richards``). Vectorised over ``u``.
+    """
+    wd_a, wd_b, tau, nu, T_tr = (float(v) for v in (wd_a, wd_b, tau, nu, T_tr))
+    if not (tau > 0 and nu > 0 and T_tr > 0):
+        raise ValueError(f"need tau, nu, T_tr > 0, got {tau}, {nu}, {T_tr}")
+    u0 = T_tr * RICHARDS_U0 / RICHARDS_T_TR if u0 is None else float(u0)
+
+    def _s(u):
+        with np.errstate(over="ignore"):
+            return (1.0 + np.exp(-(u - u0) / tau)) ** (-1.0 / nu)
+
+    s0, s1 = float(_s(0.0)), float(_s(T_tr))
+    if not s1 > s0:
+        raise ValueError(f"degenerate Richards segment (s(0)={s0}, s(T_tr)={s1})")
+
+    def _segment(u):
+        u = np.asarray(u, dtype=float)
+        frac = (_s(u) - s0) / (s1 - s0)
+        return wd_a + (wd_b - wd_a) * frac
+
+    _segment.T_tr, _segment.u0, _segment.tau, _segment.nu = T_tr, u0, tau, nu
+    return _segment
+
+
+def richards_transition_length(tau: float) -> float:
+    """Transition window of a Richards segment with time constant ``tau``: Emily's
+    2600 s scaled by ``tau / 322`` (floored at ``RICHARDS_T_TR_MIN``)."""
+    return max(RICHARDS_T_TR * float(tau) / RICHARDS_TAU, RICHARDS_T_TR_MIN)
+
+
+class _RichardsCycleSchedule:
+    """ABSOLUTE cyclic training schedule 270 -> 235 -> 270 with Richards transitions.
+
+    One period = hold ``wd_a`` (``t_hold``) -> Richards segment a -> b (``T_tr``)
+    -> hold ``wd_b`` (``t_hold``) -> segment b -> a. Callable as ``f(t) -> wd``
+    (``takes_base_wd = False``). At ``t == 0.0`` the start phase ~ U[0,
+    phase_max) is drawn inside the first ``wd_a`` hold (``phase_max <= t_hold``,
+    the ``_CycleTrainSchedule`` rule: f(0) == wd_a == the pinned burn-in wd), and
+    with ``dr`` the episode's ``tau`` / ``nu`` / ``t_hold`` are drawn from their
+    bands first (``T_tr`` follows ``tau``; then ``phase_max = t_hold``).
+    """
+
+    takes_base_wd = False
+
+    def __init__(self, seed: int, wd_a: float = 270.0, wd_b: float = 235.0,
+                 t_hold: float = RICHARDS_T_HOLD, tau: float = RICHARDS_TAU,
+                 nu: float = RICHARDS_NU, phase_max: float | None = None, dr=None):
+        self._rng = np.random.default_rng(seed)
+        self._wd_a, self._wd_b = float(wd_a), float(wd_b)
+        self._dr = None if dr is None else {k: (float(v[0]), float(v[1])) for k, v in dr.items()}
+        phase_max = float(t_hold) if phase_max is None else float(phase_max)
+        if not (0.0 <= phase_max <= float(t_hold)):
+            raise ValueError(
+                f"phase_max must lie in [0, t_hold={t_hold}] so that f(0) == wd_a "
+                f"(no jump at the burn-in boundary); got {phase_max}"
+            )
+        self._phase_max = phase_max
+        self.phase = 0.0
+        self._build(float(t_hold), float(tau), float(nu))
+
+    def _build(self, t_hold: float, tau: float, nu: float) -> None:
+        self.t_hold, self.tau, self.nu = t_hold, tau, nu
+        self.T_tr = richards_transition_length(tau)
+        self._seg_ab = make_richards_segment(self._wd_a, self._wd_b, tau, nu, self.T_tr)
+        self._seg_ba = make_richards_segment(self._wd_b, self._wd_a, tau, nu, self.T_tr)
+        self.period = 2.0 * (t_hold + self.T_tr)
+
+    def _draw(self) -> None:
+        rng = self._rng
+        phase_max = self._phase_max
+        if self._dr is not None:
+            t_hold = float(rng.uniform(*self._dr["t_hold"]))
+            tau = float(rng.uniform(*self._dr["tau"]))
+            nu = float(rng.uniform(*self._dr["nu"]))
+            self._build(t_hold, tau, nu)
+            phase_max = t_hold
+        self.phase = float(rng.uniform(0.0, phase_max)) if phase_max > 0 else 0.0
+
+    def _eval(self, t):
+        t = np.asarray(t, dtype=float)
+        th, ttr = self.t_hold, self.T_tr
+        tau_ = np.mod(t + self.phase, self.period)
+        wd = np.full_like(tau_, self._wd_a, dtype=float)
+        m = (tau_ >= th) & (tau_ < th + ttr)
+        wd[m] = self._seg_ab(tau_[m] - th)
+        m = (tau_ >= th + ttr) & (tau_ < 2.0 * th + ttr)
+        wd[m] = self._wd_b
+        m = tau_ >= 2.0 * th + ttr
+        wd[m] = self._seg_ba(tau_[m] - (2.0 * th + ttr))
+        return wd
+
+    def __call__(self, t):
+        t = float(t)
+        if t == 0.0:
+            self._draw()
+        return float(self._eval(t))
+
+
+def make_richards_cycle_train(seed: int, dr=None, **kwargs):
+    """Build a seeded ABSOLUTE Richards cycle, ``f(t) -> wd`` (see ``_RichardsCycleSchedule``)."""
+    return _RichardsCycleSchedule(seed=seed, dr=dr, **kwargs)
+
+
+class _MixCycleRichards:
+    """ABSOLUTE 50/50 mixture: per episode either the R3 linear cycle
+    (``cycle_270_235_slow_phase``: 1600 s holds, 320 s ramps) or the DR Richards
+    cycle (``richards_270_235_dr_phase``). The coin is flipped at ``t == 0.0`` and
+    the chosen branch's own ``t == 0`` redraw fires on the same call; each branch
+    has its own sub-seeded RNG, so the untaken branch's stream is not advanced.
+    f(0) == 270 either way. ``branch`` names the current episode's branch.
+    """
+
+    takes_base_wd = False
+
+    def __init__(self, seed: int, p_cycle: float = 0.5):
+        if not 0.0 <= float(p_cycle) <= 1.0:
+            raise ValueError(f"p_cycle must be in [0, 1], got {p_cycle}")
+        self._rng = np.random.default_rng(seed)
+        self._p = float(p_cycle)
+        self._cycle = make_cycle_train(270.0, 235.0, 1600.0, 320.0,
+                                       seed=int(self._rng.integers(2**31 - 1)), phase_max=1600.0)
+        self._richards = make_richards_cycle_train(seed=int(self._rng.integers(2**31 - 1)), dr=RICHARDS_DR)
+        self.branch = "cycle"
+
+    @property
+    def phase(self) -> float:
+        return self._cycle.phase if self.branch == "cycle" else self._richards.phase
+
+    def __call__(self, t):
+        t = float(t)
+        if t == 0.0:
+            self.branch = "cycle" if self._rng.random() < self._p else "richards"
+        return float(self._cycle(t) if self.branch == "cycle" else self._richards(t))
+
+
+class _RichardsWalkSchedule(_DrRampSchedule):
+    """``_DrRampSchedule`` (hold / excursion / sign / reflection logic) with every
+    linear ramp replaced by a Richards segment: per ramp ``tau ~ U[tau band]``,
+    ``nu ~ U[nu band]``, duration ``T_tr = 2600 * tau / 322`` (Emily's window
+    scaled), excursion from the parent's magnitude band. RELATIVE (``delta(0) =
+    0``), reflected inside ``[wd_lo, wd_hi]`` as the parent.
+    """
+
+    def __init__(self, seed: int, tau_lo: float, tau_hi: float, nu_lo: float, nu_hi: float,
+                 exc_lo: float, exc_hi: float, wd_lo: float, wd_hi: float,
+                 hold_lo: float, hold_hi: float, t_horizon: float = 20000.0):
+        if not (tau_lo > 0 and tau_hi >= tau_lo and nu_lo > 0 and nu_hi >= nu_lo):
+            raise ValueError(f"bad tau band [{tau_lo}, {tau_hi}] / nu band [{nu_lo}, {nu_hi}]")
+        # The parent's rate band only sizes the per-episode draw (n_pairs): the
+        # fastest possible mean rate is exc_hi over the shortest transition.
+        rate_hi = float(exc_hi) / richards_transition_length(tau_lo)
+        super().__init__(seed=seed, rate_lo=rate_hi, rate_hi=rate_hi, exc_lo=exc_lo, exc_hi=exc_hi,
+                         wd_lo=wd_lo, wd_hi=wd_hi, hold_lo=hold_lo, hold_hi=hold_hi, t_horizon=t_horizon)
+        self._tau_lo, self._tau_hi = float(tau_lo), float(tau_hi)
+        self._nu_lo, self._nu_hi = float(nu_lo), float(nu_hi)
+        self._segments = []
+
+    def _draw_ramp_shapes(self, n: int):
+        taus = self._rng.uniform(self._tau_lo, self._tau_hi, size=n)
+        nus = self._rng.uniform(self._nu_lo, self._nu_hi, size=n)
+        return np.stack([taus, nus], axis=1)
+
+    def _ramp_duration(self, shape, mag: float) -> float:
+        return richards_transition_length(float(shape[0]))
+
+    def _draw(self, base_wd: float) -> None:
+        super()._draw(base_wd)
+        kt, kd = self._knot_t, self._knot_d
+        self._segments = []   # (t_start, t_end, segment g(u) in delta space)
+        for i, k in self._ramps:
+            tau, nu = (float(v) for v in self._shapes[i])
+            t0, t1 = float(kt[k]), float(kt[k + 1])
+            self._segments.append((t0, t1, make_richards_segment(kd[k], kd[k + 1], tau, nu, t1 - t0)))
+        self._seg_t0 = np.asarray([s[0] for s in self._segments], dtype=float)
+
+    def __call__(self, t, base_wd):
+        t = float(t)
+        if t == 0.0:
+            self._draw(float(base_wd))
+        k = int(np.searchsorted(self._seg_t0, t, side="right")) - 1
+        if k >= 0:
+            t0, t1, seg = self._segments[k]
+            if t < t1:
+                return float(base_wd) + float(seg(t - t0))
+        return float(base_wd) + float(np.interp(t, self._knot_t, self._knot_d))
+
+
+class _MixStaticRichards:
+    """Stage 15 ``mix_static_richards``: RELATIVE ``f(t, base_wd)``; per episode,
+    with probability ``p_static`` hold ``base_wd`` (the static control inside the
+    preset band), otherwise a ``_RichardsWalkSchedule`` of slow Richards
+    excursions reflected inside ``[wd_lo, wd_hi]``. Coin at ``t == 0.0``, the
+    walk's own redraw fires on the same call (a static episode never advances the
+    walk's RNG). ``branch`` names the current episode's branch.
+    """
+
+    def __init__(self, seed: int, p_static: float = 0.5, **walk_kwargs):
+        if not 0.0 <= float(p_static) <= 1.0:
+            raise ValueError(f"p_static must be in [0, 1], got {p_static}")
+        self._rng = np.random.default_rng(seed)
+        self._p = float(p_static)
+        self._walk = _RichardsWalkSchedule(seed=int(self._rng.integers(2**31 - 1)), **walk_kwargs)
+        self.branch = "static"
+
+    def __call__(self, t, base_wd):
+        t = float(t)
+        if t == 0.0:
+            self.branch = "static" if self._rng.random() < self._p else "walk"
+        if self.branch == "static":
+            return float(base_wd)
+        return self._walk(t, base_wd)
+
+
+def make_mix_static_richards(
+    seed: int,
+    p_static: float = 0.5,
+    tau_lo: float = RICHARDS_DR["tau"][0],
+    tau_hi: float = RICHARDS_DR["tau"][1],
+    nu_lo: float = RICHARDS_DR["nu"][0],
+    nu_hi: float = RICHARDS_DR["nu"][1],
+    exc_lo: float = 15.0,
+    exc_hi: float = 35.0,
+    wd_lo: float = 235.0,
+    wd_hi: float = 270.0,
+    hold_lo: float = 600.0,
+    hold_hi: float = 1600.0,
+    **kwargs,
+):
+    """Build the Stage-15 static / Richards-walk mixture (see ``_MixStaticRichards``)."""
+    return _MixStaticRichards(seed, p_static, tau_lo=tau_lo, tau_hi=tau_hi, nu_lo=nu_lo, nu_hi=nu_hi,
+                              exc_lo=exc_lo, exc_hi=exc_hi, wd_lo=wd_lo, wd_hi=wd_hi,
+                              hold_lo=hold_lo, hold_hi=hold_hi, **kwargs)
+
+
 # dr_ramp: broad DR. The rate band brackets the eval schedule's 0.0925 and
 # 0.1325 deg/s by roughly a factor of 2 on each side.
 # dr_ramp_narrow: a *family* around the eval instance (45 deg total at ~0.1
@@ -710,6 +991,36 @@ TRAIN_WD_FACTORIES = {
     "cycle_270_235_305_slow_phase": partial(make_cycle_train, 270.0, 305.0, 1600.0,
                                             320.0, phase_max=1600.0,
                                             levels=(270.0, 235.0, 270.0, 305.0)),
+    # ---- Stage 15 (exp_15, cell R 2026-10-19): train on Emily's slow Richards turn ----
+    # richards_270_235_phase (`rich`): ABSOLUTE 270 -> 235 -> 270 with Emily's
+    # EXACT shape (tau 322, nu 0.39; her 900-3500 s window renormalised to exact
+    # endpoints), 1225 s holds, period 7650 s, phase ~ U[0, 1225) inside the 270
+    # hold (f(0) == 270 == les_recipe_pin270_v2). Peak 0.0336 deg/s << the 0.1407
+    # deg/s frame slew cap at max_turb_move 30: the whole turn is frame-tracked.
+    "richards_270_235_phase": partial(make_richards_cycle_train, t_hold=RICHARDS_T_HOLD,
+                                      tau=RICHARDS_TAU, nu=RICHARDS_NU),
+    # richards_270_235_dr_phase (`rich_dr`): the same cycle with per-episode
+    # tau ~ U[160, 640] s, nu ~ U[0.25, 1.0], holds ~ U[800, 1600] s (T_tr = 2600
+    # tau / 322 -> 1292-5168 s, peak rate 0.0149-0.0727 deg/s), so the policy
+    # cannot learn the clock of one shape.
+    "richards_270_235_dr_phase": partial(make_richards_cycle_train, dr=RICHARDS_DR),
+    # mix_cycle_richards_phase (`rich_mixcyc`): per episode p 0.5 the R3 linear
+    # cycle cycle_270_235_slow_phase (0.1094 deg/s), else the DR Richards cycle:
+    # fast + slow turns in one training distribution, f(0) == 270 either way.
+    "mix_cycle_richards_phase": partial(_MixCycleRichards, p_cycle=0.5),
+    # cycle_stair_phase (`stair`): ABSOLUTE linear stair 270 -> 258 -> 246 -> 235
+    # -> 246 -> 258 -> 270, 700 s dwells and 340 s steps (11-12 deg: 0.0324-0.0353
+    # deg/s, the Richards peak rate), period 6240 s, phase ~ U[0, 700) in the 270
+    # hold. Dwells on BOTH sides of the 250.3 deg wake-alignment sign flip
+    # (atan(1420 / 3976)) where lut3 reverses yaw and the Stage-14 arms lagged.
+    "cycle_stair_phase": partial(make_cycle_train, 270.0, 235.0, 700.0, 340.0, phase_max=700.0,
+                                 levels=(270.0, 258.0, 246.0, 235.0, 246.0, 258.0)),
+    # mix_static_richards (`rich_stat`): RELATIVE, for les_recipe_band235_v2
+    # (base_wd ~ U[235, 270]). p 0.5 static episodes at base_wd, else 15-35 deg
+    # Richards excursions (tau 160-640, nu 0.25-1.0, 600-1600 s holds) REFLECTED
+    # inside [235, 270] (its own domain, not the 225-315 default): static
+    # coverage of the whole eval band plus slow turns starting anywhere in it.
+    "mix_static_richards": partial(make_mix_static_richards, p_static=0.5),
 }
 
 # Training schedules that are ABSOLUTE (1-arg ``f(t)``): the preset's wd band
@@ -717,7 +1028,12 @@ TRAIN_WD_FACTORIES = {
 # randomization is replaced, not composed with.
 ABSOLUTE_TRAIN_NAMES = frozenset({"cycle_270_235_phase",
                                   "cycle_270_235_slow_phase",
-                                  "cycle_270_235_305_slow_phase"})
+                                  "cycle_270_235_305_slow_phase",
+                                  # Stage 15
+                                  "richards_270_235_phase",
+                                  "richards_270_235_dr_phase",
+                                  "mix_cycle_richards_phase",
+                                  "cycle_stair_phase"})
 
 
 def get_train_wd_factory(name: str, seed: int):
