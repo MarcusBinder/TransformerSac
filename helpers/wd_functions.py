@@ -925,6 +925,90 @@ def make_mix_static_richards(
                               hold_lo=hold_lo, hold_hi=hold_hi, **kwargs)
 
 
+class _LogUniformRateWalk(_DrRampSchedule):
+    """``_DrRampSchedule`` whose linear ramps all share ONE per-episode rate drawn
+    log-uniform in ``[rate_lo, rate_hi]`` (Stage 16 ``mix_all`` linear branch):
+    slow drifts and fast ramps are equally represented in log space, and within
+    an episode the policy sees a consistent rate it could in principle estimate.
+    ``_n_pairs`` is sized by the parent with the GLOBAL ``rate_hi`` (an upper
+    bound on the pairs any rate needs). ``rate`` names the current episode's rate.
+    """
+
+    def __init__(self, seed: int, rate_lo: float, rate_hi: float, **kwargs):
+        super().__init__(seed=seed, rate_lo=rate_lo, rate_hi=rate_hi, **kwargs)
+        self._log_lo, self._log_hi = np.log(self._rate_lo), np.log(self._rate_hi)
+        self.rate = float(rate_hi)
+
+    def _draw_ramp_shapes(self, n: int):
+        self.rate = float(np.exp(self._rng.uniform(self._log_lo, self._log_hi)))
+        return np.full(n, self.rate)
+
+
+class _MixAll:
+    """Stage 16 ``mix_all`` (Marcus, 2026-10-20): RELATIVE ``f(t, base_wd)``; EVERY
+    episode draws a new wd function from a broad family, all starting at
+    ``base_wd`` (``f(0) == base_wd``, no burn-in jump) and reflected inside
+    ``[wd_lo, wd_hi]``:
+
+    - ``static``   (0.20): hold ``base_wd`` (the static control).
+    - ``linear``   (0.25): hold / linear-ramp walk at ONE per-episode rate drawn
+                           log-uniform in [0.005, 0.14] deg/s, 10-35 deg
+                           excursions, 300-1500 s holds.
+    - ``richards`` (0.25): Richards walk (tau 120-800 s, nu 0.25-1.0), 10-35 deg
+                           excursions, 400-1600 s holds (Emily's slow turn family).
+    - ``stair``    (0.15): linear walk at 0.03-0.035 deg/s with 8-15 deg steps and
+                           500-900 s dwells (dwells on both sides of 250.3 deg).
+    - ``fast``     (0.15): linear walk at 0.10-0.14 deg/s, 30-35 deg excursions,
+                           800-1600 s holds (the hold_ramp / cycle_slow family).
+
+    Coin at ``t == 0.0``; each branch has its own sub-seeded RNG and only the
+    chosen branch's redraw fires, so the untaken branches' streams never advance.
+    ``branch`` names the current episode's branch, ``linear_rate`` the linear
+    branch's current per-episode rate.
+    """
+
+    WEIGHTS = (("static", 0.20), ("linear", 0.25), ("richards", 0.25),
+               ("stair", 0.15), ("fast", 0.15))
+
+    def __init__(self, seed: int, wd_lo: float = 235.0, wd_hi: float = 270.0,
+                 t_horizon: float = 20000.0):
+        self._rng = np.random.default_rng(seed)
+        self._names = [n for n, _ in self.WEIGHTS]
+        self._p = np.asarray([w for _, w in self.WEIGHTS], dtype=float)
+        if not np.isclose(self._p.sum(), 1.0):
+            raise ValueError(f"mix_all weights must sum to 1, got {self._p.sum()}")
+        sub = lambda: int(self._rng.integers(2**31 - 1))   # noqa: E731
+        dom = dict(wd_lo=wd_lo, wd_hi=wd_hi, t_horizon=t_horizon)
+        self._branches = {
+            "linear": _LogUniformRateWalk(seed=sub(), rate_lo=0.005, rate_hi=0.14,
+                                          exc_lo=10.0, exc_hi=35.0, hold_lo=300.0, hold_hi=1500.0, **dom),
+            "richards": _RichardsWalkSchedule(seed=sub(), tau_lo=120.0, tau_hi=800.0, nu_lo=0.25, nu_hi=1.0,
+                                              exc_lo=10.0, exc_hi=35.0, hold_lo=400.0, hold_hi=1600.0, **dom),
+            "stair": _DrRampSchedule(seed=sub(), rate_lo=0.03, rate_hi=0.035,
+                                     exc_lo=8.0, exc_hi=15.0, hold_lo=500.0, hold_hi=900.0, **dom),
+            "fast": _DrRampSchedule(seed=sub(), rate_lo=0.10, rate_hi=0.14,
+                                    exc_lo=30.0, exc_hi=35.0, hold_lo=800.0, hold_hi=1600.0, **dom),
+        }
+        self.branch = "static"
+
+    @property
+    def linear_rate(self) -> float:
+        return self._branches["linear"].rate
+
+    def __call__(self, t, base_wd):
+        t = float(t)
+        if t == 0.0:
+            self.branch = self._names[int(self._rng.choice(len(self._names), p=self._p))]
+        if self.branch == "static":
+            return float(base_wd)
+        return self._branches[self.branch](t, base_wd)
+
+
+def make_mix_all(seed: int, **kwargs):
+    """Build the Stage-16 per-episode wd-function family (see ``_MixAll``)."""
+    return _MixAll(seed, **kwargs)
+
+
 # dr_ramp: broad DR. The rate band brackets the eval schedule's 0.0925 and
 # 0.1325 deg/s by roughly a factor of 2 on each side.
 # dr_ramp_narrow: a *family* around the eval instance (45 deg total at ~0.1
@@ -1021,6 +1105,21 @@ TRAIN_WD_FACTORIES = {
     # inside [235, 270] (its own domain, not the 225-315 default): static
     # coverage of the whole eval band plus slow turns starting anywhere in it.
     "mix_static_richards": partial(make_mix_static_richards, p_static=0.5),
+    # ---- Stage 16 (exp_16, 2026-10-20) ----
+    # mix_static_richards_ends (`ends_dev`): the 235 END. Under les_recipe_pin270_v2
+    # (base_wd 270) p 0.4 static episodes at 270, else 25-37 deg Richards excursions
+    # (tau 160-640, nu 0.25-1.0) REFLECTED inside [233, 270] with 1000-2000 s
+    # dwells, so the policy dwells at 233-245 deg (the Stage-15 arms under-yawed
+    # there: front / mid 5-7 deg vs lut3 17 deg). Peak rate ~0.078 deg/s (37 deg
+    # at tau 160) < the 0.1407 deg/s frame slew cap at max_turb_move 30.
+    "mix_static_richards_ends": partial(make_mix_static_richards, p_static=0.4,
+                                        exc_lo=25.0, exc_hi=37.0, wd_lo=233.0, wd_hi=270.0,
+                                        hold_lo=1000.0, hold_hi=2000.0),
+    # mix_all (`mixall_dev`, Marcus): EVERY episode a new wd function from a broad
+    # family (static 0.20 / log-uniform-rate linear walk 0.25 / Richards walk 0.25 /
+    # stair walk 0.15 / fast cycle-walk 0.15), all from base_wd, reflected inside
+    # [235, 270]; max rate 0.14 deg/s (linear / fast) < 0.1407. See _MixAll.
+    "mix_all": partial(make_mix_all),
 }
 
 # Training schedules that are ABSOLUTE (1-arg ``f(t)``): the preset's wd band

@@ -50,7 +50,9 @@ ABSOLUTE_NAMES = sorted(ABSOLUTE_TRAIN_NAMES)
 # moves / consecutive episodes differ" tests; they keep the domain, redraw and
 # seed tests and get their own static-fraction / rate test below.
 # Stage 15: mix_static_richards (p_static 0.5) holds base_wd on half its episodes too.
-STATIC_EPISODE_TRAIN_NAMES = frozenset({"mix_static_ramp", "mix_static_richards"})
+# Stage 16: mix_static_richards_ends (p_static 0.4) and mix_all (static branch 0.20).
+STATIC_EPISODE_TRAIN_NAMES = frozenset({"mix_static_ramp", "mix_static_richards",
+                                        "mix_static_richards_ends", "mix_all"})
 MOVING_TRAIN_NAMES = [n for n in TRAIN_NAMES if n not in STATIC_EPISODE_TRAIN_NAMES]
 
 
@@ -1072,3 +1074,144 @@ def test_mix_static_richards_is_relative_half_static_and_walks_inside_235_270():
                 assert moving.std() > 1e-4
     assert 0.4 <= n_static / 300 <= 0.6
     assert n_walk > 0
+
+
+# ---------------------------------------------------------------------------
+# Stage 16 (exp_16, 2026-10-20): the 235 end (mix_static_richards_ends) and
+# Marcus's "a new wd function every episode" family (mix_all). Both RELATIVE,
+# both reflected inside [235, 270] (ends: [233, 270]) and both f(0) == base_wd.
+# ---------------------------------------------------------------------------
+STAGE16_NAMES = ("mix_static_richards_ends", "mix_all")
+MIX_ALL_WEIGHTS = {"static": 0.20, "linear": 0.25, "richards": 0.25, "stair": 0.15, "fast": 0.15}
+
+
+@pytest.mark.parametrize("name", STAGE16_NAMES)
+def test_stage16_names_are_registered_relative_train_schedules(name):
+    assert name in TRAIN_WD_FACTORIES
+    assert name not in WD_FUNCTIONS
+    assert name not in ABSOLUTE_TRAIN_NAMES
+    fn = get_train_wd_factory(name, seed=0)
+    assert _takes_base_wd(fn)
+
+
+@pytest.mark.parametrize("name", STAGE16_NAMES)
+def test_stage16_schedules_start_at_base_wd_every_episode(name):
+    """The pin-270 burn-in hands over without a jump: f(0, base) == base, bit-exact."""
+    for seed in range(5):
+        fn = get_train_wd_factory(name, seed=seed)
+        for k in range(200):
+            base = (235.0, 250.0, 270.0)[k % 3]
+            assert fn(0.0, base) == base
+            fn(5.0, base)   # advance so the next t == 0 is a genuine new episode
+
+
+def test_stage16_same_seed_identical_and_different_seeds_differ():
+    for name in STAGE16_NAMES:
+        a = _trajectory(get_train_wd_factory(name, seed=11), grid=EPISODE_10000)
+        b = _trajectory(get_train_wd_factory(name, seed=11), grid=EPISODE_10000)
+        c = _trajectory(get_train_wd_factory(name, seed=12), grid=EPISODE_10000)
+        assert np.array_equal(a, b), name
+        assert not np.array_equal(a, c), name
+
+
+def test_mix_static_richards_ends_dwells_below_240_under_the_270_pin():
+    """Under les_recipe_pin270_v2 (base_wd 270) the walks reach 233-245 deg and
+    dwell there 1000-2000 s: the Stage-15 arms under-yawed at the 235 end."""
+    fn = get_train_wd_factory("mix_static_richards_ends", seed=16)
+    n_static, n_walk, n_below = 0, 0, 0
+    n_samples = 0
+    for _ in range(300):
+        tr = _trajectory(fn, base_wd=270.0, grid=EPISODE_10000)
+        assert tr[0] == 270.0
+        if np.allclose(tr, 270.0):
+            n_static += 1
+            assert fn.branch == "static"
+            continue
+        n_walk += 1
+        assert fn.branch == "walk"
+        assert 233.0 - 1e-9 <= tr.min() and tr.max() <= 270.0 + 1e-9
+        rates = np.abs(np.diff(tr)) / DT_SIM
+        assert rates.max() <= 0.08 + 1e-6
+        n_below += int(np.sum(tr < 240.0))
+        n_samples += tr.size
+    assert 0.3 <= n_static / 300 <= 0.5            # p_static 0.4
+    assert n_walk > 0
+    assert n_below / n_samples >= 0.15
+
+
+def test_mix_static_richards_ends_walks_stay_inside_233_270_from_any_base():
+    fn = get_train_wd_factory("mix_static_richards_ends", seed=3)
+    for base in (235.0, 250.0, 270.0):
+        for _ in range(50):
+            tr = _trajectory(fn, base_wd=base, grid=EPISODE_10000)
+            assert 233.0 - 1e-9 <= tr.min() and tr.max() <= 270.0 + 1e-9
+
+
+def test_mix_all_branch_frequencies_match_the_weights_and_every_branch_is_seen():
+    fn = get_train_wd_factory("mix_all", seed=5)
+    counts = {k: 0 for k in MIX_ALL_WEIGHTS}
+    for _ in range(2000):
+        fn(0.0, 270.0)
+        counts[fn.branch] += 1
+        fn(5.0, 270.0)
+    for k, w in MIX_ALL_WEIGHTS.items():
+        assert counts[k] > 0, k
+        assert abs(counts[k] / 2000 - w) <= 0.04, (k, counts[k])
+
+
+def test_mix_all_every_branch_stays_inside_235_270_below_the_mtm30_slew_and_moves():
+    fn = get_train_wd_factory("mix_all", seed=9)
+    seen = {k: 0 for k in MIX_ALL_WEIGHTS}
+    max_rate = {k: 0.0 for k in MIX_ALL_WEIGHTS}
+    for _ in range(400):
+        base = 270.0 if seen["static"] % 2 == 0 else 250.0
+        tr = _trajectory(fn, base_wd=base, grid=EPISODE_10000)
+        assert tr[0] == base
+        assert 235.0 - 1e-9 <= tr.min() and tr.max() <= 270.0 + 1e-9
+        rates = np.abs(np.diff(tr)) / DT_SIM
+        assert rates.max() <= MTM30_SLEW + 1e-6
+        br = fn.branch
+        seen[br] += 1
+        max_rate[br] = max(max_rate[br], float(rates.max()))
+        if br == "static":
+            assert np.allclose(tr, base)
+        else:
+            assert rates.max() > 0.0
+            if br == "fast":
+                assert rates.max() >= 0.10 - 1e-6
+            if br == "stair":
+                assert rates.max() <= 0.035 + 1e-6 and rates.max() >= 0.03 - 1e-6
+            if br == "linear":
+                moving = rates[rates > 1e-6]
+                assert moving.max() <= 0.14 + 1e-6
+            if br == "richards":
+                moving = rates[rates > 1e-6]
+                assert moving.std() > 1e-4      # a Richards move, never a constant-rate ramp
+    assert all(v > 0 for v in seen.values()), seen
+    assert max_rate["linear"] > max_rate["stair"]   # the per-episode log-uniform rate reaches high rates
+
+
+def test_mix_all_linear_branch_draws_one_rate_per_episode_log_uniform():
+    """The linear walk uses ONE rate per episode (not per ramp), drawn log-uniform in
+    [0.005, 0.14] deg/s: slow drifts and fast ramps are equally represented in log space."""
+    fn = get_train_wd_factory("mix_all", seed=21)
+    rates_seen = []
+    for _ in range(600):
+        # one trajectory per episode (its t == 0 call draws the branch and the rate)
+        tr = _trajectory(fn, base_wd=270.0, grid=np.arange(0.0, 10000.0 + 1.0, 1.0))
+        if fn.branch != "linear":
+            continue
+        r = fn.linear_rate
+        assert 0.005 - 1e-9 <= r <= 0.14 + 1e-9
+        rates_seen.append(r)
+        # every move inside the episode runs at that rate (linear interp between
+        # knots; the one sample straddling a knot is smaller, hence the 90 % rule)
+        moving = np.abs(np.diff(tr))[np.abs(np.diff(tr)) > 1e-9]
+        if moving.size:
+            assert abs(moving.max() - r) <= 2e-3
+            assert np.mean(np.abs(moving - r) <= 2e-3) >= 0.9
+    rates_seen = np.asarray(rates_seen)
+    assert rates_seen.size > 50
+    # log-uniform: about half the draws fall below the geometric midpoint sqrt(0.005*0.14)
+    mid = np.sqrt(0.005 * 0.14)
+    assert 0.35 <= np.mean(rates_seen < mid) <= 0.65
