@@ -643,6 +643,24 @@ def main():
               f"measurement deques lengthened to {mes_history_length}, "
               f"history_N stays {args.history_N}")
 
+    # Stage 17 (--curriculum lut): oracle-LUT reward shaping. Validate the recipe
+    # and build the ONE reference table here in the main process (py_wake never
+    # enters the env workers; the wrapper gets plain numpy arrays). None = no
+    # wrapper in combined_wrapper (bitwise old reward).
+    from helpers.curriculum import validate_curriculum_args
+    validate_curriculum_args(args, layouts, eval_layout_names)
+    _curriculum_table = None
+    if args.curriculum == "lut":
+        from helpers.curriculum import build_curriculum_lut
+        print(f"[curriculum] lut: w {args.curriculum_w0:g}->{args.curriculum_w1:g} over env steps "
+              f"{args.curriculum_start}..{args.curriculum_end} (flat outside), "
+              f"sim_scale {args.curriculum_sim_scale:g} (err norm {args.curriculum_sim_norm_deg:g} deg), "
+              f"hold {args.curriculum_ref_hold_deg:g} deg below {args.curriculum_ref_hold_center:g}, "
+              f"table ws {args.curriculum_lut_ws:g} / ti {args.curriculum_lut_ti:g} / sign "
+              f"{args.curriculum_lut_sign} on layout {layouts[0].name}; reference at the TRUE wd, "
+              f"yaw in physical order; w == 1 is bitwise r_env", flush=True)
+        _curriculum_table = build_curriculum_lut(args, wind_turbine, layouts[0])
+
     for mes_type, prefix in mes_prefixes.items():
         if mes_type not in config:
             continue  # e.g. derate_mes is absent outside the derate presets
@@ -885,7 +903,8 @@ def main():
         from helpers.wd_functions import get_train_wd_factory
         return make_env_factory({
             **base_env_kwargs,
-            "wd_function": get_train_wd_factory(args.train_wd_function, seed=env_seed),
+            "wd_function": get_train_wd_factory(args.train_wd_function, seed=env_seed,
+                                                quant_deg=args.train_wd_quant_deg),
         })
 
     # Stage 12: per-env seeds are env_seed_base_ + i (stride 1 = the old seed + i).
@@ -894,6 +913,13 @@ def main():
         print(f"Env seed stride: {args.env_seed_stride} -> per-env seeds "
               f"{env_seed_base_}..{env_seed_base_ + args.num_envs - 1} (disjoint across seeds)")
 
+    if args.train_wd_quant_deg < 0:
+        raise ValueError(f"--train_wd_quant_deg must be >= 0 (0 = exact), got {args.train_wd_quant_deg}")
+    if args.train_wd_quant_deg > 0 and args.train_wd_function is None:
+        raise ValueError("--train_wd_quant_deg > 0 needs a --train_wd_function (static wd is "
+                         "already bit-constant; nothing to quantise)")
+    _quant_note = (f"; quantised to {args.train_wd_quant_deg:g} deg grid" if args.train_wd_quant_deg > 0
+                   else "; exact (no quantisation)")
     if args.train_wd_function is not None:
         from helpers.wd_functions import ABSOLUTE_TRAIN_NAMES, get_train_wd_factory
         if args.train_wd_function in ABSOLUTE_TRAIN_NAMES:
@@ -902,7 +928,8 @@ def main():
             # wd band MUST be pinned to f(0) or every episode starts with a wd
             # jump that the backward wd_slow pass smears non-causally into the
             # burn-in. Fail loudly instead of training on that silently.
-            _probe = get_train_wd_factory(args.train_wd_function, seed=args.seed)
+            _probe = get_train_wd_factory(args.train_wd_function, seed=args.seed,
+                                          quant_deg=args.train_wd_quant_deg)
             _f0 = float(_probe(0.0))
             _wd_lo, _wd_hi = float(config["wind"]["wd_min"]), float(config["wind"]["wd_max"])
             if not (_wd_lo == _wd_hi == _f0):
@@ -913,11 +940,13 @@ def main():
                 )
             print(f"Train wd_function: {args.train_wd_function} "
                   f"(ABSOLUTE; phase-randomised per episode; wd pinned by preset "
-                  f"to {_f0}; per-env seeds {env_seed_base_}..{env_seed_base_ + args.num_envs - 1})")
+                  f"to {_f0}; per-env seeds {env_seed_base_}..{env_seed_base_ + args.num_envs - 1}"
+                  f"{_quant_note})")
         else:
             print(f"Train wd_function: {args.train_wd_function} "
                   f"(relative schedule; wd domain randomization preserved, "
-                  f"per-env seeds {env_seed_base_}..{env_seed_base_ + args.num_envs - 1})")
+                  f"per-env seeds {env_seed_base_}..{env_seed_base_ + args.num_envs - 1}"
+                  f"{_quant_note})")
 
     def combined_wrapper(env: gym.Env) -> gym.Env:
         """
@@ -961,6 +990,20 @@ def main():
                 ),
                 limit_obs_ref=args.del_limit_obs_ref,
             )
+        # Stage 17: LUT-reference reward shaping. Reward-only; after the DEL
+        # slot (so r_env already carries the DEL / Change penalties), before
+        # ObsAggWrapper / TransformReward. Constructed at weight 1.0 (= bitwise
+        # r_env): the in-training eval envs share combined_wrapper and are never
+        # pushed a weight; training envs get w(step) via
+        # MultiLayoutEnv.set_curriculum_weight from the main loop.
+        if _curriculum_table is not None:
+            from helpers.curriculum import LutCurriculumRewardWrapper
+            env = LutCurriculumRewardWrapper(
+                env, wd_grid=_curriculum_table["wd_grid"], lut=_curriculum_table["lut"],
+                weight=1.0, sim_scale=args.curriculum_sim_scale,
+                sim_norm_deg=args.curriculum_sim_norm_deg,
+                ref_hold_deg=args.curriculum_ref_hold_deg,
+                ref_hold_center=args.curriculum_ref_hold_center)
         # change_wd_4: re-encode the ws columns (rbf/pyramid/cdf/fourier/reldef/
         # pcurve). Must sit INSIDE TransformReward so MultiLayoutEnv's
         # outermost-first _obs_dim_per_turbine probe finds the expanded dim.
@@ -2268,6 +2311,12 @@ def main():
     # during each episode's ti_window warm-up; only finite values are
     # collected so the logged means reflect evaluated steps.
     del_penalty_window = deque(maxlen=1000)
+    # Stage 17 curriculum diagnostics (filled only under --curriculum lut).
+    curriculum_weight_window = deque(maxlen=1000)
+    curriculum_sim_window = deque(maxlen=1000)
+    curriculum_reward_env_window = deque(maxlen=1000)
+    curriculum_err_window = deque(maxlen=1000)
+    _curriculum_pushed = None   # last weight sent to the training envs
     del_ratio_window = deque(maxlen=1000)
     del_agent_max_window = deque(maxlen=1000)
     del_base_max_window = deque(maxlen=1000)
@@ -2377,6 +2426,19 @@ def main():
             )
             print(f"\n[Step {global_step}] Unfroze pretrained encoder parameters")
         
+        # Stage 17: push the curriculum blend weight w(global_step) to the
+        # training envs (inside the IPC block, before step_async; ~1000 calls
+        # over a 100k-step ramp at the 1e-3 threshold, the first iteration always).
+        if _curriculum_table is not None:
+            from helpers.curriculum import curriculum_push_needed, curriculum_weight
+            _w_cur = curriculum_weight(global_step, args.curriculum_w0, args.curriculum_w1,
+                                       args.curriculum_start, args.curriculum_end)
+            # |dw| >= 1e-3, plus the endpoints w0 / w1 exactly (the 30-step lattice
+            # would otherwise stop at 0.9994 and never reach the bitwise-r_env branch).
+            if curriculum_push_needed(_w_cur, _curriculum_pushed, args.curriculum_w0, args.curriculum_w1):
+                envs.env.call("set_curriculum_weight", _w_cur)
+                _curriculum_pushed = _w_cur
+
         # Get environment info (needed for replay buffer). Under
         # --wd_source est this fetches wd_est, so the buffer stores (and the
         # policy trains on) the estimate — buffer honesty is automatic.
@@ -2931,6 +2993,15 @@ def main():
                 writer.add_scalar("entropy/n_real_mean", _acc_mean('n_real_mean'), global_step)
                 writer.add_scalar("charts/SPS", sps, global_step)
                 writer.add_scalar("charts/step_reward_mean_1000", mean_reward, global_step)
+                # Stage 17 curriculum: blend weight, similarity term, the un-blended
+                # env reward and the yaw error to the LUT reference (rolling means
+                # over the last 1000 env steps; this cadence block, not the
+                # episode-end one, so a 3000-step smoke already shows them).
+                if _curriculum_table is not None and len(curriculum_sim_window) > 0:
+                    writer.add_scalar("curriculum/weight", float(np.mean(curriculum_weight_window)), global_step)
+                    writer.add_scalar("curriculum/similarity", float(np.mean(curriculum_sim_window)), global_step)
+                    writer.add_scalar("curriculum/reward_env", float(np.mean(curriculum_reward_env_window)), global_step)
+                    writer.add_scalar("curriculum/ref_err_deg", float(np.mean(curriculum_err_window)), global_step)
                 writer.add_scalar("debug/mean_wind_direction", float(np.mean(wind_dirs)), global_step)
                 writer.add_scalar("debug/total_gradient_steps", total_gradient_steps, global_step)
                 writer.add_scalar("debug/gradient_updates_per_iter", num_gradient_updates, global_step)
@@ -2966,6 +3037,8 @@ def main():
                         # even with penalty disabled ("what it would charge").
                         # action_penalty is Optional on the unified Args (None
                         # = preset value), so read the resolved config value.
+                        # Under --curriculum lut the penalty sits inside r_env,
+                        # i.e. it is weighted by w in the blended reward.
                         writer.add_scalar(
                             "yaw/penalty_reward_estimate",
                             float(config["act_pen"].get("action_penalty") or 0.0)
@@ -3223,6 +3296,15 @@ def main():
             action_tracker.update(actions_np.reshape(args.num_envs, -1), done=dones)
             yaw_accumulator['action_saturation_frac'].append(
                 float(np.mean(np.abs(actions_np) > 0.95)))
+
+        # Stage 17 curriculum per-step diagnostics (wrapper info keys as per-env arrays).
+        if _curriculum_table is not None and "curriculum_sim" in infos:
+            for _key, _win in (("curriculum_weight", curriculum_weight_window),
+                               ("curriculum_sim", curriculum_sim_window),
+                               ("reward_env", curriculum_reward_env_window),
+                               ("curriculum_ref_err_deg", curriculum_err_window)):
+                if _key in infos:
+                    _win.extend(np.asarray(infos[_key], dtype=float).flatten().tolist())
 
         # DEL-penalty per-step diagnostics (vector env exposes wrapper info
         # keys as per-env arrays).

@@ -1215,3 +1215,144 @@ def test_mix_all_linear_branch_draws_one_rate_per_episode_log_uniform():
     # log-uniform: about half the draws fall below the geometric midpoint sqrt(0.005*0.14)
     mid = np.sqrt(0.005 * 0.14)
     assert 0.35 <= np.mean(rates_seen < mid) <= 0.65
+
+
+# ---------------------------------------------------------------------------
+# Stage 17 (exp_17, 2026-10-21): training-side wd quantisation. dynamiks takes
+# the particle-rebuild sensor pass whenever wd != previous wd (exact equality),
+# so a smooth Richards tail (1e-5..1e-3 deg per sim step) ran on a biased pass
+# in every Stage-15/16 training run while LESRL ebacc83 quantised only the eval
+# side (dwm_cli.quantise_schedule, 0.05-deg grid). ``get_train_wd_factory(...,
+# quant_deg=q)`` snaps relative schedules to ``base_wd + k*q`` and absolute ones
+# to ``k*q``; q == 0 is the legacy exact object.
+# ---------------------------------------------------------------------------
+Q17 = 0.05
+STAGE17_STATIC_MIX_NAMES = ("mix_static_richards", "mix_static_richards_ends", "mix_all", "mix_static_ramp")
+
+
+def _walk_pair(name, seed, q=Q17):
+    """(raw, quantised) instances of one schedule built from the SAME seed, so
+    their per-episode draws coincide and raw vs snapped trajectories pair up."""
+    return get_train_wd_factory(name, seed=seed), get_train_wd_factory(name, seed=seed, quant_deg=q)
+
+
+@pytest.mark.parametrize("name", sorted(TRAIN_WD_FACTORIES))
+def test_quant_deg_zero_returns_the_legacy_object_unwrapped(name):
+    fn = get_train_wd_factory(name, seed=3, quant_deg=0.0)
+    raw = get_train_wd_factory(name, seed=3)
+    assert type(fn) is type(raw)
+    assert "Quant" not in type(fn).__name__
+    assert _takes_base_wd(fn) == _takes_base_wd(raw)
+
+
+def test_quant_deg_negative_is_rejected():
+    with pytest.raises(ValueError):
+        get_train_wd_factory("mix_static_richards", seed=1, quant_deg=-0.05)
+
+
+@pytest.mark.parametrize("name", STAGE17_STATIC_MIX_NAMES)
+def test_quantised_static_episodes_are_bitwise_identical_to_the_raw_schedule(name):
+    raw, fq = _walk_pair(name, seed=11)
+    n_static = 0
+    for ep in range(40):
+        base = 235.0 + 35.0 * ((ep * 7919) % 40) / 39.0        # odd bases, NOT on the 0.05 grid
+        tr_raw = _trajectory(raw, base_wd=base, grid=EPISODE_10000)
+        tr_q = _trajectory(fq, base_wd=base, grid=EPISODE_10000)
+        if name != "mix_static_ramp":              # (_MixStaticRamp keeps a private flag, no .branch)
+            assert fq.branch == raw.branch
+        if np.all(tr_raw == base):                 # a static episode
+            n_static += 1
+            assert np.all(tr_q == tr_raw)          # bitwise, not allclose
+    assert n_static >= 5
+
+
+@pytest.mark.parametrize("name", ("mix_static_richards", "mix_static_richards_ends", "mix_all"))
+def test_quantised_walk_episodes_sit_on_the_base_plus_k_q_grid(name):
+    raw, fq = _walk_pair(name, seed=5)
+    n_walk = 0
+    for ep in range(40):
+        base = 240.123 + 0.731 * ep                              # off-grid bases
+        base = min(base, 270.0)
+        tr_raw = _trajectory(raw, base_wd=base, grid=EPISODE_10000)
+        tr_q = _trajectory(fq, base_wd=base, grid=EPISODE_10000)
+        assert tr_q[0] == base
+        if raw.branch == "static":
+            continue
+        n_walk += 1
+        k = (tr_q - base) * (1.0 / Q17)
+        assert np.max(np.abs(k - np.round(k))) < 1e-9
+        assert np.max(np.abs(tr_q - tr_raw)) <= Q17 / 2 + 1e-12
+        assert np.any(tr_q != tr_raw)                             # the walk really was snapped
+    assert n_walk >= 5
+
+
+def test_quantised_walk_is_piecewise_constant_with_steps_of_whole_grid_cells():
+    raw, fq = _walk_pair("mix_static_richards", seed=21)
+    for _ in range(30):
+        tr_q = _trajectory(fq, base_wd=262.5, grid=EPISODE_10000)
+        if fq.branch == "walk":
+            d = np.diff(tr_q) * (1.0 / Q17)
+            assert np.max(np.abs(d - np.round(d))) < 1e-9
+            # a slow Richards tail has many sim steps with NO change: the whole point
+            assert np.mean(np.abs(d) < 1e-9) > 0.3
+            return
+    pytest.fail("no walk episode in 30 draws")
+
+
+def test_quantisation_matches_dwm_cli_round_half_even_on_a_richards_segment():
+    import importlib.util
+    from pathlib import Path
+    dwm_cli_path = Path(__file__).resolve().parents[2] / "dwm_cli.py"
+    if not dwm_cli_path.exists():
+        pytest.skip("dwm_cli.py (LESRL) not next to this TransformerSac checkout")
+    import sys
+    spec = importlib.util.spec_from_file_location("dwm_cli_for_test", dwm_cli_path)
+    dwm_cli = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = dwm_cli               # dataclasses resolve the module by name
+    spec.loader.exec_module(dwm_cli)
+    from helpers.wd_functions import _snap
+
+    seg = make_richards_segment(270.0, 235.0, tau=180.0, nu=0.7, T_tr=2133.0)
+    t = np.arange(0.0, 3000.0, 1.0)
+    raw = np.array([float(seg(float(ti))) for ti in t])
+    ref = dwm_cli.quantise_schedule(lambda tt: np.interp(tt, t, raw), 270.0, q=Q17)(t)
+    ours = np.array([_snap(v, 270.0, Q17) for v in raw])
+    assert np.array_equal(ours, ref)
+    # round-half-even on the grid index, as np.round (exact binary ties: q = 0.25)
+    assert _snap(0.125, 0.0, 0.25) == 0.0 and _snap(0.375, 0.0, 0.25) == 0.5
+    assert _snap(270.0, 270.0, Q17) == 270.0 and (270.0 + 0.0 / 20.0) == 270.0
+
+
+def test_quantised_wrappers_keep_their_family_under_windgyms_real_detection():
+    wm = pytest.importorskip("WindGym.core.wind_manager")
+    detect = wm.WindManager._wd_function_takes_base_wd
+    rel = get_train_wd_factory("mix_static_richards", seed=1, quant_deg=Q17)
+    ab = get_train_wd_factory("richards_270_235_phase", seed=1, quant_deg=Q17)
+    assert detect(rel) is True and rel.takes_base_wd is True
+    assert detect(ab) is False and ab.takes_base_wd is False
+    # and the raw objects classify the same way
+    assert detect(get_train_wd_factory("mix_static_richards", seed=1)) is True
+    assert detect(get_train_wd_factory("richards_270_235_phase", seed=1)) is False
+
+
+def test_quantised_wrapper_forwards_attributes_and_redraws_per_episode():
+    raw, fq = _walk_pair("mix_static_richards", seed=9)
+    branches = set()
+    for _ in range(40):
+        _trajectory(fq, base_wd=255.0, grid=EPISODE_GRID)
+        assert fq.branch == fq.inner.branch and fq.branch in ("static", "walk")
+        branches.add(fq.branch)
+    assert branches == {"static", "walk"}
+    with pytest.raises(AttributeError):
+        fq._rng_does_not_exist  # underscore names are NOT forwarded
+    with pytest.raises(AttributeError):
+        fq.no_such_public_attribute
+
+
+def test_quantised_absolute_schedule_returns_exactly_270_at_t0_and_snaps_the_turn():
+    fq = get_train_wd_factory("richards_270_235_phase", seed=4, quant_deg=Q17)
+    assert float(fq(0.0)) == 270.0
+    tr = _trajectory(fq, grid=EPISODE_10000)
+    k = tr * (1.0 / Q17)
+    assert np.max(np.abs(k - np.round(k))) < 1e-9
+    assert tr.min() < 236.0

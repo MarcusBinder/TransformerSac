@@ -1135,12 +1135,77 @@ ABSOLUTE_TRAIN_NAMES = frozenset({"cycle_270_235_phase",
                                   "cycle_stair_phase"})
 
 
-def get_train_wd_factory(name: str, seed: int):
+# ---------------------------------------------------------------------------
+# Stage 17: training-side wd quantisation (--train_wd_quant_deg).
+#
+# dynamiks (dwm/dwm_flow_simulation.py ``wind_direction``) takes the
+# particle-rebuild sensor pass whenever the new wd differs from the previous one
+# by EXACT equality. A smooth Richards tail (1e-5..1e-3 deg per sim step) therefore
+# ran on the biased pass in every Stage-15/16 training run, while the eval side
+# has been snapped to a 0.05-deg grid since LESRL ebacc83 (dwm_cli
+# ``quantise_schedule``). The wrappers below snap the TRAINING schedule the same
+# way: relative schedules to ``base_wd + k*q`` (so a static episode, k = 0, is
+# bitwise ``base_wd``), absolute ones to ``k*q``. Round-half-even on the grid
+# index (np.round), reciprocal form so ``270 + 0/20 == 270.0`` exactly.
+# ``quant_deg == 0`` returns the ORIGINAL object: the legacy path is untouched.
+# ---------------------------------------------------------------------------
+def _snap(value: float, anchor: float, q: float) -> float:
+    """``anchor + k*q`` nearest to ``value`` (k round-half-even)."""
+    inv = 1.0 / float(q)
+    return float(anchor) + float(np.round((float(value) - float(anchor)) * inv)) / inv
+
+
+class _QuantWrapperBase:
+    """Forwards every public attribute (``branch``, ``phase``, ``linear_rate``,
+    ...) to the wrapped schedule; the redraw-at-``t == 0.0`` lives inside the
+    wrapped object and fires through the forwarded call."""
+
+    def __init__(self, inner, quant_deg: float):
+        if not float(quant_deg) > 0.0:
+            raise ValueError(f"quant_deg must be > 0 to wrap, got {quant_deg}")
+        self._inner = inner
+        self._q = float(quant_deg)
+
+    @property
+    def quant_deg(self) -> float:
+        return self._q
+
+    @property
+    def inner(self):
+        return self._inner
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._inner, name)
+
+
+class _QuantRelative(_QuantWrapperBase):
+    """RELATIVE ``f(t, base_wd)`` snapped to ``base_wd + k*q``."""
+    takes_base_wd = True
+
+    def __call__(self, t, base_wd):
+        return _snap(self._inner(t, base_wd), float(base_wd), self._q)
+
+
+class _QuantAbsolute(_QuantWrapperBase):
+    """ABSOLUTE ``f(t)`` snapped to ``k*q``."""
+    takes_base_wd = False
+
+    def __call__(self, t):
+        return _snap(self._inner(t), 0.0, self._q)
+
+
+def get_train_wd_factory(name: str, seed: int, quant_deg: float = 0.0):
     """Build a registered TRAINING wd schedule (ValueError lists known names).
 
     Each vector env must get its own seed, otherwise all 30 envs walk the same
     wd trajectory and the "train on changing wd" arms collapse to a single
     schedule per episode index.
+
+    ``quant_deg > 0`` (Stage 17) wraps the schedule so the env sees wd on the
+    ``base_wd + k*quant_deg`` grid (absolute names: ``k*quant_deg``); 0 = the
+    legacy exact object, negative = error.
     """
     try:
         factory = TRAIN_WD_FACTORIES[name]
@@ -1150,4 +1215,11 @@ def get_train_wd_factory(name: str, seed: int):
             f"(known: {sorted(TRAIN_WD_FACTORIES)}); eval-only schedules "
             f"({sorted(WD_FUNCTIONS)}) may not be used for training"
         ) from None
-    return factory(seed=seed)
+    quant_deg = float(quant_deg)
+    if quant_deg < 0.0:
+        raise ValueError(f"train_wd_quant_deg must be >= 0 (0 = exact), got {quant_deg}")
+    fn = factory(seed=seed)
+    if quant_deg == 0.0:
+        return fn
+    cls = _QuantAbsolute if name in ABSOLUTE_TRAIN_NAMES else _QuantRelative
+    return cls(fn, quant_deg)

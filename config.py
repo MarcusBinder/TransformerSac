@@ -354,6 +354,12 @@ class Args:
     # registries are disjoint, so an eval schedule name is rejected here (and vice
     # versa). None = static per-episode wd (unchanged behavior).
     train_wd_function: Optional[str] = None
+    # Stage 17: snap the TRAINING schedule to a ``base_wd + k*q`` grid (absolute
+    # schedules: ``k*q``) before it reaches windgym. dynamiks switches sensor pass
+    # on exact wd inequality, so an unsnapped smooth tail runs on a biased pass;
+    # the eval side has used 0.05 deg since LESRL ebacc83 (dwm_cli
+    # quantise_schedule). 0 = legacy exact (no wrapper); requires a schedule.
+    train_wd_quant_deg: float = 0.0
 
     # === Wind-direction source (WD-estimation ladder, T3) ===
     # What feeds the agent's rotation machinery (wind-relative position
@@ -496,6 +502,26 @@ class Args:
     reward_scale: float = 1.0    # Multiply the env reward by this (v9.1 probe). The Wake_recovery
     # reward is tiny (~0.02-0.10/step) -> small Q -> small gradients; scaling tests signal-to-noise.
     # Applied via a gymnasium reward wrapper in combined_wrapper; 1.0 = no change.
+
+    # === Stage 17: oracle-LUT reward-shaping curriculum (helpers/curriculum.py) ===
+    # "lut": r = w*r_env + (1-w)*sim, sim = sim_scale*(1 - min(err/sim_norm_deg, 1)),
+    # err = mean |yaw - PyWake-LUT(true wd)| (physical order); w ramps linearly
+    # w0 -> w1 over env steps start..end (flat outside). ONE table (sigma 0,
+    # yaw_max 45) at (lut_ws, lut_ti) for the single training layout, built in
+    # the main process; the 270 row is held over [center - hold, center].
+    # "none" = no wrapper (bitwise old reward).
+    curriculum: str = "none"
+    curriculum_w0: float = 0.0
+    curriculum_w1: float = 1.0
+    curriculum_start: int = 50000
+    curriculum_end: int = 150000
+    curriculum_sim_scale: float = 0.1
+    curriculum_sim_norm_deg: float = 45.0
+    curriculum_ref_hold_deg: float = 1.5
+    curriculum_ref_hold_center: float = 270.0
+    curriculum_lut_ws: float = 9.5
+    curriculum_lut_ti: float = 0.038
+    curriculum_lut_sign: str = "farm"
 
     # === DEL-constrained reward (baseline-relative max-DEL hinge penalty) ===
     # penalty = del_penalty_scale * max(0, DEL_agent_max/DEL_baseline_max

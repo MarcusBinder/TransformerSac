@@ -123,6 +123,9 @@ class MultiLayoutEnv(gym.Env):
         self.current_layout: LayoutConfig = layouts[0]
         self._current_layout_index: int = 0  # cached; kept in sync by reset()
         self._current_env: Optional[gym.Env] = None
+        # Stage 17: curriculum weight to (re-)apply to the LutCurriculumRewardWrapper
+        # inside per_turbine_wrapper's chain (None = never set).
+        self._curriculum_weight: Optional[float] = None
         self._create_env(self.current_layout)
         
         # Initialize permutation arrays (identity until first reset with shuffle)
@@ -207,7 +210,27 @@ class MultiLayoutEnv(gym.Env):
         # Reset permutation to identity (will be shuffled on reset if shuffle=True)
         self._perm = np.arange(layout.n_turbines)
         self._inv_perm = np.arange(layout.n_turbines)
-    
+        # The wrapper chain was just rebuilt: re-apply the curriculum weight.
+        if self._curriculum_weight is not None:
+            self.set_curriculum_weight(self._curriculum_weight)
+
+    def _find_curriculum_wrapper(self):
+        env = self._current_env
+        while env is not None:
+            if getattr(env, "curriculum_wrapper", False) is True:
+                return env
+            env = getattr(env, "env", None)
+        raise AttributeError("no curriculum wrapper (LutCurriculumRewardWrapper) in the "
+                             "per_turbine_wrapper chain of this MultiLayoutEnv")
+
+    def set_curriculum_weight(self, w: float) -> None:
+        """Stage 17: push the curriculum blend weight to the LutCurriculumRewardWrapper
+        in the inner chain (gymnasium's vector ``call`` reaches this method through
+        an outer wrapper via ``get_wrapper_attr``, but not into ``_current_env``).
+        The weight is stored so a layout rebuild re-applies it."""
+        self._curriculum_weight = float(w)
+        self._find_curriculum_wrapper().set_weight(self._curriculum_weight)
+
     def _get_rotor_diameter(self) -> float:
         """Get rotor diameter from the current environment."""
         env = self._current_env
