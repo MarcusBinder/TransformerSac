@@ -297,6 +297,10 @@ WD_FUNCTIONS = {
     "hold_ramp_270_235": make_hold_ramp(270.0, 235.0, 2045.0, 600.0),
     # Short-hold variant that fits the 140-step in-training eval window.
     "hold_ramp_270_235_short": make_hold_ramp(270.0, 235.0, 300.0, 600.0),
+    # Mirror of the short 235 case towards +35 deg (optuna sweep eval set,
+    # 2026-10-22): same 300 s hold and 600 s ramp, so the eval set carries
+    # both yaw signs at the same rate.
+    "hold_ramp_270_305_short": make_hold_ramp(270.0, 305.0, 300.0, 600.0),
     # Rate-matched VEER mirror (270 -> +35 deg) for the up/down asymmetry check.
     "hold_ramp_270_305": make_hold_ramp(270.0, 305.0, 2045.0, 600.0),
     # --- LES-3x3 Stage 3: narrow-band retreat (les_recipe_nb, wd in [265, 275]) ---

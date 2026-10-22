@@ -204,9 +204,13 @@ from helpers.layouts import get_layout_positions
 from helpers.env_configs import (
     make_env_config,
     apply_config_overrides,
+    apply_sensor_overrides,
+    eval_env_extra_kwargs,
+    eval_num_envs,
     make_eval_wind_config,
     require_les_calibrated,
 )
+from helpers.metrics_jsonl import MetricsJsonl
 
 # Receptivity profile computation
 from helpers.receptivity_profiles import compute_layout_profiles
@@ -357,6 +361,8 @@ def main():
 
     # Create run name
     run_name = f"{args.exp_name}"
+    # Optuna sweep: append-only event log (None = disabled, every write a no-op).
+    metrics_log = MetricsJsonl(args.metrics_jsonl)
     
     print("=" * 60)
     print(f"Transformer SAC for Wind Farm Control")
@@ -673,6 +679,9 @@ def main():
     # reward definition is shared by training and eval envs; the training-only
     # ws range is then overwritten per eval spec below.
     apply_config_overrides(config, args)
+    # Optuna sweep: --obs_sensors / --obs_yaw_current gate the mes_level /
+    # yaw_mes flags (no-ops when unset); before the eval deep-copies too.
+    apply_sensor_overrides(config, args)
 
     # Wind veer range + rotor tilt from args (defaults 0 = off). Applied before
     # the eval deep-copies so eval episodes sample the same veer band as
@@ -886,7 +895,10 @@ def main():
               f"(eval wind pinned to wd={_wd0}, ws={float(ws)})")
         return make_env_factory({**base_env_kwargs,
                                  "config": eval_config,
-                                 "wd_function": _wd_fn})
+                                 "wd_function": _wd_fn,
+                                 # --eval_force_baseline -> {"Baseline_comp": True}
+                                 # (eval envs only; empty by default)
+                                 **eval_env_extra_kwargs(args)})
 
     eval_env_factories = ([make_eval_env_factory(wd, ws) for wd, ws, _ in eval_specs]
                           if eval_specs else [env_factory])
@@ -1019,6 +1031,11 @@ def main():
             from helpers.obs_agg import ObsAggWrapper
             env = ObsAggWrapper(env, args.obs_agg, args.obs_agg_len,
                                 dt_env=args.dt_env)
+        # Optuna sweep: yaw-reversal penalty (helpers/reward_variants.py), in
+        # pre-scale units like the Change / DEL penalties; 0 = not attached.
+        if args.reversal_penalty > 0:
+            from helpers.reward_variants import maybe_wrap_reversal_penalty
+            env = maybe_wrap_reversal_penalty(env, args.reversal_penalty)
         # v9.1: scale the (tiny) Wake_recovery reward to probe optimization signal-to-noise.
         if args.reward_scale != 1.0:
             _scale = float(args.reward_scale)
@@ -1223,7 +1240,7 @@ def main():
                 eval_layouts=eval_layout_names,
                 env_factory=_factory,
                 combined_wrapper=combined_wrapper,
-                num_envs=args.num_envs,
+                num_envs=eval_num_envs(args),  # --num_eval_envs (default = num_envs)
                 num_eval_steps=args.num_eval_steps,
                 num_eval_episodes=args.num_eval_episodes,
                 device=device,
@@ -1271,7 +1288,7 @@ def main():
                     eval_layouts=eval_layout_names,
                     env_factory=_factory,
                     combined_wrapper=combined_wrapper,
-                    num_envs=args.num_envs,
+                    num_envs=eval_num_envs(args),
                     num_eval_steps=args.num_eval_steps,
                     num_eval_episodes=args.num_eval_episodes,
                     device=device,
@@ -1294,6 +1311,24 @@ def main():
 
         for _ev in evaluators + eval_dr_evaluators:
             _ = _ev.eval_envs  # property; triggers AsyncVectorEnv creation
+
+    # Optuna sweep: --baseline_eval_policy lut3|greedy runs the SAME evaluators
+    # (seeds, burn-in, steps, spec names) once with a PyWake-LUT / greedy agent,
+    # writes the records to --metrics_jsonl and exits before any network exists.
+    if args.baseline_eval_policy is not None:
+        from helpers.baseline_agents import run_baseline_eval
+        if not evaluators:
+            raise ValueError("--baseline_eval_policy needs in-training eval enabled "
+                             "(eval_interval <= total_timesteps or --eval_initial)")
+        run_baseline_eval(
+            args.baseline_eval_policy, args, evaluators, eval_specs,
+            wind_turbine=wind_turbine, config=config, metrics_log=metrics_log,
+        )
+        for _ev in evaluators + eval_dr_evaluators:
+            _ev.close()
+        envs.close()
+        print("[baseline] done; exiting before network construction.")
+        return
 
     def run_all_evaluations():
         """Evaluate on every eval wd schedule.
@@ -1693,6 +1728,14 @@ def main():
           f"alpha_init={args.alpha_init} lr_schedule={args.lr_schedule} lr_final_frac={args.lr_final_frac} "
           f"tqc_drop_per_net={args.tqc_drop_per_net} tqc_atom_targets={args.tqc_atom_targets} n_keep={tqc_n_keep_} "
           f"alpha_lr={alpha_learning_rate(args.alpha_lr, args.q_lr):g}")
+    metrics_log.write(
+        "started", pid=os.getpid(), obs_dim=int(obs_dim_per_turbine),
+        n_turbines=int(n_turbines_max), algorithm=args.algorithm,
+        n_params_actor=sum(p.numel() for p in actor.parameters()),
+        n_params_critic=(sum(p.numel() for p in tqc_critic.parameters()) if args.algorithm == "tqc"
+                         else sum(p.numel() for p in qf1.parameters())),
+        device=str(device),
+    )
 
 
     # Entropy tuning
@@ -2102,10 +2145,13 @@ def main():
     # Initial evaluation
     if args.eval_initial:
         print("\nRunning initial evaluation before training...")
+        _t_eval0 = time.time()
         eval_dict, eval_metrics = run_all_evaluations()
+        _eval_wall = time.time() - _t_eval0
 
         for name, value in eval_dict.items():
             writer.add_scalar(name, value, 0)
+        metrics_log.write("eval", step=0, eval_wall_s=_eval_wall, **eval_dict)
 
         print(f"Initial eval - Mean reward: {eval_metrics.mean_reward:.4f}, "
               f"Power ratio: {eval_metrics.power_ratio:.4f}")
@@ -2848,6 +2894,7 @@ def main():
                             data["attention_mask"],
                             action_dim_per_turbine,
                             agg=args.entropy_agg,
+                            scale=args.target_entropy_scale,
                         )
                         
                         # Alpha loss
@@ -3544,11 +3591,14 @@ def main():
         
         if global_step >= next_eval_step:
             print(f"\nRunning evaluation at step {global_step}...")
+            _t_eval0 = time.time()
             eval_dict, eval_metrics = run_all_evaluations()
+            _eval_wall = time.time() - _t_eval0
 
             # Log to tensorboard/wandb
             for name, value in eval_dict.items():
                 writer.add_scalar(name, value, global_step)
+            metrics_log.write("eval", step=int(global_step), eval_wall_s=_eval_wall, **eval_dict)
             
             print(f"Eval step {global_step} - Mean reward: {eval_metrics.mean_reward:.4f}, "
                   f"Power ratio: {eval_metrics.power_ratio:.4f}")
@@ -3588,6 +3638,11 @@ def main():
             f"runs/{run_name}/replay_buffer.npz",
             extra_meta=buffer_meta(global_step),
         )
+    metrics_log.write(
+        "finished", step=int(global_step), stop_requested=bool(stop_requested),
+        gpu_peak_alloc_gb=(torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else None),
+        gpu_peak_reserved_gb=(torch.cuda.max_memory_reserved() / 1e9 if device.type == "cuda" else None),
+    )
 
     # =========================================================================
     # Stage 10 PHASE 2: adaptation module phi (after the final RL save, so a

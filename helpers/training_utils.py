@@ -33,6 +33,7 @@ def compute_adaptive_target_entropy(
     attention_mask: torch.Tensor,
     action_dim_per_turbine: int = 1,
     agg: str = "sum",
+    scale: float = 1.0,
 ) -> torch.Tensor:
     """
     Compute the SAC target entropy, matched to how the actor aggregates log-prob.
@@ -49,6 +50,8 @@ def compute_adaptive_target_entropy(
         attention_mask: (batch, max_turbines) where True = padding
         action_dim_per_turbine: Actions per turbine (typically 1 for yaw)
         agg: "sum" or "mean" — must match TransformerActor.entropy_agg
+        scale: --target_entropy_scale (optuna sweep); 1.0 = the standard target.
+            < 1 asks for a sharper policy, > 1 keeps it more stochastic.
 
     Returns:
         target_entropy: (batch, 1) tensor of per-sample target entropies
@@ -56,14 +59,16 @@ def compute_adaptive_target_entropy(
     batch = attention_mask.shape[0]
     if agg == "mean":
         # Size-invariant: -1 per action dimension.
-        return attention_mask.new_full(
+        target_entropy = attention_mask.new_full(
             (batch, 1), -float(action_dim_per_turbine), dtype=torch.float32
         )
+    else:
+        # agg == "sum": scales with the actual turbine count per sample.
+        n_real_turbines = (~attention_mask).sum(dim=1, keepdim=True).float()
+        target_entropy = -action_dim_per_turbine * n_real_turbines
 
-    # agg == "sum": scales with the actual turbine count per sample.
-    n_real_turbines = (~attention_mask).sum(dim=1, keepdim=True).float()
-    target_entropy = -action_dim_per_turbine * n_real_turbines
-
+    if scale != 1.0:
+        target_entropy = target_entropy * float(scale)
     return target_entropy
 
 

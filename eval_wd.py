@@ -76,6 +76,35 @@ def load_checkpoint(checkpoint_path: str, device: torch.device):
     return data, args
 
 
+def build_eval_config(args: dict, wd0: float, ws: float) -> dict:
+    """The checkpoint's env config pinned to one eval cell (wd0, ws).
+
+    Preset -> mes histories (history_N = the checkpoint's history_length, the
+    deques lengthened to obs_agg_len under --obs_agg) -> the change_wd_3 /
+    optuna config overrides (reward, yaw band, wd band; the yaw band sets the
+    action range and the yaw obs scaling, so skipping it here would rebuild a
+    different obs contract) -> sensor gating -> the eval wind pin. Same order as
+    the trainer, so the eval env matches what the actor saw. Old checkpoints
+    carry None for every override (Args() backfill) and rebuild unchanged.
+    """
+    from helpers.env_configs import apply_config_overrides, apply_sensor_overrides
+    config = make_env_config(args["config"])
+    obs_agg = args.get("obs_agg")
+    mes_history_length = args["history_length"]
+    if obs_agg:
+        mes_history_length = max(args["history_length"], int(args["obs_agg_len"]))
+    for mes_type, prefix in (("ws_mes", "ws"), ("wd_mes", "wd"),
+                             ("yaw_mes", "yaw"), ("power_mes", "power"),
+                             ("derate_mes", "derate")):
+        if mes_type not in config:
+            continue
+        config[mes_type][f"{prefix}_history_N"] = args["history_length"]
+        config[mes_type][f"{prefix}_history_length"] = mes_history_length
+    apply_config_overrides(config, args)
+    apply_sensor_overrides(config, args)
+    return make_eval_wind_config(config, float(wd0), float(ws))
+
+
 def create_eval_env(layout: str, args: dict, cli, wd_fn, seed: int,
                     n_envs: int, vector_cls=None):
     """One vector env of MultiLayoutEnv slots pinned to one wd/ws cell.
@@ -120,22 +149,7 @@ def create_eval_env(layout: str, args: dict, cli, wd_fn, seed: int,
 
     # Env config: the checkpoint's preset, mes histories, then the eval wind
     # pin — the same construction the trainer uses for its eval specs.
-    config = make_env_config(args["config"])
-    # --obs_agg (LES-3x3 Stage 4): the deques grow to obs_agg_len while the
-    # base obs width (history_N) stays -- same rule as the trainer. Old
-    # checkpoints have obs_agg=None (Args() backfill) and rebuild unchanged.
-    obs_agg = args.get("obs_agg")
-    mes_history_length = args["history_length"]
-    if obs_agg:
-        mes_history_length = max(args["history_length"], int(args["obs_agg_len"]))
-    for mes_type, prefix in (("ws_mes", "ws"), ("wd_mes", "wd"),
-                             ("yaw_mes", "yaw"), ("power_mes", "power"),
-                             ("derate_mes", "derate")):
-        if mes_type not in config:
-            continue
-        config[mes_type][f"{prefix}_history_N"] = args["history_length"]
-        config[mes_type][f"{prefix}_history_length"] = mes_history_length
-    config = make_eval_wind_config(config, float(wd_fn(0.0)), float(cli.ws))
+    config = build_eval_config(args, float(wd_fn(0.0)), float(cli.ws))
 
     backend = cli.backend or args["backend"]
     base_env_kwargs = {

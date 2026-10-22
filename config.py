@@ -286,6 +286,18 @@ class Args:
     train_ws_min: Optional[float] = None
     train_ws_max: Optional[float] = None
 
+    # === Optuna sweep (LESRL optuna_sweep, 2026-10-22): wd band + yaw band ===
+    # Same None = "don't override" contract as the ws range above. wd_min/wd_max
+    # replace the preset's wind.wd_min/wd_max (the per-episode base-wd band; an
+    # ABSOLUTE --train_wd_function still requires wd_min == wd_max == f(0));
+    # yaw_min/yaw_max replace farm.yaw_min/yaw_max, which set BOTH the action
+    # range and the yaw obs scaling, so they reach eval_wd.py too (it applies
+    # apply_config_overrides from the checkpoint args since this flag landed).
+    wd_min: Optional[float] = None
+    wd_max: Optional[float] = None
+    yaw_min: Optional[float] = None
+    yaw_max: Optional[float] = None
+
     # === Observation encoding (change_wd_4) ===
     # The OBS_SCALING.md finding: every ws feature is affine-scaled from a HARDCODED
     # 0-30 m/s (wind_farm_env.py:71-72 ctor defaults, never overridden anywhere),
@@ -642,6 +654,27 @@ class Args:
     # === Pretrained Encoder Loading ===
     pretrain_checkpoint: Optional[str] = None   # Path to pretrained encoder .pt from pretrain_power.py
     pretrain_freeze_steps: int = 0             # Freeze encoder for this many env steps (0 = no freeze)
+
+    # === Optuna sweep flags (LESRL optuna_sweep, 2026-10-22) ===
+    # All default to the pre-sweep behaviour; see tests/test_optuna_flags.py.
+    num_eval_envs: Optional[int] = None     # eval vector-env size per eval spec (resident workers AND
+    #                                         eval episodes per pass); None = --num_envs (old coupling)
+    target_entropy_scale: float = 1.0       # multiplies compute_adaptive_target_entropy() (autotune only)
+    eval_force_baseline: bool = False       # build the in-training EVAL envs with Baseline_comp=True so
+    #                                         eval/.../mean_baseline_power exists for Power_avg rewards too
+    #                                         (training envs untouched; eval cost 2x for those rewards)
+    metrics_jsonl: Optional[str] = None     # append one JSON line per event (started / eval / finished)
+    #                                         to this path, fsync'd; the optuna worker tails it
+    obs_sensors: Optional[str] = None       # comma list from {ws, wd, power} gating mes_level.turb_*;
+    #                                         "" = none of the three (yaw is always observed); None = preset
+    obs_yaw_current: bool = False           # yaw_mes.yaw_current = True (adds one column per turbine)
+    reversal_penalty: float = 0.0           # coef of YawReversalPenaltyWrapper (helpers/reward_variants.py):
+    #                                         r -= coef * mean_i[1(sign flip) * |d_yaw| / yaw_step_env],
+    #                                         before --reward_scale; 0 = wrapper not attached
+    baseline_eval_policy: Optional[str] = None  # "lut3" | "greedy": run the in-training evaluators ONCE
+    #                                         with a PyWake-LUT / greedy agent (helpers/baseline_agents.py),
+    #                                         write the records to --metrics_jsonl and exit before any
+    #                                         network is built (the optuna sweep's measured reference)
 
     # === Action Settings ===
     action_type: str = "wind"   # "wind" (target setpoint) or "yaw" (delta). Overridden by BC checkpoint if provided.

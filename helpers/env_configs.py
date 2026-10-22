@@ -612,7 +612,20 @@ _OVERRIDE_MAP = (
     ("train_ws_max",  "wind",      "ws_max"),
     ("action_penalty",      "act_pen", "action_penalty"),
     ("action_penalty_type", "act_pen", "action_penalty_type"),
+    # Optuna sweep (2026-10-22): wd band + yaw band. The yaw band sets the
+    # action range AND the yaw obs scaling, so eval_wd.py applies this map too.
+    ("wd_min",  "wind", "wd_min"),
+    ("wd_max",  "wind", "wd_max"),
+    ("yaw_min", "farm", "yaw_min"),
+    ("yaw_max", "farm", "yaw_max"),
 )
+
+
+def _arg(args, attr: str, default=None):
+    """Read a flag from an Args instance OR a checkpoint-args dict (eval_wd.py)."""
+    if isinstance(args, dict):
+        return args.get(attr, default)
+    return getattr(args, attr, default)
 
 
 def apply_config_overrides(config: Dict[str, Any], args) -> Dict[str, Any]:
@@ -632,7 +645,7 @@ def apply_config_overrides(config: Dict[str, Any], args) -> Dict[str, Any]:
     """
     applied = []
     for attr, section, key in _OVERRIDE_MAP:
-        value = getattr(args, attr, None)
+        value = _arg(args, attr)
         if value is None:
             continue
         config.setdefault(section, {})
@@ -642,6 +655,63 @@ def apply_config_overrides(config: Dict[str, Any], args) -> Dict[str, Any]:
     if applied:
         print("Config overrides: " + "; ".join(applied))
     return config
+
+
+# Optuna sweep (2026-10-22): sensor gating. The mes_level turb_* flags are what
+# WindGym's FarmMes ANDs into the per-channel settings (see obs_dim_per_turbine).
+SENSOR_NAMES = ("ws", "wd", "power")
+
+
+def apply_sensor_overrides(config: Dict[str, Any], args) -> Dict[str, Any]:
+    """Apply --obs_sensors / --obs_yaw_current in place (no-ops when unset).
+
+    ``obs_sensors`` is a comma list drawn from {ws, wd, power}; "" disables all
+    three (yaw is never gated). ``obs_yaw_current`` switches the yaw_mes
+    current-value column on. Accepts an Args or a checkpoint-args dict so
+    eval_wd.py rebuilds the same obs contract.
+    """
+    sensors = _arg(args, "obs_sensors")
+    if sensors is not None:
+        wanted = {s.strip() for s in str(sensors).split(",") if s.strip()}
+        unknown = wanted - set(SENSOR_NAMES)
+        if unknown:
+            raise ValueError(f"--obs_sensors: unknown sensor(s) {sorted(unknown)}; "
+                             f"valid: {SENSOR_NAMES}")
+        mes = config.setdefault("mes_level", {})
+        for name in SENSOR_NAMES:
+            mes[f"turb_{name}"] = name in wanted
+        print(f"Sensor override: turb_ws/wd/power = "
+              f"{[name in wanted for name in SENSOR_NAMES]} (--obs_sensors {sensors!r})")
+    if _arg(args, "obs_yaw_current", False):
+        config.setdefault("yaw_mes", {})["yaw_current"] = True
+        print("Sensor override: yaw_mes.yaw_current = True (--obs_yaw_current)")
+    return config
+
+
+def eval_num_envs(args) -> int:
+    """Eval vector-env size: --num_eval_envs, else --num_envs (the old coupling).
+
+    It sets both the number of resident eval workers per eval spec and the
+    number of eval episodes per pass (env i is seeded eval_seed + i), so a sweep
+    can train on many envs while keeping a small, fixed eval set.
+    """
+    n = _arg(args, "num_eval_envs")
+    if n is None:
+        return int(_arg(args, "num_envs"))
+    if int(n) < 1:
+        raise ValueError(f"--num_eval_envs must be >= 1, got {n}")
+    return int(n)
+
+
+def eval_env_extra_kwargs(args) -> Dict[str, Any]:
+    """WindFarmEnv kwargs added to the in-training EVAL envs only.
+
+    --eval_force_baseline -> Baseline_comp=True, so ``mean_baseline_power`` is
+    reported for Power_avg rewards too (Baseline / Wake_recovery rewards force
+    a baseline farm anyway). Empty by default, keeping the eval envs identical
+    to the training envs.
+    """
+    return {"Baseline_comp": True} if _arg(args, "eval_force_baseline", False) else {}
 
 
 def make_eval_wind_config(config: Dict[str, Any], wd0: float, ws: float) -> Dict[str, Any]:
