@@ -211,6 +211,8 @@ from helpers.env_configs import (
     require_les_calibrated,
 )
 from helpers.metrics_jsonl import MetricsJsonl
+from helpers.eval_score import eval_scores, load_score_ref
+from helpers.wandb_utils import STEP_METRIC_GROUPS, init_wandb, wandb_init_kwargs
 
 # Receptivity profile computation
 from helpers.receptivity_profiles import compute_layout_profiles
@@ -363,6 +365,8 @@ def main():
     run_name = f"{args.exp_name}"
     # Optuna sweep: append-only event log (None = disabled, every write a no-op).
     metrics_log = MetricsJsonl(args.metrics_jsonl)
+    # Optuna sweep: greedy / lut3 references for the live eval/score/* curves (None = off).
+    score_ref = load_score_ref(args.eval_score_ref) if args.eval_score_ref else None
     
     print("=" * 60)
     print(f"Transformer SAC for Wind Farm Control")
@@ -1407,11 +1411,13 @@ def main():
     
     if args.track:
         import wandb
-        wandb.init(
+        _run = init_wandb(
+            args,
+            soft_fail=args.wandb_soft_fail,
             project=args.wandb_project_name,
             entity=args.wandb_entity,
             sync_tensorboard=True,
-            config=vars(args) | {
+            **wandb_init_kwargs(args.wandb_init_json, vars(args) | {
                 # Debug/multi-layout config
                 "debug/n_layouts": len(layout_names),
                 # Under DR the pool is huge; log a compact summary instead of 2048 names.
@@ -1422,13 +1428,14 @@ def main():
                 "debug/log_frequency": debug_logger.log_frequency,
                 "debug/attention_log_frequency": debug_logger.attention_log_frequency,
                 "debug/gradient_log_frequency": debug_logger.gradient_log_frequency,
-            },
+            }),
             name=run_name,
             group=args.exp_group,
             monitor_gym=True,
             save_code=True,
         )
 
+    if args.track and _run is not None:
         # Everything reaches W&B through sync_tensorboard, so the TB tag is the
         # W&B key and the TB step arrives as "global_step". Declaring the groups
         # explicitly makes each one chart against global_step instead of
@@ -1436,8 +1443,7 @@ def main():
         # metrics logged at different frequencies (per-iteration perf/* vs
         # per-episode del/*) across mismatched x-axes.
         wandb.define_metric("global_step")
-        for _group in ("perf/*", "actions/*", "del/*", "losses/*",
-                       "charts/*", "entropy/*", "timing/*"):
+        for _group in STEP_METRIC_GROUPS:
             wandb.define_metric(_group, step_metric="global_step")
 
     writer = SummaryWriter(f"runs/{run_name}")
@@ -2148,6 +2154,7 @@ def main():
         _t_eval0 = time.time()
         eval_dict, eval_metrics = run_all_evaluations()
         _eval_wall = time.time() - _t_eval0
+        eval_dict.update(eval_scores(eval_dict, score_ref))
 
         for name, value in eval_dict.items():
             writer.add_scalar(name, value, 0)
@@ -3603,6 +3610,7 @@ def main():
             _t_eval0 = time.time()
             eval_dict, eval_metrics = run_all_evaluations()
             _eval_wall = time.time() - _t_eval0
+            eval_dict.update(eval_scores(eval_dict, score_ref))
 
             # Log to tensorboard/wandb
             for name, value in eval_dict.items():

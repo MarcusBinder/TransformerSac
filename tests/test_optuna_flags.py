@@ -12,6 +12,7 @@ flag (A1-A7 of the sweep plan):
   A5 --obs_sensors / --obs_yaw_current      (sensor gating)
   A6 --reversal_penalty                     (YawReversalPenaltyWrapper)
   A7 hold_ramp_270_305_short                (eval registry)
+  A8 --eval_score_ref / --wandb_soft_fail   (live sweep score, W&B never kills a trial)
 """
 import json
 import sys
@@ -290,6 +291,144 @@ def test_num_eval_envs_defaults_to_the_training_num_envs():
     assert eval_num_envs(parse("--num_envs", "30", "--num_eval_envs", "8")) == 8
     with pytest.raises(ValueError):
         eval_num_envs(parse("--num_eval_envs", "0"))
+
+
+# ---------------------------------------------------------------------------
+# A8: live sweep score (--eval_score_ref) + W&B soft-fail (--wandb_soft_fail)
+# ---------------------------------------------------------------------------
+
+def _score_ref_file(tmp_path):
+    ref = {"specs": ["static_270", "static_235"],
+           "per_spec": {"static_270": {"greedy": 10.0, "lut3": 12.0, "greedy_agent": 10.0},
+                        "static_235": {"greedy": 20.0, "lut3": 25.0, "greedy_agent": 20.0}}}
+    p = tmp_path / "baselines.json"
+    p.write_text(json.dumps(ref))
+    return p
+
+
+def test_a8_new_flags_default_to_the_old_behaviour():
+    a = Args()
+    assert a.eval_score_ref is None and a.wandb_soft_fail is False and a.wandb_init_json is None
+    b = parse("--eval_score_ref", "x.json", "--wandb_soft_fail", "--wandb_init_json", "w.json")
+    assert b.eval_score_ref == "x.json" and b.wandb_soft_fail is True and b.wandb_init_json == "w.json"
+
+
+def test_a8_load_score_ref_reads_the_baselines_per_spec_layout(tmp_path):
+    from helpers.eval_score import load_score_ref
+    ref = load_score_ref(str(_score_ref_file(tmp_path)))
+    assert ref == {"static_270": (10.0, 12.0), "static_235": (20.0, 25.0)}
+    assert list(ref) == ["static_270", "static_235"]
+
+
+def test_a8_eval_scores_is_the_unclamped_normalised_energy(tmp_path):
+    from helpers.eval_score import eval_scores, load_score_ref
+    ref = load_score_ref(str(_score_ref_file(tmp_path)))
+    ev = {"eval/wd/static_270/mean_power": 13.0,      # (13-10)/(12-10) = 1.5
+          "eval/wd/static_235/mean_power": 0.0,       # (0-20)/(25-20) = -4 (not clamped)
+          "eval/mean_reward": 0.3}
+    out = eval_scores(ev, ref)
+    assert out == pytest.approx({"eval/score/static_270": 1.5, "eval/score/static_235": -4.0,
+                                 "eval/score/mean": -1.25})
+
+
+def test_a8_eval_scores_skips_missing_specs_and_then_has_no_mean(tmp_path):
+    from helpers.eval_score import eval_scores, load_score_ref
+    ref = load_score_ref(str(_score_ref_file(tmp_path)))
+    out = eval_scores({"eval/wd/static_270/mean_power": 11.0}, ref)
+    assert out == pytest.approx({"eval/score/static_270": 0.5})
+    assert eval_scores({}, None) == {}
+
+
+class _FakeWandb:
+    """Stand-in for the wandb module: records init calls, fails the first ``fail`` of them."""
+
+    class Settings:
+        def __init__(self, **kw):
+            self.kw = kw
+
+    def __init__(self, fail=0):
+        self.fail, self.calls = fail, []
+
+    def init(self, **kw):
+        self.calls.append(kw)
+        if len(self.calls) <= self.fail:
+            raise RuntimeError("wandb down")
+        return "RUN"
+
+
+def test_a8_init_wandb_without_soft_fail_is_the_old_call(monkeypatch):
+    from helpers import wandb_utils
+    fake = _FakeWandb(fail=1)
+    monkeypatch.setitem(sys.modules, "wandb", fake)
+    args = parse()
+    with pytest.raises(RuntimeError):
+        wandb_utils.init_wandb(args, soft_fail=False, project="p", name="n")
+    assert fake.calls == [{"project": "p", "name": "n"}]       # no settings, no retry
+    fake2 = _FakeWandb()
+    monkeypatch.setitem(sys.modules, "wandb", fake2)
+    assert wandb_utils.init_wandb(args, soft_fail=False, project="p") == "RUN"
+    assert fake2.calls == [{"project": "p"}]
+
+
+def test_a8_init_wandb_soft_fail_retries_offline(monkeypatch):
+    from helpers import wandb_utils
+    fake = _FakeWandb(fail=1)
+    monkeypatch.setitem(sys.modules, "wandb", fake)
+    args = parse()
+    assert wandb_utils.init_wandb(args, soft_fail=True, project="p", tags=["t"]) == "RUN"
+    assert args.track is True
+    # no explicit wandb.Settings: building one re-validates the WANDB_* env (0.21 rejected a
+    # WANDB_CONFIG_PATHS string there, so every online init failed); the worker sets WANDB_INIT_TIMEOUT
+    assert fake.calls[0] == {"project": "p", "tags": ["t"]}
+    assert fake.calls[1] == {"project": "p", "tags": ["t"], "mode": "offline"}
+
+
+def test_a8_init_wandb_soft_fail_gives_up_and_disables_tracking(monkeypatch):
+    from helpers import wandb_utils
+    fake = _FakeWandb(fail=2)
+    monkeypatch.setitem(sys.modules, "wandb", fake)
+    args = parse()
+    assert wandb_utils.init_wandb(args, soft_fail=True, project="p") is None
+    assert args.track is False and len(fake.calls) == 2
+
+
+def test_a8_wandb_init_json_adds_id_tags_and_config(tmp_path):
+    from helpers.wandb_utils import wandb_init_kwargs
+    base = {"lr": 1.0, "debug/x": 2}
+    assert wandb_init_kwargs(None, base) == {"config": base}           # no flag: the old call
+    p = tmp_path / "wandb_init.json"
+    p.write_text(json.dumps({"id": "s-t0001-ab12", "tags": ["optuna", "s"],
+                             "config": {"optuna/trial": 1, "lr": "clash"}}))
+    kw = wandb_init_kwargs(str(p), base)
+    assert kw["id"] == "s-t0001-ab12" and kw["tags"] == ["optuna", "s"]
+    assert kw["config"] == {"lr": 1.0, "debug/x": 2, "optuna/trial": 1}  # trainer args win a clash
+    assert base == {"lr": 1.0, "debug/x": 2}
+
+
+def test_a8_real_wandb_offline_run_carries_the_id_tags_and_config(tmp_path, monkeypatch):
+    wandb = pytest.importorskip("wandb")
+    from helpers import wandb_utils
+    monkeypatch.setenv("WANDB_MODE", "offline")
+    monkeypatch.setenv("WANDB_DIR", str(tmp_path))
+    monkeypatch.setenv("WANDB_SILENT", "true")
+    p = tmp_path / "wandb_init.json"
+    p.write_text(json.dumps({"id": "s-t0002-cd34", "tags": ["optuna", "s", "raw"],
+                             "config": {"optuna/trial": 2, "optuna/lr": 3e-4}}))
+    args = parse("--wandb_soft_fail")
+    run = wandb_utils.init_wandb(args, soft_fail=True, project="p", group="s", name="optuna_s_t0002",
+                                 **wandb_utils.wandb_init_kwargs(str(p), {"seed": 1}))
+    try:
+        assert run is not None and run.id == "s-t0002-cd34" and run.group == "s"
+        assert set(run.tags) == {"optuna", "s", "raw"}
+        assert run.config["optuna/trial"] == 2 and run.config["seed"] == 1
+    finally:
+        run.finish()
+
+
+def test_a8_eval_groups_chart_against_global_step():
+    from helpers.wandb_utils import STEP_METRIC_GROUPS
+    for g in ("perf/*", "losses/*", "charts/*", "eval/*", "eval_dr/*"):
+        assert g in STEP_METRIC_GROUPS
 
 
 # ---------------------------------------------------------------------------

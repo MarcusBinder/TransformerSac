@@ -675,6 +675,13 @@ class Args:
     #                                         with a PyWake-LUT / greedy agent (helpers/baseline_agents.py),
     #                                         write the records to --metrics_jsonl and exit before any
     #                                         network is built (the optuna sweep's measured reference)
+    eval_score_ref: Optional[str] = None    # baselines.json of the sweep: after every eval also log
+    #                                         eval/score/<spec> and eval/score/mean (helpers/eval_score.py,
+    #                                         unclamped) to TB/W&B and the --metrics_jsonl record
+    wandb_soft_fail: bool = False           # W&B init failure -> retry offline -> run untracked, never crash
+    #                                         (helpers/wandb_utils.py; the optuna worker passes it)
+    wandb_init_json: Optional[str] = None   # JSON {"id", "tags", "config"} passed to wandb.init (optuna worker:
+    #                                         run id, tags, optuna/* config); None = the old call
 
     # === Action Settings ===
     action_type: str = "wind"   # "wind" (target setpoint) or "yaw" (delta). Overridden by BC checkpoint if provided.
