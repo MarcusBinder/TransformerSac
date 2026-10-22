@@ -290,3 +290,29 @@ def test_num_eval_envs_defaults_to_the_training_num_envs():
     assert eval_num_envs(parse("--num_envs", "30", "--num_eval_envs", "8")) == 8
     with pytest.raises(ValueError):
         eval_num_envs(parse("--num_eval_envs", "0"))
+
+
+# ---------------------------------------------------------------------------
+# Regression: --obs_norm crashed every run since the async step refactor
+# (obs_normalizer.update read next_obs before step_result was unpacked).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.slow
+@pytest.mark.parametrize("overlap", [False, True])
+def test_obs_norm_training_run_completes(tmp_path, overlap):
+    import subprocess
+    metrics = tmp_path / "m.jsonl"
+    argv = [sys.executable, "-u", "transformer_sac_windfarm.py", "--backend", "pywake", "--dt_sim", "10",
+            "--dt_env", "10", "--layouts", "les_3x3", "--max_turbines", "9", "--turbtype", "iea22",
+            "--config", "les_recipe", "--train_ws_min", "9", "--train_ws_max", "9", "--TI_type", "Random",
+            "--num_envs", "2", "--num_eval_envs", "1", "--total_timesteps", "60", "--learning_starts", "20",
+            "--eval_interval", "60", "--eval_wd_function", "static_270", "--eval_ws", "9", "--num_eval_steps", "5",
+            "--embed_dim", "32", "--num_heads", "2", "--num_layers", "1", "--algorithm", "sac", "--batch_size", "16",
+            "--buffer_size", "100", "--obs_norm", "--no-track", "--no-save_model", "--no-cuda",
+            "--metrics_jsonl", str(metrics), "--exp_name", f"obsnorm_test_{int(overlap)}"]
+    if overlap:
+        argv.append("--async_overlap")
+    r = subprocess.run(argv, cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=600)
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
+    events = [json.loads(l)["event"] for l in metrics.read_text().splitlines()]
+    assert events[0] == "started" and events[-1] == "finished" and "eval" in events

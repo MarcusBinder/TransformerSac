@@ -2560,12 +2560,16 @@ def main():
 
         # change_wd_4: fold the fresh observations into the running obs stats.
         # Masked so 0.0-pad rows don't drag the means; runs from step 0 (the
-        # random-exploration warmup is already on-distribution).
-        if obs_normalizer is not None:
+        # random-exploration warmup is already on-distribution). The step result
+        # exists here only in blocking mode; under --async_overlap the update is
+        # done right after the deferred step_wait below (it used to read an
+        # unbound next_obs here and crash every --obs_norm run).
+        if obs_normalizer is not None and step_result is not None:
             obs_normalizer.update(
-                torch.as_tensor(next_obs, dtype=torch.float32, device=device),
+                torch.as_tensor(step_result[0], dtype=torch.float32, device=device),
                 torch.as_tensor(current_masks, device=device),
             )
+        _obs_norm_deferred = obs_normalizer is not None and step_result is None
 
 
         # =====================================================================
@@ -3301,6 +3305,11 @@ def main():
                 timing["env_span"] += _t_now - _t_async
         next_obs, rewards, terminations, truncations, infos = step_result
         prev_dones = np.logical_or(terminations, truncations)
+        if _obs_norm_deferred:  # --async_overlap: the step result only exists now
+            obs_normalizer.update(
+                torch.as_tensor(next_obs, dtype=torch.float32, device=device),
+                torch.as_tensor(current_masks, device=device),
+            )
 
         # Get current layout names for each env. Under domain randomization the pool
         # is huge, so bucket every training layout under "dr_pool" for debug stats.
