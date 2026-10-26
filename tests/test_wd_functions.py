@@ -27,6 +27,7 @@ from helpers.wd_functions import (
     make_cycle_train,
     make_dr_ramp,
     make_hold_ramp,
+    make_richards_eval,
     make_richards_segment,
     make_static,
     parse_eval_ws,
@@ -981,6 +982,94 @@ def test_richards_270_235_phase_reproduces_emilys_profile_on_her_window():
     down = np.array([float(fn(RICH_T_HOLD + x)) for x in u])
     up = np.array([float(fn(2.0 * RICH_T_HOLD + RICH_T_TR + x)) for x in u])
     np.testing.assert_allclose(up, 505.0 - down, atol=1e-9)
+
+
+# --- richards_270_235_short: the Optuna v2 EVAL twin of richards_270_235_phase ---
+# (2026-10-26 audit: no eval spec was a slow turn; the fast-ramp wins did not
+# transfer to Emily's 2133 s Richards turn). 300 steps x dt_env 10 = 3000 s:
+# segment from t = 0 (its own value at u = 0 is the 270 hold), 2600 s window,
+# then 235 to the end. Snapped to the 0.05 deg grid as dwm_cli.quantise_schedule
+# (the Stage-16 G4 fix) so the sensor wd estimate sees the same staircase as the
+# campaign's cell R.
+RICH_SHORT_T_EVAL = 3000.0
+RICH_SHORT_Q = 0.05
+
+
+def test_richards_270_235_short_is_an_eval_schedule_not_a_train_one():
+    assert "richards_270_235_short" in WD_FUNCTIONS
+    assert "richards_270_235_short" not in TRAIN_WD_FACTORIES
+    fn = get_wd_function("richards_270_235_short")
+    assert fn.__name__ == "richards_270_235_short"
+    assert fn.quant_deg == RICH_SHORT_Q
+
+
+def test_richards_270_235_short_starts_bit_exactly_at_270_and_ends_at_235():
+    fn = get_wd_function("richards_270_235_short")
+    assert float(fn(0.0)) == 270.0
+    assert float(fn(RICH_T_TR)) == 235.0
+    assert float(fn(RICH_SHORT_T_EVAL)) == 235.0
+    assert float(fn(RICH_SHORT_T_EVAL + 5000.0)) == 235.0      # holds past the window
+
+
+def test_richards_270_235_short_is_monotone_on_the_grid_and_vectorised():
+    fn = get_wd_function("richards_270_235_short")
+    t = np.arange(0.0, RICH_SHORT_T_EVAL + 1.0, 1.0)
+    wd = np.asarray(fn(t), dtype=float)
+    assert wd.shape == t.shape
+    assert np.all(np.diff(wd) <= 0.0)
+    # every value on the 270 + k * 0.05 grid
+    k = (wd - 270.0) / RICH_SHORT_Q
+    np.testing.assert_allclose(k, np.round(k), atol=1e-9)
+    # scalar calls agree with the vector call
+    for ti in (0.0, 339.0, 1000.0, 1690.0, 2460.0, 2999.0):
+        assert float(fn(ti)) == wd[int(ti)]
+
+
+def test_richards_270_235_short_departs_and_arrives_inside_the_3000_s_window():
+    """0.5-deg rule on a 1 s grid (dwm_cli._smooth_edges on the unquantised
+    schedule): depart ~339 s, arrive ~2298 s (Emily's raw curve: 1225 -> 3358 s,
+    2133 s; the renormalised segment loses her tails -> 1959 s), so a 300-step eval
+    holds 270 for ~34 steps, turns, and dwells at 235 for ~70 steps. Peak rate =
+    Emily's 2 deg/min (the 0.05 grid steps are excluded from the measure)."""
+    fn = get_wd_function("richards_270_235_short")
+    t = np.arange(0.0, RICH_SHORT_T_EVAL + 1.0, 1.0)
+    wd = np.asarray(fn(t), dtype=float)
+    dep = float(t[np.flatnonzero(np.abs(wd - 270.0) > 0.5)[0]])
+    arr = float(t[np.flatnonzero(np.abs(wd - 235.0) <= 0.5)[0]])
+    assert 300.0 < dep < 380.0
+    assert 2250.0 < arr < 2350.0
+    assert fn.t_depart == pytest.approx(dep, abs=10.0) and fn.t_arrive == pytest.approx(arr, abs=10.0)
+    assert fn.t_arrive - fn.t_depart == pytest.approx(1959.0, abs=5.0)
+    assert 0.030 < fn.peak_rate < 0.036          # deg/s, Emily's 2.0 deg/min = 0.0333
+    assert np.abs(np.diff(wd)).max() <= RICH_SHORT_Q + 1e-9   # quantised 1 s grid: one grid step at most
+    assert fn.peak_rate < MTM30_SLEW
+
+
+def test_richards_270_235_short_equals_emilys_profile_on_her_window():
+    """t_episode = t_emily - 900: the segment is the one richards_270_235_phase
+    trains on, so the only deviation is the renormalised tails (< 0.35 deg) plus
+    the 0.05 deg grid."""
+    fn = get_wd_function("richards_270_235_short")
+    t_emily = np.arange(EMILY_WINDOW[0], EMILY_WINDOW[1] + 1.0, 1.0)
+    wd = np.asarray(fn(t_emily - EMILY_WINDOW[0]), dtype=float)
+    dev = np.abs(wd - _emily(t_emily))
+    assert dev.max() < 0.35 + RICH_SHORT_Q / 2
+    assert dev[t_emily <= 1990.0].max() < 0.15 + RICH_SHORT_Q / 2
+    # the same segment the training cycle uses (phase 0, t_episode = t_emily - 325)
+    train = get_train_wd_factory("richards_270_235_phase", seed=1)
+    _draw_episode_with_phase_zero(train)
+    ref = np.array([float(train(t)) for t in t_emily - EMILY_WINDOW[0] + RICH_T_HOLD])
+    assert np.abs(wd - ref).max() <= RICH_SHORT_Q / 2 + 1e-9
+
+
+def test_make_richards_eval_exposes_its_parameters():
+    fn = make_richards_eval(270.0, 235.0, 322.0, 0.39, quant_deg=0.1)
+    assert fn.quant_deg == 0.1 and fn.T_tr == pytest.approx(RICH_T_TR)
+    assert float(fn(0.0)) == 270.0 and float(fn(RICH_T_TR)) == 235.0
+    k = (np.asarray(fn(np.arange(0.0, 3000.0, 7.0))) - 270.0) / 0.1
+    np.testing.assert_allclose(k, np.round(k), atol=1e-9)
+    with pytest.raises(ValueError):
+        make_richards_eval(270.0, 235.0, 322.0, 0.39, quant_deg=0.0)
 
 
 def test_richards_270_235_phase_starts_inside_the_270_hold_and_phases_vary():

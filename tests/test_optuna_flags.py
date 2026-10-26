@@ -331,6 +331,26 @@ def test_a8_eval_scores_is_the_unclamped_normalised_energy(tmp_path):
                                  "eval/score/mean": -1.25})
 
 
+def test_a8_eval_scores_weighted_mean_follows_the_baselines_weights(tmp_path):
+    """baselines.json["weights"] (spec -> weight, default 1.0) makes eval/score/mean
+    the weighted mean, the same formula as optuna_sweep.objective.score_record."""
+    from helpers.eval_score import eval_scores, load_score_ref
+    ref = {"specs": ["static_270", "static_235"], "weights": {"static_235": 3.0},
+           "per_spec": {"static_270": {"greedy": 10.0, "lut3": 12.0},
+                        "static_235": {"greedy": 20.0, "lut3": 25.0}}}
+    p = tmp_path / "baselines.json"
+    p.write_text(json.dumps(ref))
+    r = load_score_ref(str(p))
+    assert r == {"static_270": (10.0, 12.0, 1.0), "static_235": (20.0, 25.0, 3.0)}
+    ev = {"eval/wd/static_270/mean_power": 13.0,      # 1.5
+          "eval/wd/static_235/mean_power": 22.5}      # 0.5
+    out = eval_scores(ev, r)
+    assert out == pytest.approx({"eval/score/static_270": 1.5, "eval/score/static_235": 0.5,
+                                 "eval/score/mean": (1.5 * 1.0 + 0.5 * 3.0) / 4.0})
+    # a 2-tuple ref (no weights key) still means weight 1
+    assert eval_scores(ev, {k: v[:2] for k, v in r.items()})["eval/score/mean"] == pytest.approx(1.0)
+
+
 def test_a8_eval_scores_skips_missing_specs_and_then_has_no_mean(tmp_path):
     from helpers.eval_score import eval_scores, load_score_ref
     ref = load_score_ref(str(_score_ref_file(tmp_path)))

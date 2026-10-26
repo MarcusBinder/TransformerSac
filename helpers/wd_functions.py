@@ -345,6 +345,10 @@ WD_FUNCTIONS = {
     # hold_ramp_270_235.
     "hold_ramp_270_235_slow": make_hold_ramp(270.0, 235.0, 3257.0, 320.0),
 }
+# "richards_270_235_short" (Optuna v2 eval set, 2026-10-26): Emily's slow turn
+# (cell R, tau 322 / nu 0.39, peak 2 deg/min; the training segment's 0.5-deg
+# edges are 1959 s apart) from t = 0, then 235. 300 steps x dt_env 10 = 3000 s
+# = ~339 s at 270 + the turn + ~700 s at 235. Registered below the Richards helpers it is built from.
 
 
 def parse_eval_ws(eval_ws) -> list:
@@ -725,6 +729,51 @@ def richards_transition_length(tau: float) -> float:
     return max(RICHARDS_T_TR * float(tau) / RICHARDS_TAU, RICHARDS_T_TR_MIN)
 
 
+RICHARDS_EVAL_QUANT_DEG = 0.05     # the campaign's SMOOTH_QUANT_DEG (LESRL dwm_cli, Stage-16 G4 fix)
+_RICHARDS_EVAL_EDGE_DEG = 0.5      # departure / arrival rule (dwm_cli._smooth_edges)
+
+
+def make_richards_eval(wd_a: float, wd_b: float, tau: float, nu: float,
+                       quant_deg: float = RICHARDS_EVAL_QUANT_DEG):
+    """Deterministic EVAL schedule ``f(t) -> wd``: ONE Richards turn ``wd_a -> wd_b``
+    starting at ``t = 0`` (the segment's own value at ``u = 0`` IS ``wd_a``, so there
+    is no separate pre-hold: Emily's shape leaves 270 by 0.5 deg only ~339 s in),
+    ``wd_b`` for ever after ``T_tr = richards_transition_length(tau)``. The segment
+    is the one ``richards_270_235_phase`` trains on (``make_richards_segment`` with
+    the default ``u0``), snapped to the grid ``wd_a + quant_deg * k`` the way the
+    campaign's eval harness does (``dwm_cli.quantise_schedule``, vectorised,
+    round-half-even on the grid index), so ``f(0.0) == wd_a`` bit-exactly.
+    Attributes: ``T_tr``, ``quant_deg``, ``t_depart`` / ``t_arrive`` (first t on a
+    1 s grid with ``|wd - wd_a| > 0.5`` / ``|wd - wd_b| <= 0.5``), ``peak_rate``
+    (deg/s), all three measured on the unquantised segment as the harness does.
+    """
+    wd_a, wd_b, q = float(wd_a), float(wd_b), float(quant_deg)
+    if not q > 0.0:
+        raise ValueError(f"quant_deg must be > 0 (the eval harness grid), got {quant_deg}")
+    T_tr = richards_transition_length(tau)
+    seg = make_richards_segment(wd_a, wd_b, tau, nu, T_tr)
+
+    def _richards_eval(t):
+        u = np.clip(np.asarray(t, dtype=float), 0.0, T_tr)
+        return wd_a + q * np.round((seg(u) - wd_a) / q)
+
+    # edges + peak rate on the UNQUANTISED segment (as dwm_cli: _smooth_edges(raw, ...));
+    # the 0.05 grid would show 0.05 deg/s "steps" on a 1 s grid
+    grid = np.arange(0.0, T_tr + 1.0, 1.0)
+    wd = np.asarray(seg(grid), dtype=float)
+    dep = np.flatnonzero(np.abs(wd - wd_a) > _RICHARDS_EVAL_EDGE_DEG)
+    arr = np.flatnonzero(np.abs(wd - wd_b) <= _RICHARDS_EVAL_EDGE_DEG)
+    _richards_eval.__name__ = f"richards_{wd_a:g}_{wd_b:g}"
+    _richards_eval.__doc__ = (f"Richards turn {wd_a:g} -> {wd_b:g} from t = 0 (tau {float(tau):g} s, nu "
+                              f"{float(nu):g}, T_tr {T_tr:g} s), then {wd_b:g}; snapped to {q:g} deg")
+    _richards_eval.T_tr, _richards_eval.tau, _richards_eval.nu = T_tr, float(tau), float(nu)
+    _richards_eval.quant_deg = q
+    _richards_eval.t_depart = float(grid[dep[0]]) if dep.size else float("nan")
+    _richards_eval.t_arrive = float(grid[arr[0]]) if arr.size else float("nan")
+    _richards_eval.peak_rate = float(np.abs(np.diff(wd)).max())
+    return _richards_eval
+
+
 class _RichardsCycleSchedule:
     """ABSOLUTE cyclic training schedule 270 -> 235 -> 270 with Richards transitions.
 
@@ -791,6 +840,10 @@ class _RichardsCycleSchedule:
         if t == 0.0:
             self._draw()
         return float(self._eval(t))
+
+
+WD_FUNCTIONS["richards_270_235_short"] = make_richards_eval(270.0, 235.0, RICHARDS_TAU, RICHARDS_NU)
+WD_FUNCTIONS["richards_270_235_short"].__name__ = "richards_270_235_short"
 
 
 def make_richards_cycle_train(seed: int, dr=None, **kwargs):
