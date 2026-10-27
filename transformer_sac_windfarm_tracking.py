@@ -1381,131 +1381,151 @@ def main():
             with torch.no_grad():
                 actions = agent.act(envs, obs, **act_state)
         
-        # Step environment
-        _t0 = _sync_timer()
-        next_obs, rewards, terminations, truncations, infos = envs.step(actions)
-        if args.log_timing:
-            timing["env"] += time.perf_counter() - _t0
+        # Step environment. The step is always dispatched async; --async_overlap
+        # only moves the blocking point. Default: collect it right away and
+        # post-process before the gradient burst (the original compute order).
+        # --async_overlap: run the burst while the AsyncVectorEnv workers
+        # simulate the step, then collect it. Iteration time ~ max(env, grad)
+        # instead of the sum; the burst then samples a buffer without this
+        # iteration's transitions (one iteration lag), and timing["env"] counts
+        # only the part of the step the burst did not hide. While the step is in
+        # flight no env IPC (get_attr / call / step) is allowed, i.e. none in the
+        # TRAINING block below (envs.return_queue is a wrapper-local deque: safe)
+        # or AsyncVectorEnv raises AlreadyPendingCallError.
+        envs.step_async(actions)
+
+        def _collect_step():
+            """step_wait, per-step bookkeeping and the replay-buffer insert.
+            Returns True when --buffer_only asks main() to exit."""
+            nonlocal obs, warmup_buffer_saved
+            _t0 = _sync_timer()
+            next_obs, rewards, terminations, truncations, infos = envs.step_wait()
+            if args.log_timing:
+                timing["env"] += time.perf_counter() - _t0
 
 
-        # Get current layout names for each env. Under domain randomization the pool
-        # is huge, so bucket every training layout under "dr_pool" for debug stats.
-        if dr_enabled:
-            current_layouts = ["dr_pool"] * args.num_envs
-        else:
-            current_layouts = get_env_current_layout(envs)
+            # Get current layout names for each env. Under domain randomization the pool
+            # is huge, so bucket every training layout under "dr_pool" for debug stats.
+            if dr_enabled:
+                current_layouts = ["dr_pool"] * args.num_envs
+            else:
+                current_layouts = get_env_current_layout(envs)
 
-        # Log per-step data to debug tracker (always - internal deques handle storage)
-        for i in range(args.num_envs):
-            debug_logger.log_layout_step(
-                layout_name=current_layouts[i],
-                reward=float(rewards[i]),
-                power=float(infos.get("Power agent", [0.0] * args.num_envs)[i]) if "Power agent" in infos else None,
-                actions=actions[i] if isinstance(actions, np.ndarray) else np.array(actions[i]),
-            )
-            debug_logger.log_wind_direction(float(wind_dirs[i]))
+            # Log per-step data to debug tracker (always - internal deques handle storage)
+            for i in range(args.num_envs):
+                debug_logger.log_layout_step(
+                    layout_name=current_layouts[i],
+                    reward=float(rewards[i]),
+                    power=float(infos.get("Power agent", [0.0] * args.num_envs)[i]) if "Power agent" in infos else None,
+                    actions=actions[i] if isinstance(actions, np.ndarray) else np.array(actions[i]),
+                )
+                debug_logger.log_wind_direction(float(wind_dirs[i]))
 
 
-        # Track rewards
-        step_reward_window.extend(np.array(rewards).flatten().tolist())
+            # Track rewards
+            step_reward_window.extend(np.array(rewards).flatten().tolist())
 
-        # DEL-penalty per-step diagnostics (vector env exposes wrapper info
-        # keys as per-env arrays).
-        if args.del_penalty_scale > 0 and "del_penalty" in infos:
-            del_penalty_window.extend(
-                np.asarray(infos["del_penalty"], dtype=float).flatten().tolist())
-            reward_unpen_window.extend(
-                np.asarray(infos["reward_unpenalized"], dtype=float).flatten().tolist())
-            _ratios = np.asarray(infos["del_ratio"], dtype=float).flatten()
-            del_ratio_window.extend(_ratios[np.isfinite(_ratios)].tolist())
+            # DEL-penalty per-step diagnostics (vector env exposes wrapper info
+            # keys as per-env arrays).
+            if args.del_penalty_scale > 0 and "del_penalty" in infos:
+                del_penalty_window.extend(
+                    np.asarray(infos["del_penalty"], dtype=float).flatten().tolist())
+                reward_unpen_window.extend(
+                    np.asarray(infos["reward_unpenalized"], dtype=float).flatten().tolist())
+                _ratios = np.asarray(infos["del_ratio"], dtype=float).flatten()
+                del_ratio_window.extend(_ratios[np.isfinite(_ratios)].tolist())
         
-        # Log episode stats
-        if "final_info" in infos:
-            ep_return = np.mean(envs.return_queue)
-            ep_length = np.mean(envs.length_queue)
-            ep_power = np.mean(envs.mean_power_queue)
+            # Log episode stats
+            if "final_info" in infos:
+                ep_return = np.mean(envs.return_queue)
+                ep_length = np.mean(envs.length_queue)
+                ep_power = np.mean(envs.mean_power_queue)
             
-            print(f"Step {global_step}: Episode return={ep_return:.2f}, power={ep_power:.2f}")
-            writer.add_scalar("charts/episodic_return", ep_return, global_step)
-            writer.add_scalar("charts/episodic_length", ep_length, global_step)
-            # NOTE (tracking): for power tracking, higher episodic_power is NOT
-            # better -- overshooting a sub-greedy setpoint is a failure. The real
-            # objective is the tracking error below; episodic_power is kept only
-            # as a raw diagnostic.
-            writer.add_scalar("charts/episodic_power", ep_power, global_step)
+                print(f"Step {global_step}: Episode return={ep_return:.2f}, power={ep_power:.2f}")
+                writer.add_scalar("charts/episodic_return", ep_return, global_step)
+                writer.add_scalar("charts/episodic_length", ep_length, global_step)
+                # NOTE (tracking): for power tracking, higher episodic_power is NOT
+                # better -- overshooting a sub-greedy setpoint is a failure. The real
+                # objective is the tracking error below; episodic_power is kept only
+                # as a raw diagnostic.
+                writer.add_scalar("charts/episodic_power", ep_power, global_step)
 
-            # Tracking-specific metrics. RecordEpisodeVals already accumulates the
-            # per-episode mean |P_farm - P_ref| and mean reference (both watts);
-            # surface them (and a greedy-normalized error, which mirrors the
-            # reward's -|err|/rated scaling) as the primary signs-of-life signals.
-            if getattr(envs, "track_mae_queue", None) and len(envs.track_mae_queue) > 0:
-                track_mae = float(np.mean(envs.track_mae_queue))
-                writer.add_scalar("charts/episodic_track_mae", track_mae, global_step)
-                writer.add_scalar("charts/episodic_track_mae_frac_greedy",
-                                  track_mae / GREEDY, global_step)
-                print(f"           tracking MAE={track_mae/1e6:.3f} MW "
-                      f"({100*track_mae/GREEDY:.1f}% of greedy)")
-            if getattr(envs, "mean_power_ref_queue", None) and len(envs.mean_power_ref_queue) > 0:
-                writer.add_scalar("charts/episodic_power_ref",
-                                  float(np.mean(envs.mean_power_ref_queue)), global_step)
+                # Tracking-specific metrics. RecordEpisodeVals already accumulates the
+                # per-episode mean |P_farm - P_ref| and mean reference (both watts);
+                # surface them (and a greedy-normalized error, which mirrors the
+                # reward's -|err|/rated scaling) as the primary signs-of-life signals.
+                if getattr(envs, "track_mae_queue", None) and len(envs.track_mae_queue) > 0:
+                    track_mae = float(np.mean(envs.track_mae_queue))
+                    writer.add_scalar("charts/episodic_track_mae", track_mae, global_step)
+                    writer.add_scalar("charts/episodic_track_mae_frac_greedy",
+                                      track_mae / GREEDY, global_step)
+                    print(f"           tracking MAE={track_mae/1e6:.3f} MW "
+                          f"({100*track_mae/GREEDY:.1f}% of greedy)")
+                if getattr(envs, "mean_power_ref_queue", None) and len(envs.mean_power_ref_queue) > 0:
+                    writer.add_scalar("charts/episodic_power_ref",
+                                      float(np.mean(envs.mean_power_ref_queue)), global_step)
 
-            # DEL-penalty signs of life (rolling-window means; window length
-            # ~ recent episode(s)). del_penalty stays 0 through each warm-up.
-            if args.del_penalty_scale > 0 and len(del_penalty_window) > 0:
-                writer.add_scalar("charts/episodic_del_penalty",
-                                  float(np.mean(del_penalty_window)), global_step)
-                writer.add_scalar("charts/episodic_reward_unpenalized",
-                                  float(np.mean(reward_unpen_window)), global_step)
-                if len(del_ratio_window) > 0:
-                    writer.add_scalar("charts/episodic_del_ratio",
-                                      float(np.mean(del_ratio_window)), global_step)
+                # DEL-penalty signs of life (rolling-window means; window length
+                # ~ recent episode(s)). del_penalty stays 0 through each warm-up.
+                if args.del_penalty_scale > 0 and len(del_penalty_window) > 0:
+                    writer.add_scalar("charts/episodic_del_penalty",
+                                      float(np.mean(del_penalty_window)), global_step)
+                    writer.add_scalar("charts/episodic_reward_unpenalized",
+                                      float(np.mean(reward_unpen_window)), global_step)
+                    if len(del_ratio_window) > 0:
+                        writer.add_scalar("charts/episodic_del_ratio",
+                                          float(np.mean(del_ratio_window)), global_step)
 
 
-        # Handle final observations
-        real_next_obs = next_obs.copy()
-        for idx, trunc in enumerate(truncations):
-            if trunc:
-                real_next_obs[idx] = infos["final_obs"][idx]
+            # Handle final observations
+            real_next_obs = next_obs.copy()
+            for idx, trunc in enumerate(truncations):
+                if trunc:
+                    real_next_obs[idx] = infos["final_obs"][idx]
         
-        # Store in replay buffer
-        for i in range(args.num_envs):
-            done = terminations[i] or truncations[i]
-            action_reshaped = actions[i].reshape(-1, action_dim_per_turbine)
+            # Store in replay buffer
+            for i in range(args.num_envs):
+                done = terminations[i] or truncations[i]
+                action_reshaped = actions[i].reshape(-1, action_dim_per_turbine)
         
-            layout_idx_i = current_layout_indices[i] if current_layout_indices is not None else None
-            perm_i = current_permutations[i] if current_permutations is not None else None
+                layout_idx_i = current_layout_indices[i] if current_layout_indices is not None else None
+                perm_i = current_permutations[i] if current_permutations is not None else None
 
-            rb.add(
-                obs[i],
-                real_next_obs[i],
-                action_reshaped,
-                rewards[i],
-                done,
-                raw_positions[i],
-                current_masks[i],
-                wind_dirs[i],
-                layout_index=layout_idx_i,
-                permutation=perm_i,
-            )
+                rb.add(
+                    obs[i],
+                    real_next_obs[i],
+                    action_reshaped,
+                    rewards[i],
+                    done,
+                    raw_positions[i],
+                    current_masks[i],
+                    wind_dirs[i],
+                    layout_index=layout_idx_i,
+                    permutation=perm_i,
+                )
 
-        # One-shot warmup buffer save (buffer pre-generation for ablation runs)
-        if (args.save_buffer_at_learning_starts
-                and not warmup_buffer_saved
-                and global_step >= args.learning_starts):
-            rb.save(
-                f"runs/{run_name}/replay_buffer_warmup_{args.learning_starts}.npz",
-                extra_meta=buffer_meta(global_step),
-            )
-            warmup_buffer_saved = True
-            if args.buffer_only:
-                print("\n--buffer_only set: warmup buffer saved, exiting before training.")
-                if evaluator is not None:
-                    evaluator.close()
-                envs.close()
-                writer.close()
-                return
+            # One-shot warmup buffer save (buffer pre-generation for ablation runs)
+            if (args.save_buffer_at_learning_starts
+                    and not warmup_buffer_saved
+                    and global_step >= args.learning_starts):
+                rb.save(
+                    f"runs/{run_name}/replay_buffer_warmup_{args.learning_starts}.npz",
+                    extra_meta=buffer_meta(global_step),
+                )
+                warmup_buffer_saved = True
+                if args.buffer_only:
+                    print("\n--buffer_only set: warmup buffer saved, exiting before training.")
+                    if evaluator is not None:
+                        evaluator.close()
+                    envs.close()
+                    writer.close()
+                    return True
 
-        obs = next_obs
+            obs = next_obs
+            return False
+
+        if not args.async_overlap and _collect_step():
+            return
         
         # =====================================================================
         # TRAINING
@@ -1944,6 +1964,10 @@ def main():
                     debug_logger.print_diagnostics(global_step)
 
 
+
+        # --async_overlap: collect the step that ran during the gradient burst.
+        if args.async_overlap and _collect_step():
+            return
 
         # =====================================================================
         # CHECKPOINTING
