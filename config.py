@@ -15,6 +15,8 @@ class Args:
     # === Experiment Settings ===
     config: str = "default"  # Environment config preset
     power_schedule: str = "default"  # "default" (80/60/70/100) or "boost" (80/115/70/100, needs yaw)
+    power_ref_factory: Optional[str] = None  # "module:attr" -> attr(greedy=..., **power_ref_kwargs) builds the reference; overrides power_schedule
+    power_ref_kwargs: str = "{}"  # JSON object of keyword arguments for power_ref_factory
     exp_name: str = "transformer_sac_windfarm"
     seed: int = 1
     torch_deterministic: bool = True

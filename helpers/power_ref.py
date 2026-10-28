@@ -12,6 +12,10 @@ args via ``functools.partial`` (a float + a list of tuples) -- both picklable.
 A closure or lambda over the training scope would not be.
 """
 
+import importlib
+import json
+from functools import partial
+
 import numpy as np
 
 # (n_steps, fraction_of_greedy) per segment. 4 segments x 200 steps = 800-step
@@ -38,6 +42,29 @@ def stepwise_power_ref(t, env, *, greedy, schedule=DEFAULT_SCHEDULE):
     fracs = [f for _, f in schedule]
     idx = min(int(np.searchsorted(bounds, step, side="right")), len(fracs) - 1)
     return fracs[idx] * greedy
+
+
+def build_power_ref(greedy, *, power_schedule="default", factory=None, factory_kwargs="{}"):
+    """Power reference callable for WindFarmEnv, plus a one-line description.
+
+    Without ``factory``: the fraction-of-greedy step schedule picked by
+    ``power_schedule`` ("default" or "boost"), as before. With
+    ``factory="module:attr"``: ``attr(greedy=greedy, **kwargs)`` from an
+    importable module, with ``factory_kwargs`` a JSON object (or a dict). The
+    factory must return a picklable ``callable(t_seconds, env) -> W`` (it is
+    sent to AsyncVectorEnv workers), e.g. a setpoint family from another repo.
+    """
+    if factory:
+        module, _, attr = factory.partition(":")
+        if not module or not attr:
+            raise ValueError(f"power_ref_factory must be 'module:attr', got {factory!r}")
+        kwargs = json.loads(factory_kwargs) if isinstance(factory_kwargs, str) else dict(factory_kwargs or {})
+        fn = getattr(importlib.import_module(module), attr)
+        return fn(greedy=greedy, **kwargs), f"{factory}(greedy, **{kwargs})"
+    schedule = BOOST_SCHEDULE if power_schedule == "boost" else DEFAULT_SCHEDULE
+    desc = (f"{power_schedule} (fractions {[f for _, f in schedule]}; MW "
+            f"{[round(f * greedy / 1e6, 2) for _, f in schedule]})")
+    return partial(stepwise_power_ref, greedy=greedy, schedule=schedule), desc
 
 
 def measure_greedy(make_probe_env, *, n_steps=100, burn_in=20) -> float:

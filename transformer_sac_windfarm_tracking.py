@@ -16,6 +16,7 @@ Differences from transformer_sac_windfarm.py (all in ENV SETUP):
     history_N/history_length override loop is dropped.
   - power reference: a stepwise 80/60/70/100 %-of-greedy schedule supplied via
     WindFarmEnv(power_ref_function=...); greedy is measured once by a probe env.
+    --power_ref_factory module:attr replaces it with an external reference.
 
 Recommended smoke-run args:
   --config power_tracking --backend pywake --action_type wind --num_envs 1
@@ -103,9 +104,8 @@ from helpers.layouts import get_layout_positions
 from helpers.env_configs import make_env_config
 
 # Power-tracking / derate-only helpers (see module docstring).
-from functools import partial
 from helpers.derating_turbine import make_derating_turbine
-from helpers.power_ref import stepwise_power_ref, measure_greedy, DEFAULT_SCHEDULE, BOOST_SCHEDULE
+from helpers.power_ref import build_power_ref, measure_greedy
 
 # Receptivity profile computation
 from helpers.receptivity_profiles import compute_layout_profiles
@@ -414,22 +414,20 @@ def main():
             reset_init=False, **probe_env_kwargs,
         )
 
-    # Select the fraction-of-greedy schedule. "boost" puts a 115% segment in the
-    # middle -- reachable ONLY via yaw wake steering, so it requires a yaw+derate
-    # config (e.g. power_tracking_yaw); "default" stays <= 100% for derate-only.
-    schedule = BOOST_SCHEDULE if args.power_schedule == "boost" else DEFAULT_SCHEDULE
-
+    # The reference: the fraction-of-greedy schedule ("boost" puts a 115% segment
+    # in the middle -- reachable ONLY via yaw wake steering, so it requires a
+    # yaw+derate config; "default" stays <= 100% for derate-only), or an external
+    # factory (--power_ref_factory module:attr, e.g. powertracking's regulation
+    # signals) called with greedy and --power_ref_kwargs. Both are picklable for
+    # AsyncVectorEnv (partial over a module-level fn / the factory's object).
     print("Measuring greedy farm power (probe env)...")
     GREEDY = measure_greedy(_make_probe_env)
-    print(f"  Power schedule: {args.power_schedule} "
-          f"(fractions {[f for _, f in schedule]})")
-    print(f"  GREEDY = {GREEDY / 1e6:.3f} MW; reference cycle (MW): "
-          f"{[round(f * GREEDY / 1e6, 2) for _, f in schedule]}")
-
-    # partial over a module-level fn keeps this picklable for AsyncVectorEnv.
-    base_env_kwargs["power_ref_function"] = partial(
-        stepwise_power_ref, greedy=GREEDY, schedule=schedule
+    power_ref, power_ref_desc = build_power_ref(
+        GREEDY, power_schedule=args.power_schedule,
+        factory=args.power_ref_factory, factory_kwargs=args.power_ref_kwargs,
     )
+    print(f"  GREEDY = {GREEDY / 1e6:.3f} MW; power reference: {power_ref_desc}")
+    base_env_kwargs["power_ref_function"] = power_ref
 
     # DEL-constrained reward: DELRewardWrapper compares agent DELs against a
     # greedy baseline farm, which only exists when the env is built with

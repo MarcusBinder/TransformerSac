@@ -10,7 +10,8 @@ used to train the power-tracking Transformer-SAC agent
 right-column panels (farm power + reference / per-turbine derating / per-turbine
 power, plus turbine yaws for yaw+derate agents) that ``agent_eval.py`` draws
 when it auto-detects a derate/tracking env. The control mode is read from the
-checkpoint's saved args (``config``/``action_type``/``power_schedule``), so
+checkpoint's saved args (``config``/``action_type``/``power_schedule``, or
+``power_ref_factory``/``power_ref_kwargs``), so
 derate-only and yaw+derate checkpoints both rebuild their exact training env.
 
 Two things this script has to bridge:
@@ -40,7 +41,6 @@ import os
 import shutil
 import subprocess
 import sys
-from functools import partial
 
 import numpy as np
 import torch
@@ -55,12 +55,7 @@ from helpers.derating_turbine import (
     make_derating_turbine,
     make_operating_point_lookup_for,
 )
-from helpers.power_ref import (
-    stepwise_power_ref,
-    measure_greedy,
-    DEFAULT_SCHEDULE,
-    BOOST_SCHEDULE,
-)
+from helpers.power_ref import build_power_ref, measure_greedy
 from WindGym import WindFarmEnv, AgentEvalFast
 from WindGym.farm_eval import FarmEval
 from WindGym.wrappers import PerTurbineObservationWrapper
@@ -225,18 +220,16 @@ def build_track3_env(args: dict, turbbox_path: str, obs_width: int | None = None
             **{**base_env_kwargs, "config": probe_config},
         )
 
-    schedule = (
-        BOOST_SCHEDULE if args.get("power_schedule") == "boost" else DEFAULT_SCHEDULE
-    )
-
     print("Measuring greedy farm power (probe env)...")
     greedy = measure_greedy(_make_probe_env)
-    print(f"  GREEDY = {greedy / 1e6:.3f} MW; reference cycle (MW): "
-          f"{[round(f * greedy / 1e6, 2) for _, f in schedule]}")
-
-    base_env_kwargs["power_ref_function"] = partial(
-        stepwise_power_ref, greedy=greedy, schedule=schedule
+    # the checkpoint's own reference: its schedule, or its external factory
+    power_ref, power_ref_desc = build_power_ref(
+        greedy, power_schedule=args.get("power_schedule", "default"),
+        factory=args.get("power_ref_factory"),
+        factory_kwargs=args.get("power_ref_kwargs", "{}"),
     )
+    print(f"  GREEDY = {greedy / 1e6:.3f} MW; power reference: {power_ref_desc}")
+    base_env_kwargs["power_ref_function"] = power_ref
 
     if baseline_comp:
         # "Global" holds the baseline farm at yaw=0/derate=0 (true greedy),
