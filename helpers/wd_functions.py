@@ -1172,6 +1172,14 @@ TRAIN_WD_FACTORIES = {
     "mix_static_richards_ends": partial(make_mix_static_richards, p_static=0.4,
                                         exc_lo=25.0, exc_hi=37.0, wd_lo=233.0, wd_hi=270.0,
                                         hold_lo=1000.0, hold_hi=2000.0),
+    # ---- Optuna v3 (2026-10-28) ----
+    # mix_static_richards_long: the Stage-15 mixture (p 0.5 static at base_wd,
+    # 15-35 deg Richards excursions reflected inside [235, 270]) with 1000-2500 s
+    # holds, so a 300k-step run dwells long enough at both ends of the slow turn
+    # for the delayed payoff of a committed 20-25 deg offset to be credited
+    # (static_270 was the unlearned skill in v2).
+    "mix_static_richards_long": partial(make_mix_static_richards, p_static=0.5,
+                                        hold_lo=1000.0, hold_hi=2500.0),
     # mix_all (`mixall_dev`, Marcus): EVERY episode a new wd function from a broad
     # family (static 0.20 / log-uniform-rate linear walk 0.25 / Richards walk 0.25 /
     # stair walk 0.15 / fast cycle-walk 0.15), all from base_wd, reflected inside

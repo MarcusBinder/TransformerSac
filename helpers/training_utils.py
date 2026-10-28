@@ -273,6 +273,17 @@ def tqc_td_target(kept: torch.Tensor, rewards: torch.Tensor, dones: torch.Tensor
 LR_SCHEDULES = ("none", "cosine", "linear")
 
 
+def actor_update_allowed(global_step: int, args) -> bool:
+    """False inside the fine-tune actor-freeze window
+    ``[learning_starts, learning_starts + finetune_freeze_actor_steps)``:
+    the critics keep training on the resumed policy's data while the actor
+    (and alpha) stay put. 0 (the default) = always allowed."""
+    freeze = int(getattr(args, "finetune_freeze_actor_steps", 0) or 0)
+    if freeze <= 0:
+        return True
+    return int(global_step) >= int(args.learning_starts) + freeze
+
+
 def lr_progress(global_step: int, learning_starts: int, total_timesteps: int) -> float:
     """Fraction of the update budget spent, clamped to [0, 1]: 0 at learning_starts,
     1 at total_timesteps (the trainer's two extra iterations past it clamp)."""

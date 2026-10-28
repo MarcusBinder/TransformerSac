@@ -105,6 +105,24 @@ def build_eval_config(args: dict, wd0: float, ws: float) -> dict:
     return make_eval_wind_config(config, float(wd0), float(ws))
 
 
+def wd_est_env_kwargs(cli, backend: str) -> dict:
+    """Estimator kwargs for --wd_source est (empty for the true wd).
+
+    ``wd_est_deadband`` is read with getattr: callers that build a bare
+    namespace (tests/test_obs_agg.py) predate the v3 flag and get 0 (off),
+    which is bit-identical to the pre-v3 estimator."""
+    if getattr(cli, "wd_source", "true") != "est":
+        return {}
+    if backend == "pywake":
+        raise SystemExit(
+            "--wd_source est needs the dynamiks backend: pywake's "
+            "adapter hard-codes v=w=0, so a measured local wd does not "
+            "exist there.")
+    return {"wd_est_tau": cli.wd_est_tau,
+            "wd_est_consensus": cli.wd_est_consensus,
+            "wd_est_deadband": float(getattr(cli, "wd_est_deadband", 0.0) or 0.0)}
+
+
 def create_eval_env(layout: str, args: dict, cli, wd_fn, seed: int,
                     n_envs: int, vector_cls=None):
     """One vector env of MultiLayoutEnv slots pinned to one wd/ws cell.
@@ -179,14 +197,7 @@ def create_eval_env(layout: str, args: dict, cli, wd_fn, seed: int,
     # default of 2 m.
     if getattr(cli, "max_turb_move", None) is not None:
         base_env_kwargs["max_turb_move"] = float(cli.max_turb_move)
-    if cli.wd_source == "est":
-        if backend == "pywake":
-            raise SystemExit(
-                "--wd_source est needs the dynamiks backend: pywake's "
-                "adapter hard-codes v=w=0, so a measured local wd does not "
-                "exist there.")
-        base_env_kwargs["wd_est_tau"] = cli.wd_est_tau
-        base_env_kwargs["wd_est_consensus"] = cli.wd_est_consensus
+    base_env_kwargs.update(wd_est_env_kwargs(cli, backend))
 
     # No yaw_init override: the trainer's env factories let the config preset
     # decide (hard_2 inherits "Random"), and parity with the in-training eval
@@ -448,7 +459,7 @@ def build_dataset(episodes, cli, meta):
     return ds
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Eval ONE checkpoint under ONE wd schedule/source cell, "
                     "write ONE NetCDF.")
@@ -470,6 +481,10 @@ def main():
     parser.add_argument("--wd_est_consensus", default="median",
                         help="Estimator consensus (median/mean/front); "
                              "forwarded when --wd_source est.")
+    parser.add_argument("--wd_est_deadband", type=float, default=0.0,
+                        help="Hold the estimate unless it moves > d deg "
+                             "(0 = off); forwarded when --wd_source est. "
+                             "Must match the checkpoint's training value.")
     parser.add_argument("--eval-layout", default="square_5x5")
     parser.add_argument("--backend", default=None,
                         choices=(None, "pywake", "dynamiks"),
@@ -495,7 +510,11 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--turbbox-path", default="./boxes/")
     parser.add_argument("--stochastic", action="store_true")
-    cli = parser.parse_args()
+    return parser
+
+
+def main():
+    cli = build_parser().parse_args()
 
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
@@ -554,6 +573,7 @@ def main():
         "wd_corrupt": cli.wd_corrupt,
         "wd_est_tau": cli.wd_est_tau if cli.wd_est_tau is not None else -1.0,
         "wd_est_consensus": cli.wd_est_consensus,
+        "wd_est_deadband": float(getattr(cli, "wd_est_deadband", 0.0) or 0.0),
         "eval_layout": cli.eval_layout,
         "backend": cli.backend or args["backend"],
         "TI_type": cli.TI_type or args["TI_type"],

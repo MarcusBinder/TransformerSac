@@ -52,8 +52,10 @@ ABSOLUTE_NAMES = sorted(ABSOLUTE_TRAIN_NAMES)
 # seed tests and get their own static-fraction / rate test below.
 # Stage 15: mix_static_richards (p_static 0.5) holds base_wd on half its episodes too.
 # Stage 16: mix_static_richards_ends (p_static 0.4) and mix_all (static branch 0.20).
+# Optuna v3: mix_static_richards_long (p_static 0.5, 1000-2500 s holds).
 STATIC_EPISODE_TRAIN_NAMES = frozenset({"mix_static_ramp", "mix_static_richards",
-                                        "mix_static_richards_ends", "mix_all"})
+                                        "mix_static_richards_ends", "mix_all",
+                                        "mix_static_richards_long"})
 MOVING_TRAIN_NAMES = [n for n in TRAIN_NAMES if n not in STATIC_EPISODE_TRAIN_NAMES]
 
 
@@ -1445,3 +1447,35 @@ def test_quantised_absolute_schedule_returns_exactly_270_at_t0_and_snaps_the_tur
     k = tr * (1.0 / Q17)
     assert np.max(np.abs(k - np.round(k))) < 1e-9
     assert tr.min() < 236.0
+
+
+# ---------------------------------------------------------------------------
+# Optuna v3 (2026-10-28): mix_static_richards_long = the Stage-15 mixture with
+# 1000-2500 s holds, so a 300k-step run sees long static dwells at both ends
+# of the slow turn (the static_270 skill v2 never learned).
+# ---------------------------------------------------------------------------
+
+def test_mix_static_richards_long_holds_1000_to_2500_s():
+    assert "mix_static_richards_long" in TRAIN_WD_FACTORIES
+    assert "mix_static_richards_long" not in ABSOLUTE_TRAIN_NAMES
+    fn = get_train_wd_factory("mix_static_richards_long", seed=23)
+    assert _takes_base_wd(fn)
+    assert fn._walk._hold_lo == 1000.0 and fn._walk._hold_hi == 2500.0
+    n_static, n_walk = 0, 0
+    for _ in range(300):
+        tr = _trajectory(fn, base_wd=270.0, grid=EPISODE_10000)
+        assert tr[0] == 270.0
+        if np.allclose(tr, 270.0):
+            n_static += 1
+            continue
+        n_walk += 1
+        assert 235.0 - 1e-9 <= tr.min() and tr.max() <= 270.0 + 1e-9
+        # every flat stretch between moves lasts >= 1000 s (the first hold is
+        # the only one that may start at t = 0 and be cut by the episode end)
+        moving = np.abs(np.diff(tr)) > 1e-9
+        edges = np.flatnonzero(np.diff(moving.astype(int)))
+        for a, b in zip(edges[:-1], edges[1:]):
+            if not moving[a + 1]:          # a hold between two moves
+                assert (b - a) * DT_SIM >= 1000.0 - DT_SIM
+    assert 0.4 <= n_static / 300 <= 0.6   # p_static 0.5
+    assert n_walk > 0

@@ -475,3 +475,60 @@ def test_obs_norm_training_run_completes(tmp_path, overlap):
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
     events = [json.loads(l)["event"] for l in metrics.read_text().splitlines()]
     assert events[0] == "started" and events[-1] == "finished" and "eval" in events
+
+
+# ---------------------------------------------------------------------------
+# V3 (Optuna v3, 2026-10-28): --wd_est_deadband (the est-wd hold) and the
+# fine-tune arm's actor freeze window.
+# ---------------------------------------------------------------------------
+
+def test_wd_est_deadband_reaches_the_env_kwargs_and_the_checkpoint_args():
+    import transformer_sac_windfarm as tsw
+    assert Args().wd_est_deadband == 0.0
+    a = parse("--backend", "dynamiks", "--wd_source", "est", "--wd_est_tau", "60",
+              "--wd_est_deadband", "1.0")
+    kw = tsw.wd_source_env_kwargs(a)
+    assert kw == {"wd_est_tau": 60.0, "wd_est_consensus": "median", "wd_est_deadband": 1.0}
+    assert vars(a)["wd_est_deadband"] == 1.0   # save_checkpoint stores vars(args)
+    # wd_source true: nothing forwarded (the old behaviour)
+    assert tsw.wd_source_env_kwargs(parse("--backend", "dynamiks")) == {}
+
+
+def test_wd_est_deadband_without_est_source_is_refused():
+    import transformer_sac_windfarm as tsw
+    a = parse("--backend", "dynamiks", "--wd_est_deadband", "1.0")
+    with pytest.raises(ValueError, match="wd_est_deadband"):
+        tsw.wd_source_env_kwargs(a)
+    with pytest.raises(ValueError, match="wd_est_tau"):
+        tsw.wd_source_env_kwargs(parse("--backend", "dynamiks", "--wd_source", "est"))
+
+
+def test_eval_wd_cli_default_deadband_is_zero_and_a_namespace_without_it_still_builds():
+    import types
+    import eval_wd
+    base = ["--checkpoint", "x.pt", "--wd_function", "static_270", "--out", "x.nc"]
+    cli = eval_wd.build_parser().parse_args(base)
+    assert cli.wd_est_deadband == 0.0
+    cli2 = eval_wd.build_parser().parse_args(
+        base + ["--wd_source", "est", "--wd_est_tau", "60", "--wd_est_deadband", "2"])
+    assert eval_wd.wd_est_env_kwargs(cli2, "dynamiks") == {
+        "wd_est_tau": 60.0, "wd_est_consensus": "median", "wd_est_deadband": 2.0}
+    # test_obs_agg builds a SimpleNamespace without the new attribute
+    old = types.SimpleNamespace(wd_source="est", wd_est_tau=30.0, wd_est_consensus="median")
+    assert eval_wd.wd_est_env_kwargs(old, "dynamiks")["wd_est_deadband"] == 0.0
+    assert eval_wd.wd_est_env_kwargs(types.SimpleNamespace(wd_source="true"), "pywake") == {}
+    with pytest.raises(SystemExit):
+        eval_wd.wd_est_env_kwargs(old, "pywake")
+
+
+def test_actor_updates_are_skipped_for_the_freeze_window_after_learning_starts():
+    from types import SimpleNamespace
+    from helpers.training_utils import actor_update_allowed
+    assert Args().finetune_freeze_actor_steps == 0
+    off = SimpleNamespace(learning_starts=100, finetune_freeze_actor_steps=0)
+    assert all(actor_update_allowed(s, off) for s in (0, 100, 150, 10_000))
+    on = SimpleNamespace(learning_starts=100, finetune_freeze_actor_steps=50)
+    assert not actor_update_allowed(100, on)
+    assert not actor_update_allowed(149, on)
+    assert actor_update_allowed(150, on)
+    assert actor_update_allowed(10_000, on)

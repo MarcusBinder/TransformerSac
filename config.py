@@ -386,6 +386,10 @@ class Args:
     wd_est_tau: Optional[float] = None
     # Cross-turbine consensus: median (robust default) / mean / front.
     wd_est_consensus: str = "median"
+    # Hold the consensus estimate unless it moves > d deg (circular); 0 = off.
+    # Kills the sub-degree est-wd jitter that flips the yaw sign at the 270
+    # symmetry point (the est-fed LUT needed the same hold). Optuna v3.
+    wd_est_deadband: float = 0.0
 
     # === Layout Settings ===
     # Comma-separated list of layouts. Single = single-layout, Multiple = multi-layout
@@ -637,6 +641,9 @@ class Args:
     finetune_reset_actor_optimizer: int = 0     # If True, reset optimizers for fresh fine-tuning. If False, resume optimizer states too.
     finetune_reset_critic_optimizer: int = 0    # If True, reset optimizers for fresh fine-tuning. If False, resume optimizer states too.
     finetune_reset_alpha: int = 0               # If True, reset entropy coefficient. If False, keep from checkpoint.
+    finetune_freeze_actor_steps: int = 0        # Env steps after learning_starts during which the actor (+ alpha)
+                                                # update is skipped: the critics re-fit on the parent policy's data
+                                                # before the actor moves (Optuna v3 fine-tune arm). 0 = off.
     resume_step_counter: int = 0  # If 1, restore global step from checkpoint["step"] on resume
                                   # (total_timesteps then counts as ABSOLUTE, not additional).
                                   # Use for continuing an interrupted run; leave 0 for fine-tuning.

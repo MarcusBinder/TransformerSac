@@ -37,7 +37,7 @@ from config import Args
 from replay_buffer import TransformerReplayBuffer
 from helpers.training_utils import (
     buffer_done, clear_gpu_memory, compute_adaptive_target_entropy, env_seed_base, initial_log_alpha,
-    tqc_n_keep, tqc_td_target, lr_multiplier, lr_progress, alpha_learning_rate,
+    tqc_n_keep, tqc_td_target, lr_multiplier, lr_progress, alpha_learning_rate, actor_update_allowed,
     get_env_current_layout, log_optimizer_effective_lr,
     compute_optimizer_diagnostics, log_finetune_diagnostics,
 )
@@ -167,6 +167,37 @@ def dwm_speedup_kwargs(args) -> dict:
             raise ValueError(f"--dwm_lateral_cutoff must be > 0, got {cutoff}")
         out["lateral_cutoff"] = float(cutoff)
     return out
+
+
+def wd_source_env_kwargs(args) -> dict:
+    """WindFarmEnv kwargs for the WD-estimation ladder (--wd_source est).
+
+    Empty for wd_source="true" (the privileged env.wd, historical behaviour).
+    For "est": the estimator's tau / consensus / deadband, validated here so
+    the three env factories (train / in-training eval / train-wd) get one
+    consistent set. A deadband with wd_source="true" is refused: there is no
+    estimator to hold.
+    """
+    source = getattr(args, "wd_source", "true")
+    if source not in ("true", "est"):
+        raise ValueError(f"--wd_source must be 'true' or 'est', got {source!r}")
+    deadband = float(getattr(args, "wd_est_deadband", 0.0) or 0.0)
+    if source == "true":
+        if deadband > 0:
+            raise ValueError("--wd_est_deadband needs --wd_source est (no estimator to hold)")
+        return {}
+    if getattr(args, "backend", None) == "pywake":
+        raise ValueError(
+            "--wd_source est requires --backend dynamiks: pywake's "
+            "adapter hard-codes v=w=0, so a measured local wind "
+            "direction does not exist there (atan2(v,u) == 0).")
+    if args.wd_est_tau is None:
+        raise ValueError("--wd_source est requires --wd_est_tau")
+    if deadband < 0:
+        raise ValueError(f"--wd_est_deadband must be >= 0, got {deadband}")
+    return {"wd_est_tau": float(args.wd_est_tau),
+            "wd_est_consensus": args.wd_est_consensus,
+            "wd_est_deadband": deadband}
 
 
 from helpers.dr_posterior import load_posterior, make_dr_sampler
@@ -793,21 +824,12 @@ def main():
     # estimate. The env computes it from measurements it already takes
     # (core/wd_estimator.py); rollout fetch + agent fetch + replay buffer all
     # read through wd_source_attr, so gradients never see the true wd.
-    assert args.wd_source in ("true", "est"), (
-        f"--wd_source must be 'true' or 'est', got {args.wd_source!r}")
+    base_env_kwargs.update(wd_source_env_kwargs(args))
     if args.wd_source == "est":
-        if args.backend == "pywake":
-            raise ValueError(
-                "--wd_source est requires --backend dynamiks: pywake's "
-                "adapter hard-codes v=w=0, so a measured local wind "
-                "direction does not exist there (atan2(v,u) == 0).")
-        if args.wd_est_tau is None:
-            raise ValueError("--wd_source est requires --wd_est_tau")
-        base_env_kwargs["wd_est_tau"] = float(args.wd_est_tau)
-        base_env_kwargs["wd_est_consensus"] = args.wd_est_consensus
         print(f"wd source: ESTIMATED (tau={args.wd_est_tau}s, "
-              f"consensus={args.wd_est_consensus}) — the policy never "
-              f"sees the privileged env.wd")
+              f"consensus={args.wd_est_consensus}, "
+              f"deadband={base_env_kwargs['wd_est_deadband']} deg) — the "
+              f"policy never sees the privileged env.wd")
     wd_source_attr = "wd" if args.wd_source == "true" else "wd_est"
 
     # DEL-constrained reward: DELRewardWrapper compares agent DELs against a
@@ -2820,7 +2842,8 @@ def main():
                 # -----------------------------------------------------------------
                 # Update Actor (delayed based on total gradient steps)
                 # -----------------------------------------------------------------
-                if total_gradient_steps % args.policy_frequency == 0:
+                if (total_gradient_steps % args.policy_frequency == 0
+                        and actor_update_allowed(global_step, args)):
                     _t_actor = _sync_timer()
                     # Get actions from current policy + Q-values (under AMP autocast)
                     with amp_ctx:
