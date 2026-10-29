@@ -29,6 +29,7 @@ import sys
 import numpy as np
 import torch
 
+from helpers.turbine_model import turbine_model_spec
 from eval_tracking_figs import (
     TRACK3_WD,
     build_agent,
@@ -78,6 +79,7 @@ class TrackingPolicy:
             "power_ref_factory": args.get("power_ref_factory"),
             "power_ref_kwargs": args.get("power_ref_kwargs"),
             "deterministic": deterministic,
+            **turbine_model_spec(args),
         }
 
     def reset(self, facts) -> None:
@@ -93,6 +95,13 @@ class TrackingPolicy:
             raise ValueError(
                 f"yaw rate differs from training: {facts.yaw_step_sim} vs {self.yaw_step} "
                 "deg per sim step (set yaw_step_sim in the eval config)"
+            )
+        trained_ref = self.spec["derate_reference"]
+        eval_ref = getattr(facts, "derate_reference", None)
+        if trained_ref is not None and eval_ref is not None and eval_ref != trained_ref:
+            raise ValueError(
+                f"derate_reference differs from training: {eval_ref!r} vs {trained_ref!r} "
+                "(the derate action means something else; set derate_reference in the eval config)"
             )
 
     def act(self, obs, info) -> np.ndarray:

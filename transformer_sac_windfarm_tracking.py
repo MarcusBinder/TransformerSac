@@ -78,6 +78,7 @@ from torch.utils.tensorboard import SummaryWriter
 from WindGym import WindFarmEnv
 from WindGym.wrappers import RecordEpisodeVals, PerTurbineObservationWrapper
 from helpers.agent import WindFarmAgent
+from helpers.turbine_model import apply_turbine_model
 
 # Logging utilities for multi-layout training
 from helpers.multi_layout_debug import (
@@ -367,6 +368,17 @@ def main():
     # Override ActionMethod from args (default "wind", or overridden by checkpoint above)
     config["ActionMethod"] = args.action_type
     print(f"ActionMethod set to: {config['ActionMethod']}")
+    # Turbine model: --derate_reference overrides the preset's key and
+    # --turbine_params (JSON) becomes dwm_params; applied to config /
+    # base_env_kwargs BEFORE the greedy probe env is snapshotted from them, so
+    # greedy is measured with the same turbine model the agent trains on.
+    turbine_model_kwargs = {}
+    apply_turbine_model(
+        config, turbine_model_kwargs,
+        derate_reference=args.derate_reference, turbine_params=args.turbine_params,
+    )
+    print(f"derate_reference: {config.get('derate_reference', 'available')}; "
+          f"dwm_params: {turbine_model_kwargs.get('dwm_params', {})}")
     
     # NOTE (tracking variant): the uniform per-sensor history override from the
     # yaw trainer is intentionally REMOVED here. The "power_tracking" config sets
@@ -389,6 +401,7 @@ def main():
         "yaw_step_sim": args.yaw_step,
         # Tracking episode horizon (notebook: 4 segments x 100 steps = 400).
         "max_time_steps": args.max_episode_steps,
+        **turbine_model_kwargs,  # dwm_params from --turbine_params (if any)
     }
 
     # Power-reference schedule. The reference is a fraction-of-greedy step schedule

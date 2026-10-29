@@ -56,6 +56,7 @@ from helpers.derating_turbine import (
     make_operating_point_lookup_for,
 )
 from helpers.power_ref import build_power_ref, measure_greedy
+from helpers.turbine_model import apply_turbine_model
 from WindGym import WindFarmEnv, AgentEvalFast
 from WindGym.farm_eval import FarmEval
 from WindGym.wrappers import PerTurbineObservationWrapper
@@ -167,6 +168,13 @@ def build_track3_env(args: dict, turbbox_path: str, obs_width: int | None = None
         )
     config = make_env_config(args["config"])
     config["ActionMethod"] = args["action_type"]
+    # The checkpoint's derate semantics (None for runs saved before the flag).
+    # Only the reference is applied here: this env is rebuilt for its
+    # observation layout and wrapper stack, so the turbine parameters
+    # (dwm_params, filter constants) do not matter and are left out.
+    apply_turbine_model(
+        config, {}, derate_reference=args.get("derate_reference"), turbine_params=None
+    )
 
     if obs_width is not None:
         # Per-turbine token = 3 sensors (ws/power/yaw) x samples + broadcast

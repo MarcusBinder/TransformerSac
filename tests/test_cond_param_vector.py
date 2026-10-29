@@ -48,7 +48,10 @@ def _turb_tok(max_t, rows):
 # ----------------------------------------------------------------- constants --
 def test_key_order_matches_windgym_spec_and_posterior():
     from WindGym.core.turbine_params import TURBINE_PARAM_SPECS
-    assert COND_TURB_KEYS == tuple(TURBINE_PARAM_SPECS)
+    # The cond vector covers the DR keys; WindGym may add keys that are not
+    # randomized (tau_ct, setpoint mode), so the check is a prefix, not equality.
+    assert COND_TURB_KEYS == tuple(TURBINE_PARAM_SPECS)[: len(COND_TURB_KEYS)]
+    assert set(COND_TURB_KEYS) <= set(TURBINE_PARAM_SPECS)
     assert COND_FARM_KEYS == ("k1", "k2", "d_particle", "hill_vortex_factor", "mann_L", "mann_GAMMA", "mann_AE")
     assert COND_DIM == 13
     from helpers.param_cond import LEGACY_FARM_KEYS

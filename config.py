@@ -82,6 +82,15 @@ class Args:
     # substep (mirrors yaw_step_sim; windgym config key "derate_step_sim").
     # None = setpoint applies instantly (windgym default).
     derate_step_sim: Optional[float] = None
+    # Turbine model (helpers/turbine_model.py). derate_reference overrides the
+    # preset's key: "available" (fraction of available power, the legacy
+    # meaning), "rated", or "setpoint" (WindGym SetpointPyWakeWindTurbines: the
+    # command is a fraction of rated applied as an absolute cap on an
+    # inertia-filtered available power, Ct lagged by tau_ct). None = preset.
+    derate_reference: Optional[str] = None
+    # JSON object of WindGym turbine-parameter keys -> WindFarmEnv dwm_params,
+    # e.g. '{"tau_power": 6, "tau_ct": 10}'. "{}" = nominal turbine.
+    turbine_params: str = "{}"
     # Max apparent turbine displacement per sim step (m) — dynamiks'
     # max_turb_move, which is the SOLE input to the wd_slow frame slew limit
     # (max_wd_step = max_turb_move*360/(2*pi*max_dist) per sim step; its only
