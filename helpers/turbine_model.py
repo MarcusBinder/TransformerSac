@@ -52,8 +52,45 @@ def apply_turbine_model(
 
 
 def turbine_model_spec(args: dict[str, Any]) -> dict[str, Any]:
-    """The two fields as saved in a checkpoint's args (back-filled for old runs)."""
+    """The turbine model a checkpoint was trained on, from its saved args.
+
+    A missing or ``None`` ``derate_reference`` (runs trained without the flag,
+    including every run before it existed) resolves to the preset's key
+    (``available`` when the preset has none), so the spec always names the
+    meaning the policy's derate action was trained with.
+    """
+    ref = args.get("derate_reference")
+    if ref is None:
+        from helpers.env_configs import make_env_config  # lazy: heavy module
+
+        ref = make_env_config(args.get("config", "default")).get("derate_reference", "available")
     return {
-        "derate_reference": args.get("derate_reference"),
+        "derate_reference": str(ref).lower(),
         "turbine_params": parse_turbine_params(args.get("turbine_params", "{}")),
     }
+
+
+def check_turbine_model(spec: dict[str, Any], facts) -> None:
+    """Refuse an eval env whose derate meaning or filter constants differ from ``spec``.
+
+    ``facts`` is the runner's static env description (``EnvFacts``); fields it
+    does not carry are not compared. Raises ``ValueError`` on a mismatch.
+    """
+    eval_ref = getattr(facts, "derate_reference", None)
+    if eval_ref is not None and str(eval_ref).lower() != spec["derate_reference"]:
+        raise ValueError(
+            f"derate_reference differs from training: {eval_ref!r} vs "
+            f"{spec['derate_reference']!r} (the derate action means something else; "
+            "set derate_reference in the eval config)"
+        )
+    params = spec.get("turbine_params") or {}
+    for key in ("tau_power", "tau_ct"):
+        have = getattr(facts, key, None)
+        if have is None:
+            continue
+        want = float(params.get(key, 0.0))
+        if float(have) != want:
+            raise ValueError(
+                f"{key} differs from training: {have} vs {want} s "
+                "(set turbine_params in the eval config)"
+            )

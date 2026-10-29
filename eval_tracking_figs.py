@@ -168,12 +168,15 @@ def build_track3_env(args: dict, turbbox_path: str, obs_width: int | None = None
         )
     config = make_env_config(args["config"])
     config["ActionMethod"] = args["action_type"]
-    # The checkpoint's derate semantics (None for runs saved before the flag).
-    # Only the reference is applied here: this env is rebuilt for its
-    # observation layout and wrapper stack, so the turbine parameters
-    # (dwm_params, filter constants) do not matter and are left out.
+    # The checkpoint's turbine model (flags absent for runs saved before them):
+    # the reference into the config, the turbine parameters as dwm_params into
+    # the env kwargs, so the greedy probe below and the rollout env both run
+    # the model the policy was trained on.
+    turbine_model_kwargs = {}
     apply_turbine_model(
-        config, {}, derate_reference=args.get("derate_reference"), turbine_params=None
+        config, turbine_model_kwargs,
+        derate_reference=args.get("derate_reference"),
+        turbine_params=args.get("turbine_params"),
     )
 
     if obs_width is not None:
@@ -210,6 +213,7 @@ def build_track3_env(args: dict, turbbox_path: str, obs_width: int | None = None
         "dt_env": args["dt_env"],
         "yaw_step_sim": args["yaw_step"],
         "op_lookup": op_lookup,
+        **turbine_model_kwargs,  # dwm_params from the checkpoint's --turbine_params
     }
 
     x_pos = np.arange(3) * 6 * D
