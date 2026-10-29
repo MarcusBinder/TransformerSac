@@ -349,11 +349,19 @@ class LutPolicy:
         if getattr(base, "derate_action", False):
             raise ValueError("LutPolicy produces yaw-only actions (derate_action=True env)")
         wd_hat = float(getattr(base, "wd_est", float("nan")))
-        # Live frame: equals wd_nominal in a static run, follows the schedule otherwise.
-        target = self.ctrl.target_yaw(wd_hat, wd_frame=float(base.fs.wind_direction))
+        # The frame the target is expressed in = the agent's yaw frame: the env's
+        # phi_frame under yaw_frame_source="est" (2026-10-29; the LUT then
+        # converts gamma(phi_hat) by -wrap180(phi_hat - phi_frame), i.e. only by
+        # the frame's slew lag), else the live simulator frame (equals
+        # wd_nominal in a static run, follows the schedule otherwise).
+        if getattr(base, "yaw_frame_source", "true") == "est":
+            frame = float(base.phi_frame)
+        else:
+            frame = float(base.fs.wind_direction)
+        target = self.ctrl.target_yaw(wd_hat, wd_frame=frame)
         self.trace.append((float(base.fs.time), float(self.ctrl.last_phi), target.copy()))
         if base.ActionMethod == "yaw":
-            cur = np.asarray(base.current_yaw, dtype=float)
+            cur = np.asarray(getattr(base, "current_yaw_ctrl", base.current_yaw), dtype=float)
             action = np.clip((target - cur) / float(base.yaw_step_env), -1.0, 1.0)
         elif base.ActionMethod == "wind":
             action = self.scale_yaw(np.clip(target, self.yaw_min, self.yaw_max))

@@ -390,6 +390,21 @@ class Args:
     # Kills the sub-degree est-wd jitter that flips the yaw sign at the 270
     # symmetry point (the est-fed LUT needed the same hold). Optuna v3.
     wd_est_deadband: float = 0.0
+    # Yaw frame the agent observes / commands in (windgym yaw_frame_source,
+    # plan 2026-10-29 WP3.4): "true" = the simulator's wind (historical);
+    # "est" = its own wd_est, as a deployed controller (the LES script, the
+    # DWM harness --frame-source est). Needs --wd_source est.
+    yaw_frame_source: str = "true"
+    # Residual-on-lut3 action prior (helpers/action_prior.py, WP3.5): the
+    # action is decoded as lut3(phi_est) + a * action_prior_delta deg,
+    # clipped to the yaw band. Needs --action_type wind and --wd_source est.
+    # None = plain actions.
+    action_prior: Optional[str] = None
+    action_prior_delta: float = 10.0
+    # Training TI band override (env_configs._OVERRIDE_MAP -> wind.TI_min/max),
+    # so a sweep can train on the harness cell's 0.0498 (the presets pin 0.038).
+    ti_min: Optional[float] = None
+    ti_max: Optional[float] = None
 
     # === Layout Settings ===
     # Comma-separated list of layouts. Single = single-layout, Multiple = multi-layout

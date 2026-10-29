@@ -831,6 +831,32 @@ def main():
               f"deadband={base_env_kwargs['wd_est_deadband']} deg) — the "
               f"policy never sees the privileged env.wd")
     wd_source_attr = "wd" if args.wd_source == "true" else "wd_est"
+    # Yaw frame of the agent (plan 2026-10-29 WP3.4): under "est" the env
+    # expresses yaw observations / targets in the frame of wd_est (what a
+    # deployed controller has), with the frame slew-limited at max_wd_step.
+    if args.yaw_frame_source not in ("true", "est"):
+        raise ValueError(f"--yaw_frame_source must be 'true' or 'est', got {args.yaw_frame_source!r}")
+    if args.yaw_frame_source == "est":
+        if args.wd_source != "est":
+            raise ValueError("--yaw_frame_source est needs --wd_source est (the frame IS the estimate)")
+        base_env_kwargs["yaw_frame_source"] = "est"
+        print("yaw frame: ESTIMATED (yaw observed / commanded in the frame of wd_est; "
+              "windgym yaw_frame_source='est')")
+    # Residual-on-lut3 action prior (helpers/action_prior.py, WP3.5).
+    if args.action_prior is not None:
+        from helpers.action_prior import PRIOR_MODES, prior_point
+        if args.action_prior not in PRIOR_MODES:
+            raise ValueError(f"--action_prior must be one of {PRIOR_MODES}, got {args.action_prior!r}")
+        if args.action_type != "wind":
+            raise ValueError("--action_prior needs --action_type wind (absolute targets)")
+        if args.wd_source != "est":
+            raise ValueError("--action_prior needs --wd_source est (the table is indexed with wd_est)")
+        if float(args.action_prior_delta) < 0:
+            raise ValueError("--action_prior_delta must be >= 0")
+        _prior_ws, _prior_ti = prior_point(args, config)
+        print(f"action prior: {args.action_prior} + a * {args.action_prior_delta:g} deg "
+              f"(table at ws {_prior_ws} / TI {_prior_ti}, yaw band "
+              f"[{config['farm']['yaw_min']}, {config['farm']['yaw_max']}])")
 
     # DEL-constrained reward: DELRewardWrapper compares agent DELs against a
     # greedy baseline farm, which only exists when the env is built with
@@ -885,6 +911,15 @@ def main():
             # without it (older windgym has no attribute: nothing to check).
             require_les_calibrated(getattr(env.unwrapped, "dwm_setup", None))
             env.action_space.seed(args.seed)
+            if args.action_prior is not None:
+                # Innermost: sees the physical turbine order (MultiLayoutEnv
+                # un-permutes before the action reaches the base env). The
+                # table is built once per process (worker) at the training point.
+                from helpers.action_prior import ActionPriorWrapper, build_prior_controller, prior_point
+                _ws, _ti = prior_point(args, env_kwargs["config"])
+                _ctrl = build_prior_controller(wind_turbine, x_pos, y_pos, _ws, _ti,
+                                               yaw_max=float(env_kwargs["config"]["farm"]["yaw_max"]))
+                env = ActionPriorWrapper(env, _ctrl, delta=float(args.action_prior_delta))
             return env
         return _factory
 

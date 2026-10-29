@@ -618,6 +618,9 @@ _OVERRIDE_MAP = (
     ("wd_max",  "wind", "wd_max"),
     ("yaw_min", "farm", "yaw_min"),
     ("yaw_max", "farm", "yaw_max"),
+    # Optuna v3 (2026-10-29): training TI band (the harness cell is TI 0.0498).
+    ("ti_min",  "wind", "TI_min"),
+    ("ti_max",  "wind", "TI_max"),
 )
 
 
