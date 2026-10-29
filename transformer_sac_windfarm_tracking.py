@@ -460,6 +460,17 @@ def main():
         base_env_kwargs["Baseline_comp"] = True
         config["BaseController"] = "Global"
 
+    # Thrust load terms (helpers/thrust_load_reward.py) price the agent farm's
+    # own thrust, so they need no baseline farm. Both wrappers write
+    # info["reward_unpenalized"], hence one or the other.
+    _thrust_load_active = any(
+        s > 0 for s in (args.load_dthrust2_scale, args.load_thrust_eq_scale,
+                        args.load_thrust_level_scale))
+    if _thrust_load_active and args.del_penalty_scale > 0:
+        raise ValueError("load_*_scale and del_penalty_scale > 0 cannot be combined")
+    if _thrust_load_active and args.backend != "dynamiks":
+        raise ValueError("load_*_scale needs --backend dynamiks (it reads the dynamiks flow simulation)")
+
     def env_factory(x_pos: np.ndarray, y_pos: np.ndarray) -> gym.Env:
         """Create a base WindFarmEnv with given positions."""
         env = WindFarmEnv(x_pos=x_pos,
@@ -519,6 +530,18 @@ def main():
                 # default) -- the sector means are what the surrogate sees.
                 n_r=3,
                 n_theta=12,
+            )
+        # Thrust load terms (own farm only), also before reward_scale so the
+        # scales are in pre-scale reward units like del_penalty_scale.
+        if _thrust_load_active:
+            from helpers.thrust_load_reward import ThrustLoadRewardWrapper
+
+            env = ThrustLoadRewardWrapper(
+                env,
+                dthrust2_scale=args.load_dthrust2_scale,
+                thrust_eq_scale=args.load_thrust_eq_scale,
+                thrust_level_scale=args.load_thrust_level_scale,
+                thrust_ref=args.load_thrust_ref,
             )
         # v9.1: scale the (tiny) Wake_recovery reward to probe optimization signal-to-noise.
         if args.reward_scale != 1.0:
@@ -1325,6 +1348,9 @@ def main():
     del_penalty_window = deque(maxlen=1000)
     del_ratio_window = deque(maxlen=1000)
     reward_unpen_window = deque(maxlen=1000)
+    # Thrust load-term diagnostics (filled only when a load_*_scale > 0).
+    _load_keys = ("load_penalty", "load_dthrust2", "load_thrust_eq", "load_thrust_level")
+    load_windows = {k: deque(maxlen=1000) for k in _load_keys}
     # next_save_step = ((start_step // args.save_interval) + 1) * args.save_interval  # Account for resumed step
     next_save_step = start_step + args.save_interval
     # Replay buffer saving
@@ -1450,7 +1476,12 @@ def main():
                     np.asarray(infos["reward_unpenalized"], dtype=float).flatten().tolist())
                 _ratios = np.asarray(infos["del_ratio"], dtype=float).flatten()
                 del_ratio_window.extend(_ratios[np.isfinite(_ratios)].tolist())
-        
+            if _thrust_load_active and "load_penalty" in infos:
+                for k in _load_keys:
+                    load_windows[k].extend(np.asarray(infos[k], dtype=float).flatten().tolist())
+                reward_unpen_window.extend(
+                    np.asarray(infos["reward_unpenalized"], dtype=float).flatten().tolist())
+
             # Log episode stats
             if "final_info" in infos:
                 ep_return = np.mean(envs.return_queue)
@@ -1491,6 +1522,13 @@ def main():
                     if len(del_ratio_window) > 0:
                         writer.add_scalar("charts/episodic_del_ratio",
                                           float(np.mean(del_ratio_window)), global_step)
+                # Thrust load terms (rolling-window means, unweighted terms).
+                if _thrust_load_active and len(load_windows["load_penalty"]) > 0:
+                    for k in _load_keys:
+                        writer.add_scalar(f"charts/episodic_{k}",
+                                          float(np.mean(load_windows[k])), global_step)
+                    writer.add_scalar("charts/episodic_reward_unpenalized",
+                                      float(np.mean(reward_unpen_window)), global_step)
 
 
             # Handle final observations

@@ -94,6 +94,17 @@ class Args:
     # JSON object deep-merged into the env config preset (helpers/env_overrides.py)
     # for keys without a flag, e.g. '{"derate_max": 1.0, "derate_penalty": 0.1}'.
     env_overrides: str = "{}"
+    # Thrust-based load terms of the tracking reward (helpers/thrust_load_reward.py;
+    # tracking trainer only, dynamiks backend, no baseline farm). Thrust is
+    # normalised by load_thrust_ref (N; None = the turbine's peak steady thrust):
+    #   reward -= dthrust2_scale * sum_i sum_substeps (dT_i)^2
+    #           + thrust_eq_scale * sum_i (mean_step T_i - farm mean)^2
+    #           + thrust_level_scale * sum_i mean_step T_i
+    # All 0 = wrapper not attached. Not combinable with del_penalty_scale > 0.
+    load_dthrust2_scale: float = 0.0
+    load_thrust_eq_scale: float = 0.0
+    load_thrust_level_scale: float = 0.0
+    load_thrust_ref: Optional[float] = None
     # Max apparent turbine displacement per sim step (m) — dynamiks'
     # max_turb_move, which is the SOLE input to the wd_slow frame slew limit
     # (max_wd_step = max_turb_move*360/(2*pi*max_dist) per sim step; its only
