@@ -8,7 +8,8 @@ action a in [-1, 1] is decoded as an ABSOLUTE yaw target
 where lut3 is the robust PyWake table (pywake_lut mode 3, sigma 2.3, sign farm)
 built ONCE at the training point (midpoint of the training ws / TI bands, the
 training turbine and layout, the checkpoint's yaw band) and indexed with the
-env's own sensor-derived wd estimate ``env.wd_est`` in the agent's yaw frame
+prior's OWN sensor-derived wd estimate ``env.wd_est_prior`` (tau 60, front, deadband 0 = the
+harness lut3 feed, independent of the agent's sampled estimator) in the agent's yaw frame
 (``env.phi_frame`` under yaw_frame_source="est", else the live true frame,
 exactly as the harness LutPolicy). a = 0 IS the harness lut3 row; the policy
 can only add what RL learns on top (the dynamic gains). The decode is the
@@ -32,6 +33,20 @@ from WindGym.core.yaw_frame import residual_target, wind_action_from_target
 PRIOR_MODES = ("lut3",)
 LUT_SIGMA = 2.3
 LUT_SIGN = "farm"
+# The prior's OWN wd estimator = the harness lut3 feed (2026-10-29 parity finding: the agent's
+# median consensus sat on the 270 symmetry point and flipped the prior's lobe 17 times in 2000 s,
+# which a residual of <= 15 deg cannot undo). Independent of the agent's sampled estimator.
+PRIOR_WD_EST_TAU = 60.0
+PRIOR_WD_EST_CONSENSUS = "front"
+PRIOR_WD_EST_DEADBAND = 0.0
+
+
+def prior_wd_est_env_kwargs(args) -> dict:
+    """WindFarmEnv kwargs of the prior's own estimator (env.wd_est_prior), from the checkpoint /
+    trainer args with the harness-lut3 defaults (tau 60, front, deadband 0)."""
+    return {"prior_wd_est_tau": float(_arg(args, "action_prior_wd_est_tau", PRIOR_WD_EST_TAU)),
+            "prior_wd_est_consensus": str(_arg(args, "action_prior_wd_est_consensus", PRIOR_WD_EST_CONSENSUS)),
+            "prior_wd_est_deadband": float(_arg(args, "action_prior_wd_est_deadband", PRIOR_WD_EST_DEADBAND))}
 _TABLE_CACHE: Dict[tuple, object] = {}
 
 
@@ -78,10 +93,14 @@ def lut_frame(base) -> float:
 
 
 def prior_wind_action(a, ctrl, env, *, delta: float, yaw_min: float, yaw_max: float) -> np.ndarray:
-    """The env "wind" action that commands ``lut3(phi_est) + a * delta`` on ``env``
-    (a WindFarmEnv or anything exposing wd_est / phi_frame / yaw_frame_source / fs)."""
+    """The env "wind" action that commands ``lut3(phi_prior) + a * delta`` on ``env`` (a WindFarmEnv
+    or anything exposing wd_est_prior / phi_frame / yaw_frame_source / fs). The table is indexed with
+    the PRIOR's own estimate (env.wd_est_prior), the target expressed in the agent's yaw frame."""
     base = getattr(env, "unwrapped", env)
-    wd_hat = float(getattr(base, "wd_est", float("nan")))
+    if not hasattr(base, "wd_est_prior"):
+        raise AttributeError("the action prior needs env.wd_est_prior (its own estimator: build the env "
+                             "with prior_wd_est_tau, helpers.action_prior.prior_wd_est_env_kwargs)")
+    wd_hat = float(base.wd_est_prior)
     prior = np.asarray(ctrl.target_yaw(wd_hat, wd_frame=lut_frame(base)), dtype=float)
     target = residual_target(a, prior, delta, yaw_min, yaw_max)
     return wind_action_from_target(target, yaw_min, yaw_max).astype(np.float32)
@@ -101,6 +120,9 @@ class ActionPriorWrapper(gym.ActionWrapper):
         if getattr(base, "wd_est_tau", None) is None:
             raise ValueError("--action_prior needs the env's wd_est (build it with wd_est_tau: "
                              "--wd_source est)")
+        if getattr(base, "prior_wd_est_tau", None) is None:
+            raise ValueError("--action_prior needs the prior's own estimator (build the env with "
+                             "prior_wd_est_tau: prior_wd_est_env_kwargs)")
         if float(getattr(ctrl, "deadband_deg", 0.0)) != 0.0:
             raise ValueError("the prior controller's deadband must be 0 (the estimator holds)")
         self.ctrl = ctrl

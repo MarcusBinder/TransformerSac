@@ -854,6 +854,9 @@ def main():
         if float(args.action_prior_delta) < 0:
             raise ValueError("--action_prior_delta must be >= 0")
         _prior_ws, _prior_ti = prior_point(args, config)
+        from helpers.action_prior import prior_wd_est_env_kwargs
+        base_env_kwargs.update(prior_wd_est_env_kwargs(args))
+        print(f"action prior estimator: {prior_wd_est_env_kwargs(args)} (independent of the agent's)")
         print(f"action prior: {args.action_prior} + a * {args.action_prior_delta:g} deg "
               f"(table at ws {_prior_ws} / TI {_prior_ti}, yaw band "
               f"[{config['farm']['yaw_min']}, {config['farm']['yaw_max']}])")

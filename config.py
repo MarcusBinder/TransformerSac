@@ -401,6 +401,11 @@ class Args:
     # None = plain actions.
     action_prior: Optional[str] = None
     action_prior_delta: float = 10.0
+    # The prior's OWN wd estimator (env.wd_est_prior) = the harness lut3 feed; independent of
+    # the agent's --wd_est_* (2026-10-29: the agent's median consensus flipped the prior's lobe).
+    action_prior_wd_est_tau: float = 60.0
+    action_prior_wd_est_consensus: str = "front"
+    action_prior_wd_est_deadband: float = 0.0
     # Training TI band override (env_configs._OVERRIDE_MAP -> wind.TI_min/max),
     # so a sweep can train on the harness cell's 0.0498 (the presets pin 0.038).
     ti_min: Optional[float] = None
