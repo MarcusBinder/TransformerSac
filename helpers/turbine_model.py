@@ -74,7 +74,8 @@ def check_turbine_model(spec: dict[str, Any], facts) -> None:
     """Refuse an eval env whose derate meaning or filter constants differ from ``spec``.
 
     ``facts`` is the runner's static env description (``EnvFacts``); fields it
-    does not carry are not compared. Raises ``ValueError`` on a mismatch.
+    does not carry, or the spec lacks (``derate_min`` / ``derate_max``), are not
+    compared. Raises ``ValueError`` on a mismatch.
     """
     eval_ref = getattr(facts, "derate_reference", None)
     if eval_ref is not None and str(eval_ref).lower() != spec["derate_reference"]:
@@ -93,4 +94,14 @@ def check_turbine_model(spec: dict[str, Any], facts) -> None:
             raise ValueError(
                 f"{key} differs from training: {have} vs {want} s "
                 "(set turbine_params in the eval config)"
+            )
+    # The derate action range: the policy's [-1, 1] maps onto it.
+    for key in ("derate_min", "derate_max"):
+        have = getattr(facts, key, None)
+        if have is None or key not in spec:
+            continue
+        if float(have) != float(spec[key]):
+            raise ValueError(
+                f"{key} differs from training: {have} vs {spec[key]} "
+                "(set it in the eval config: a policy is evaluated with its own action range)"
             )

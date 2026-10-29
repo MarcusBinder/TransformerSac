@@ -57,6 +57,7 @@ from helpers.derating_turbine import (
 )
 from helpers.power_ref import build_power_ref, measure_greedy
 from helpers.turbine_model import apply_turbine_model
+from helpers.env_overrides import apply_env_overrides
 from WindGym import WindFarmEnv, AgentEvalFast
 from WindGym.farm_eval import FarmEval
 from WindGym.wrappers import PerTurbineObservationWrapper
@@ -178,6 +179,7 @@ def build_track3_env(args: dict, turbbox_path: str, obs_width: int | None = None
         derate_reference=args.get("derate_reference"),
         turbine_params=args.get("turbine_params"),
     )
+    apply_env_overrides(config, args.get("env_overrides"))
 
     if obs_width is not None:
         # Per-turbine token = 3 sensors (ws/power/yaw) x samples + broadcast

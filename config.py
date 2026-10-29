@@ -91,6 +91,9 @@ class Args:
     # JSON object of WindGym turbine-parameter keys -> WindFarmEnv dwm_params,
     # e.g. '{"tau_power": 6, "tau_ct": 10}'. "{}" = nominal turbine.
     turbine_params: str = "{}"
+    # JSON object deep-merged into the env config preset (helpers/env_overrides.py)
+    # for keys without a flag, e.g. '{"derate_max": 1.0, "derate_penalty": 0.1}'.
+    env_overrides: str = "{}"
     # Max apparent turbine displacement per sim step (m) — dynamiks'
     # max_turb_move, which is the SOLE input to the wd_slow frame slew limit
     # (max_wd_step = max_turb_move*360/(2*pi*max_dist) per sim step; its only

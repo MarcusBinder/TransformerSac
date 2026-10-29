@@ -79,6 +79,7 @@ from WindGym import WindFarmEnv
 from WindGym.wrappers import RecordEpisodeVals, PerTurbineObservationWrapper
 from helpers.agent import WindFarmAgent
 from helpers.turbine_model import apply_turbine_model
+from helpers.env_overrides import apply_env_overrides
 
 # Logging utilities for multi-layout training
 from helpers.multi_layout_debug import (
@@ -379,6 +380,10 @@ def main():
     )
     print(f"derate_reference: {config.get('derate_reference', 'available')}; "
           f"dwm_params: {turbine_model_kwargs.get('dwm_params', {})}")
+    # Preset keys without a flag (derate_max, derate_penalty, track_def, ...).
+    apply_env_overrides(config, args.env_overrides)
+    if args.env_overrides.strip() not in ("", "{}"):
+        print(f"env_overrides applied: {args.env_overrides}")
     
     # NOTE (tracking variant): the uniform per-sensor history override from the
     # yaw trainer is intentionally REMOVED here. The "power_tracking" config sets

@@ -80,6 +80,9 @@ class TrackingPolicy:
             "power_ref_factory": args.get("power_ref_factory"),
             "power_ref_kwargs": args.get("power_ref_kwargs"),
             "deterministic": deterministic,
+            "env_overrides": args.get("env_overrides", "{}"),
+            "derate_min": float(base_env.derate_min),
+            "derate_max": float(base_env.derate_max),
             **turbine_model_spec(args),
         }
 

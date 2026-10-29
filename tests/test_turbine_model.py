@@ -83,6 +83,13 @@ def test_check_turbine_model_refuses_mismatches():
         {"derate_reference": "available", "turbine_params": {}},
         SimpleNamespace(derate_reference="available", tau_power=0.0, tau_ct=0.0),
     )
+    # the derate action range is part of what the policy learned
+    spec_r = {**spec, "derate_min": 0.0, "derate_max": 0.8}
+    check_turbine_model(spec_r, SimpleNamespace(derate_reference="setpoint", derate_max=0.8))
+    with pytest.raises(ValueError, match="derate_max"):
+        check_turbine_model(spec_r, SimpleNamespace(derate_reference="setpoint", derate_max=1.0))
+    with pytest.raises(ValueError, match="derate_min"):
+        check_turbine_model(spec_r, SimpleNamespace(derate_min=0.1))
 
 
 def test_build_track3_env_carries_the_checkpoint_turbine_model(monkeypatch):
@@ -103,11 +110,13 @@ def test_build_track3_env_carries_the_checkpoint_turbine_model(monkeypatch):
         "dt_sim": 1, "dt_env": 1, "yaw_step": 0.5, "use_wd_deviation": False,
         "wd_scale_range": 90.0, "power_schedule": "default",
         "derate_reference": "setpoint", "turbine_params": '{"tau_power": 6, "tau_ct": 10}',
+        "env_overrides": '{"derate_max": 1.0}',
     }
     base_env, _, _, greedy = etf.build_track3_env(args, "./boxes/")
     assert greedy == 1.0e7
     for env in (base_env, seen["probe"]):
         assert env.derate_reference == "setpoint"
         assert env._base_dwm_params == {"tau_power": 6.0, "tau_ct": 10.0}
+        assert env.derate_max == 1.0  # --env_overrides applied to the preset
     base_env.close()
     seen["probe"].close()
