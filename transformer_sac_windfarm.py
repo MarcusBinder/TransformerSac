@@ -366,13 +366,17 @@ def main():
     args = tyro.cli(Args)
     
     # Validate initial_exploration
-    assert args.initial_exploration in ("random", "policy"), \
-        f"--initial_exploration must be 'random' or 'policy', got '{args.initial_exploration}'"
+    assert args.initial_exploration in ("random", "policy", "lut"), \
+        f"--initial_exploration must be 'random', 'policy' or 'lut', got '{args.initial_exploration}'"
     if args.initial_exploration == "policy" and args.resume_checkpoint is None:
         print("WARNING: --initial_exploration=policy without --resume_checkpoint. "
               "The actor is untrained, so 'policy' exploration will just be random Gaussian noise.")
     if args.initial_exploration == "policy":
         print(f"Initial exploration: using actor network for first {args.learning_starts} steps")
+    if args.initial_exploration == "lut":
+        print(f"Initial exploration: lut3 teacher + AR(1) noise ({args.lut_noise_deg:g} deg, "
+              f"{args.lut_noise_tau_s:g} s) for the first {args.learning_starts} steps, then BC "
+              f"({args.bc_steps} steps, lr {args.bc_lr:g}, std {args.bc_std:g})")
 
     # Validate replay buffer save/load flags
     assert not (args.buffer_only and args.load_buffer is not None), \
@@ -867,6 +871,18 @@ def main():
         print(f"action prior: {args.action_prior} + a * {args.action_prior_delta:g} deg "
               f"(table at ws {_prior_ws} / TI {_prior_ti}, yaw band "
               f"[{config['farm']['yaw_min']}, {config['farm']['yaw_max']}])")
+    # lutpre1: lut3 teacher in the warm-up (helpers/lut_pretrain.py). Its own estimator is the
+    # residual prior's (env.wd_est_prior, tau 60 / front / deadband 0 = the harness lut3 feed).
+    from helpers.lut_pretrain import validate_lut_args
+    validate_lut_args(args, config)
+    if args.initial_exploration == "lut":
+        from helpers.action_prior import prior_wd_est_env_kwargs
+        from helpers.lut_pretrain import teacher_point
+        base_env_kwargs.update(prior_wd_est_env_kwargs(args))
+        _teach_ws, _teach_ti = teacher_point(args, config)
+        print(f"lut teacher: lut3 table at ws {_teach_ws} / TI {_teach_ti}, estimator "
+              f"{prior_wd_est_env_kwargs(args)}, yaw band "
+              f"[{config['farm']['yaw_min']}, {config['farm']['yaw_max']}], action {args.action_type}")
 
     # DEL-constrained reward: DELRewardWrapper compares agent DELs against a
     # greedy baseline farm, which only exists when the env is built with
@@ -909,8 +925,9 @@ def main():
             print(f"{_k} override: {base_env_kwargs[_k]}")
 
 
-    def make_env_factory(env_kwargs: dict):
-        """Build a WindFarmEnv factory bound to one set of env kwargs."""
+    def make_env_factory(env_kwargs: dict, teacher: bool = True):
+        """Build a WindFarmEnv factory bound to one set of env kwargs (teacher=False:
+        no lutpre1 teacher wrapper, the eval envs)."""
         def _factory(x_pos: np.ndarray, y_pos: np.ndarray) -> gym.Env:
             env = WindFarmEnv(x_pos=x_pos,
                               y_pos=y_pos,
@@ -930,6 +947,16 @@ def main():
                 _ctrl = build_prior_controller(wind_turbine, x_pos, y_pos, _ws, _ti,
                                                yaw_max=float(env_kwargs["config"]["farm"]["yaw_max"]))
                 env = ActionPriorWrapper(env, _ctrl, delta=float(args.action_prior_delta))
+            if args.initial_exploration == "lut" and teacher:
+                # Same slot as the action prior (physical order, table once per worker).
+                # Actions pass through: the teacher only answers teacher_actions().
+                from helpers.action_prior import build_prior_controller
+                from helpers.lut_pretrain import LutTeacherWrapper, teacher_point
+                _ws, _ti = teacher_point(args, env_kwargs["config"])
+                _ctrl = build_prior_controller(wind_turbine, x_pos, y_pos, _ws, _ti,
+                                               yaw_max=float(env_kwargs["config"]["farm"]["yaw_max"]))
+                env = LutTeacherWrapper(env, _ctrl, noise_deg=float(args.lut_noise_deg),
+                                        noise_tau_s=float(args.lut_noise_tau_s), seed=args.seed)
             return env
         return _factory
 
@@ -969,7 +996,7 @@ def main():
                                  "wd_function": _wd_fn,
                                  # --eval_force_baseline -> {"Baseline_comp": True}
                                  # (eval envs only; empty by default)
-                                 **eval_env_extra_kwargs(args)})
+                                 **eval_env_extra_kwargs(args)}, teacher=False)
 
     eval_env_factories = ([make_eval_env_factory(wd, ws) for wd, ws, _ in eval_specs]
                           if eval_specs else [env_factory])
@@ -2088,6 +2115,8 @@ def main():
         profile_registry_gpu_budget_mb=args.profile_registry_gpu_budget_mb,
         cond_dim=cond_normalizer.cond_dim if _cond_on else 0,
         action_hist_dim=ACTION_HIST_FEAT if args.cond_action_hist else 0,
+        # lutpre1: the clean lut3 action per token (NaN outside the warm-up)
+        label_dim=action_dim_per_turbine if args.initial_exploration == "lut" else 0,
     )
 
     # Shared metadata stored alongside every buffer save (also validated on load)
@@ -2102,6 +2131,10 @@ def main():
             "cond_source": args.cond_source,
             "cond_norm_json": args.cond_norm_json,
             "cond_action_hist": bool(args.cond_action_hist),
+            # lutpre1: a buffer's stored actions are action-type specific (a wind buffer
+            # must never load into a yaw run) and the warm-up policy shapes its contents
+            "action_type": args.action_type,
+            "warmup_policy": args.initial_exploration,
         }
 
     if args.load_buffer is not None:
@@ -2144,6 +2177,12 @@ def main():
                 f"Replay buffer was generated with window_length="
                 f"{buffer_meta_loaded.get('window_length', 1)} but this run uses "
                 f"{args.window_length}. Observation contents would be inconsistent."
+            )
+        if buffer_meta_loaded.get("action_type", args.action_type) != args.action_type:
+            raise ValueError(
+                f"Replay buffer was generated with action_type="
+                f"'{buffer_meta_loaded.get('action_type')}' but this run uses "
+                f"'{args.action_type}': stored actions would be inconsistent."
             )
         if buffer_meta_loaded.get("seed") != args.seed:
             print(f"NOTE: buffer was generated with seed={buffer_meta_loaded.get('seed')}, "
@@ -2530,6 +2569,41 @@ def main():
     current_params = None
     current_action_hist = None
 
+    bc_done = False
+
+    def run_lut_bc(step: int):
+        """lutpre1: fit the actor to the warm-up's lut3 labels, save checkpoints/bc.pt and
+        return a FRESH actor optimizer at --policy_lr (the BC Adam state is discarded)."""
+        from helpers.lut_pretrain import deg_per_action_unit, run_bc
+        _yaw_step_env = float(envs.env.get_attr("yaw_step_env")[0]) if args.action_type == "yaw" else 0.0
+        _deg = deg_per_action_unit(args.action_type, yaw_min=float(config["farm"]["yaw_min"]),
+                                   yaw_max=float(config["farm"]["yaw_max"]), yaw_step_env=_yaw_step_env)
+        print(f"\n[lutpre] BC at step {step}: {args.bc_steps} steps on {len(rb.labelled_indices())} "
+              f"labelled rows ({_deg:g} deg per action unit)", flush=True)
+        _t_bc = time.time()
+        _bc = run_bc(actor, rb, steps=args.bc_steps, lr=args.bc_lr, batch_size=args.bc_batch_size,
+                     std=args.bc_std, std_coef=args.bc_std_coef, deg_per_unit=_deg, device=device,
+                     obs_normalizer=obs_normalizer, writer=writer, seed=args.seed,
+                     grad_clip=args.grad_clip_max_norm)
+        print(f"[lutpre] BC done in {time.time() - _t_bc:.0f} s: rms {_bc['rms_deg_train']:.3f} deg "
+              f"(train) / {_bc['rms_deg_holdout']:.3f} deg (holdout, {_bc['n_holdout']} rows), "
+              f"loss {_bc['loss']:.5f}", flush=True)
+        metrics_log.write("bc", step=int(step), **_bc)
+        _new_opt = make_adam([p for p in actor.parameters() if id(p) not in shared_param_ids],
+                             lr=args.policy_lr)
+        _path = save_checkpoint(
+            actor, qf1, qf2, _new_opt, q_optimizer,
+            step, run_name, args, log_alpha, alpha_optimizer,
+            tqc_critic=tqc_critic,
+            tqc_critic_target=tqc_critic_target,
+            qf1_target=qf1_target, qf2_target=qf2_target,
+            obs_norm_state=obs_normalizer.state_dict() if obs_normalizer is not None else None,
+        )
+        os.replace(_path, os.path.join(os.path.dirname(_path), "bc.pt"))
+        print(f"[lutpre] saved {os.path.join(os.path.dirname(_path), 'bc.pt')}; actor optimizer "
+              f"rebuilt at policy_lr {args.policy_lr:g}", flush=True)
+        return _new_opt
+
     for update in range(_rl_iterations):
         global_step += args.num_envs
         
@@ -2597,8 +2671,21 @@ def main():
         act_state = dict(wind_dirs=wind_dirs, raw_positions=raw_positions, masks=current_masks,
                         receptivity=current_receptivity, influence=current_influence,
                         params=current_params, action_hist=current_action_hist)
+        if args.initial_exploration == "lut" and not bc_done and global_step >= args.learning_starts:
+            # lutpre1 BC, once, at the first iteration past the warm-up: BEFORE the actor's first
+            # action (and before step_async, so no env step is in flight). GPU only.
+            actor_optimizer = run_lut_bc(global_step)
+            bc_done = True
+        current_labels = None
         if global_step < args.learning_starts:
-            if args.initial_exploration == "policy":
+            if args.initial_exploration == "lut":
+                # lutpre1: ONE call per env step, in the prefetch block (before step_async).
+                # Token order, padded: (clean lut3 label, noisy exploration action) per env.
+                _teach = envs.env.call("teacher_actions")
+                current_labels = np.stack([t[0] for t in _teach]).astype(np.float32)
+                actions = np.stack([t[1] for t in _teach]).astype(np.float32).reshape(
+                    envs.action_space.shape)
+            elif args.initial_exploration == "policy":
                 # Use the actor network (useful when resuming from checkpoint)
                 with torch.no_grad():
                     actions = agent.act(envs, obs, **act_state)
@@ -3625,6 +3712,8 @@ def main():
                 permutation=perm_i,
                 params=current_params[i] if current_params is not None else None,
                 action_hist=current_action_hist[i] if current_action_hist is not None else None,
+                label=(current_labels[i].reshape(-1, action_dim_per_turbine)
+                       if current_labels is not None else None),
             )
 
         # One-shot warmup buffer save (buffer pre-generation for ablation runs)

@@ -680,6 +680,27 @@ class MultiLayoutEnv(gym.Env):
         out[: self.n_turbines] = phys[self._perm]
         return out
 
+    def teacher_actions(self) -> Tuple[np.ndarray, np.ndarray]:
+        """lutpre1: (clean lut3 label, exploration action) from the inner
+        ``LutTeacherWrapper`` (physical order there), each ``(max_turbines,)`` in
+        TOKEN order (permuted like ``turbine_positions``), padded with zeros.
+        A method, not a property: the vector env's ``call`` reaches it through the
+        outer wrappers, ``get_attr`` would only see this env's own attributes."""
+        env = self._current_env
+        while env is not None and not getattr(env, "lut_teacher", False):
+            env = getattr(env, "env", None)
+        if env is None:
+            raise AttributeError(
+                "MultiLayoutEnv.teacher_actions needs a LutTeacherWrapper in the wrapper "
+                "chain (trainer flag --initial_exploration lut)"
+            )
+        out = []
+        for phys in env.teacher_actions():
+            padded = np.zeros(self.max_turbines, dtype=np.float32)
+            padded[: self.n_turbines] = np.asarray(phys, dtype=np.float32)[self._perm]
+            out.append(padded)
+        return out[0], out[1]
+
     @property
     def farm_params(self) -> Dict[str, float]:
         """This episode's farm-level DWM / Mann parameters (the six posterior

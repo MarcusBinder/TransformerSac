@@ -55,6 +55,7 @@ class TransformerReplayBuffer:
         profile_registry_gpu_budget_mb: int = 256,
         cond_dim: int = 0,
         action_hist_dim: int = 0,
+        label_dim: int = 0,
     ):
         """
         Args:
@@ -76,6 +77,10 @@ class TransformerReplayBuffer:
                 float32; 0 = column absent). sample() returns it as "params".
             action_hist_dim: Stage 10 -- width of the per-token commanded-action
                 history (_action_hist; 0 = absent). sample() key "action_hist".
+            label_dim: lutpre1 -- width of the per-token teacher label (_labels,
+                (capacity, max_turbines, label_dim) float32, NaN = unlabelled row;
+                0 = absent). Only sample_at() returns it ("labels"); the RL sample()
+                path is unchanged.
         """
         self.capacity = capacity
         self.device = device
@@ -104,6 +109,10 @@ class TransformerReplayBuffer:
                         if self.cond_dim > 0 else None)
         self._action_hist = (np.zeros((capacity, max_turbines, self.action_hist_dim), dtype=np.float32)
                              if self.action_hist_dim > 0 else None)
+        # --- lutpre1: per-token teacher label (NaN = no label) ---
+        self.label_dim = int(label_dim)
+        self._labels = (np.full((capacity, max_turbines, self.label_dim), np.nan, dtype=np.float32)
+                        if self.label_dim > 0 else None)
 
         # --- Profile-specific storage ---
         if self.use_profiles:
@@ -153,6 +162,7 @@ class TransformerReplayBuffer:
             + self._wind_directions.nbytes
             + (self._params.nbytes if self._params is not None else 0)
             + (self._action_hist.nbytes if self._action_hist is not None else 0)
+            + (self._labels.nbytes if self._labels is not None else 0)
         ) / 1e6
         print(f"[ReplayBuffer] Pre-allocated {alloc_mb:.1f} MB for {capacity} transitions "
               f"(max_turb={max_turbines}, obs_dim={obs_dim}, act_dim={action_dim})")
@@ -171,6 +181,7 @@ class TransformerReplayBuffer:
         permutation: Optional[np.ndarray] = None,
         params: Optional[np.ndarray] = None,
         action_hist: Optional[np.ndarray] = None,
+        label: Optional[np.ndarray] = None,
     ) -> None:
         """
         Store a transition by writing directly into pre-allocated arrays.
@@ -188,8 +199,14 @@ class TransformerReplayBuffer:
             permutation: Turbine permutation array (for shuffled profiles)
             params: (max_turbines, cond_dim) hidden-parameter vector e (required iff cond_dim > 0)
             action_hist: (max_turbines, action_hist_dim) commanded-action history (iff action_hist_dim > 0)
+            label: (max_turbines, label_dim) teacher label (label_dim > 0 only; None = unlabelled row)
         """
         i = self.position
+
+        if self._labels is not None:
+            self._labels[i] = np.nan if label is None else label
+        elif label is not None:
+            raise ValueError("replay buffer built without labels (label_dim 0): add() got a label")
 
         if self._params is not None:
             if params is None:
@@ -247,7 +264,21 @@ class TransformerReplayBuffer:
         # np.random.choice(replace=False), which builds a full O(self.size) permutation
         # every call -- a hidden cost that scales with buffer fill (up to 1e6).
         indices = np.random.randint(0, self.size, size=batch_size)
+        return self._gather(indices, with_labels=False)
 
+    def sample_at(self, indices: np.ndarray) -> Dict[str, torch.Tensor]:
+        """The sample() batch for explicit row ``indices``, plus "labels" when the
+        buffer has a label column (lutpre1 BC)."""
+        return self._gather(np.asarray(indices, dtype=np.int64), with_labels=True)
+
+    def labelled_indices(self) -> np.ndarray:
+        """Stored rows whose label is finite everywhere, in storage order (empty
+        when the buffer has no label column)."""
+        if self._labels is None:
+            return np.zeros(0, dtype=np.int64)
+        return np.flatnonzero(np.isfinite(self._labels[: self.size]).all(axis=(1, 2)))
+
+    def _gather(self, indices: np.ndarray, with_labels: bool) -> Dict[str, torch.Tensor]:
         # --- Vectorized array indexing (the whole point) ---
         raw_positions = self._raw_positions[indices]            # (B, T, 2)
         wind_directions = self._wind_directions[indices]        # (B,)
@@ -282,6 +313,8 @@ class TransformerReplayBuffer:
             result["params"] = self._to_device(self._params[indices])
         if self._action_hist is not None:
             result["action_hist"] = self._to_device(self._action_hist[indices])
+        if with_labels and self._labels is not None:
+            result["labels"] = self._to_device(self._labels[indices])
 
         # --- Vectorized profile lookup + permutation ---
         if self.use_profiles:
@@ -392,11 +425,14 @@ class TransformerReplayBuffer:
             "meta_json": np.str_(json.dumps(extra_meta or {})),
             "cond_dim": np.int64(self.cond_dim),
             "action_hist_dim": np.int64(self.action_hist_dim),
+            "label_dim": np.int64(self.label_dim),
         }
         if self._params is not None:
             payload["params"] = self._params[:n]
         if self._action_hist is not None:
             payload["action_hist"] = self._action_hist[:n]
+        if self._labels is not None:
+            payload["labels"] = self._labels[:n]
         if self.use_profiles:
             payload["layout_indices"] = self._layout_indices[:n]
             payload["permutations"] = self._permutations[:n]
@@ -443,7 +479,8 @@ class TransformerReplayBuffer:
             _check("action_dim", self._actions.shape[2])
             # Stage 10 columns: files written before them carry no key (= 0),
             # so a cond-off buffer loads them and a cond-on buffer refuses.
-            for name, expected in (("cond_dim", self.cond_dim), ("action_hist_dim", self.action_hist_dim)):
+            for name, expected in (("cond_dim", self.cond_dim), ("action_hist_dim", self.action_hist_dim),
+                                   ("label_dim", self.label_dim)):
                 actual = int(data[name]) if name in data.files else 0
                 if actual != expected:
                     raise ValueError(
@@ -474,6 +511,8 @@ class TransformerReplayBuffer:
                 self._params[:n] = data["params"]
             if self._action_hist is not None:
                 self._action_hist[:n] = data["action_hist"]
+            if self._labels is not None:
+                self._labels[:n] = data["labels"]
 
             if self.use_profiles:
                 _check("n_layouts", self._padded_recep.shape[0])

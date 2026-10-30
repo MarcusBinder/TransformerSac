@@ -669,7 +669,20 @@ class Args:
                                   # Use for continuing an interrupted run; leave 0 for fine-tuning.
 
     # === Initial Exploration Mode ===
-    initial_exploration: str = "random"  # "random" = sample from action space, "policy" = use actor network (useful when resuming from checkpoint)
+    initial_exploration: str = "random"  # "random" = sample from action space, "policy" = use actor network (useful when resuming from checkpoint),
+    #                                      "lut" = lut3 teacher + exploration noise, labelled buffer, BC at learning_starts (helpers/lut_pretrain.py)
+    # lutpre1 (--initial_exploration lut only): AR(1) exploration offset on the lut3 TARGET (deg, s)
+    lut_noise_deg: float = 3.0
+    lut_noise_tau_s: float = 60.0
+    # Teacher table point (ws, TI); None = the residual prior's point (midpoints of the training bands)
+    lut_teacher_ws: Optional[float] = None
+    lut_teacher_ti: Optional[float] = None
+    # BC at learning_starts: actor mean -> clean label (MSE in squashed space), pre-tanh std -> bc_std
+    bc_steps: int = 20000
+    bc_lr: float = 3e-4
+    bc_batch_size: int = 256
+    bc_std: float = 0.1
+    bc_std_coef: float = 0.1
 
     # === Replay Buffer Save/Load ===
     load_buffer: Optional[str] = None           # Path to a saved replay buffer (.npz). Loading skips the exploration phase (learning_starts -> 0).
