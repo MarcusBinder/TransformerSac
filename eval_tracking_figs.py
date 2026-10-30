@@ -168,11 +168,12 @@ def build_track3_env(args: dict, turbbox_path: str, obs_width: int | None = None
     # The trainer's layers (helpers/tracking_env_config.py): preset, action
     # method, the checkpoint's turbine model (flags absent for runs saved
     # before them) with the turbine parameters as dwm_params into the env
-    # kwargs, the reward/wind flags and env_overrides, so the greedy probe
-    # below and the rollout env both run the env the policy was trained on.
-    # Checkpoints trained before the trainer applied the reward flags
-    # (TransformerSac b08a4ac and earlier) saved them without using them, so
-    # their rollouts here show the flagged reward, not the trained one.
+    # kwargs, the derate slew, the reward/wind flags and env_overrides, so the
+    # greedy probe below and the rollout env both run the env the policy was
+    # trained on. Checkpoints trained before the trainer applied the reward
+    # flags and --derate_step_sim (TransformerSac b08a4ac and earlier) saved
+    # them without using them, so their rollouts here use the flagged reward
+    # and slew, not the trained ones.
     config, turbine_model_kwargs = build_tracking_env_config(args)
 
     if obs_width is not None:

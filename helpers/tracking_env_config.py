@@ -5,13 +5,15 @@ Shared by ``transformer_sac_windfarm_tracking.py`` and
 same layers it was trained with:
 
 1. the named preset (``--config``), with ``ActionMethod`` from ``--action_type``;
-2. the turbine model (``--derate_reference``, ``--turbine_params``);
+2. the turbine model (``--derate_reference``, ``--turbine_params``) and the
+   derate slew (``--derate_step_sim``, as the yaw trainers apply it);
 3. the reward / wind / yaw-band flags of ``_OVERRIDE_MAP`` (``--power_avg``,
    ``--power_scaling``, ``--action_penalty``, ...; None = keep the preset);
 4. ``--env_overrides``, the most specific layer.
 
-Until this helper existed the tracking trainer skipped layer 3, so those flags
-were parsed, saved in the checkpoint args and silently dropped.
+Until this helper existed the tracking trainer skipped layer 3 and
+``--derate_step_sim``, so those flags were parsed, saved in the checkpoint args
+and silently dropped.
 """
 from __future__ import annotations
 
@@ -34,6 +36,9 @@ def build_tracking_env_config(args) -> tuple[dict, dict]:
         derate_reference=_arg(args, "derate_reference"),
         turbine_params=_arg(args, "turbine_params"),
     )
+    derate_step_sim = _arg(args, "derate_step_sim")
+    if derate_step_sim is not None:
+        config["derate_step_sim"] = derate_step_sim
     apply_config_overrides(config, args)
     apply_env_overrides(config, _arg(args, "env_overrides"))
     return config, turbine_model_kwargs

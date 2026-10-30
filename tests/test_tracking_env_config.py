@@ -2,9 +2,9 @@
 
 The tracking trainer once built its config inline and skipped
 ``apply_config_overrides``, so ``--power_avg`` / ``--action_penalty`` /
-``--power_scaling`` were parsed, saved in the checkpoint and dropped. These tests
-pin the layer order through the real CLI and check that the trainer and the eval
-rebuild both use the helper.
+``--power_scaling`` / ``--derate_step_sim`` were parsed, saved in the checkpoint
+and dropped. These tests pin the layer order through the real CLI and check that
+the trainer and the eval rebuild both use the helper.
 """
 import sys
 from pathlib import Path
@@ -58,6 +58,13 @@ def test_turbine_model_layer():
     config, kwargs = build_tracking_env_config(args)
     assert config["derate_reference"] == "setpoint"
     assert kwargs == {"dwm_params": {"tau_ct": 10.0}}
+
+
+def test_derate_step_sim_reaches_the_config():
+    config, _ = build_tracking_env_config(parse())
+    assert "derate_step_sim" not in config
+    config, _ = build_tracking_env_config(parse("--derate_step_sim", "0.05"))
+    assert config["derate_step_sim"] == 0.05
 
 
 def test_checkpoint_args_dict_gives_the_same_config():
