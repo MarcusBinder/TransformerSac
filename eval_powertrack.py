@@ -49,9 +49,11 @@ class TrackingPolicy:
         obs_width = checkpoint["actor_state_dict"]["obs_encoder.0.weight"].shape[1]
         # The training env, rebuilt for its observation layout and wrapper
         # stack (build_track3_env also runs its greedy probe, unused here; the
-        # rollout itself runs in powertrack's env).
+        # rollout itself runs in powertrack's env). Without turbulence: the
+        # field does not change the layout, and a MannLoad run's training boxes
+        # (job scratch) are gone by eval time.
         base_env, wrapped_env, rotor_diameter, _ = build_track3_env(
-            args, "./boxes/", obs_width=obs_width
+            {**args, "TI_type": "None"}, "./boxes/", obs_width=obs_width
         )
         actor, agent = build_agent(args, wrapped_env, rotor_diameter, device)
         actor.load_state_dict(checkpoint["actor_state_dict"])
