@@ -43,3 +43,21 @@ def test_on_at_the_boundary_interval_equals_total():
 def test_eval_initial_forces_on_even_with_huge_interval():
     a = _args(eval_initial=True, eval_interval=1_000_000_000, total_timesteps=50_000)
     assert tsw.in_training_eval_enabled(a) is True
+
+
+def test_periodic_eval_never_due_when_gate_is_off_even_past_the_interval():
+    # Optuna v3h (2026-10-30): eval_interval = total + 1 turns eval off, but
+    # the loop runs num_updates + 2 iterations, so global_step passes 300001
+    # (at 300030) and the periodic eval fired with no evaluators built (eval_metrics None,
+    # AttributeError after the last checkpoint, rc 1, every trial FAIL).
+    a = _args(eval_initial=False, eval_interval=300_001, total_timesteps=300_000, num_envs=30)
+    gate = tsw.in_training_eval_enabled(a)
+    # the RL loop always runs num_updates + 2 iterations of num_envs steps
+    last_step = (a.total_timesteps // a.num_envs + 2) * a.num_envs
+    assert gate is False and last_step >= a.eval_interval
+    assert tsw.periodic_eval_due(gate, last_step, a.eval_interval) is False
+
+
+def test_periodic_eval_due_when_gate_is_on():
+    assert tsw.periodic_eval_due(True, 50_010, 50_000) is True
+    assert tsw.periodic_eval_due(True, 49_980, 50_000) is False

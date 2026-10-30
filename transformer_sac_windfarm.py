@@ -286,6 +286,13 @@ def in_training_eval_enabled(args) -> bool:
     return bool(args.eval_initial) or (args.eval_interval <= args.total_timesteps)
 
 
+def periodic_eval_due(eval_enabled: bool, global_step: int, next_eval_step: int) -> bool:
+    """True iff the periodic eval runs at this step. The gate wins: the RL loop
+    runs num_updates + 2 iterations, so global_step passes eval_interval = total
+    + 1, where no evaluators exist (in_training_eval_enabled False)."""
+    return bool(eval_enabled) and global_step >= next_eval_step
+
+
 def build_dr_layout_pool(args, wind_turbine, build=None):
     """Stage 14: the domain-randomization layout pool as ``(name, x, y)`` tuples.
 
@@ -3666,7 +3673,7 @@ def main():
         # PERIODIC EVALUATION
         # =====================================================================
         
-        if global_step >= next_eval_step:
+        if periodic_eval_due(eval_enabled, global_step, next_eval_step):
             print(f"\nRunning evaluation at step {global_step}...")
             _t_eval0 = time.time()
             eval_dict, eval_metrics = run_all_evaluations()
