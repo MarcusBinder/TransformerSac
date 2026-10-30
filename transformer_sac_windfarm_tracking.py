@@ -78,8 +78,7 @@ from torch.utils.tensorboard import SummaryWriter
 from WindGym import WindFarmEnv
 from WindGym.wrappers import RecordEpisodeVals, PerTurbineObservationWrapper
 from helpers.agent import WindFarmAgent
-from helpers.turbine_model import apply_turbine_model
-from helpers.env_overrides import apply_env_overrides
+from helpers.tracking_env_config import build_tracking_env_config
 
 # Logging utilities for multi-layout training
 from helpers.multi_layout_debug import (
@@ -103,7 +102,6 @@ from helpers.helper_funcs import (
     soft_update,
 )
 from helpers.layouts import get_layout_positions
-from helpers.env_configs import make_env_config
 
 # Power-tracking / derate-only helpers (see module docstring).
 from helpers.derating_turbine import make_derating_turbine
@@ -364,24 +362,17 @@ def main():
 
     # Environment configuration
     print(f"using the config: {args.config}")
-    config = make_env_config(args.config)
-
-    # Override ActionMethod from args (default "wind", or overridden by checkpoint above)
-    config["ActionMethod"] = args.action_type
+    # Preset + ActionMethod (default "wind", or overridden by checkpoint above)
+    # + turbine model (--derate_reference, --turbine_params -> dwm_params) +
+    # reward/wind flags (--power_avg, --action_penalty, ...; prints "Config
+    # overrides: ...") + --env_overrides (preset keys without a flag). Applied
+    # to config / base_env_kwargs BEFORE the greedy probe env is snapshotted
+    # from them, so greedy is measured with the same turbine model the agent
+    # trains on.
+    config, turbine_model_kwargs = build_tracking_env_config(args)
     print(f"ActionMethod set to: {config['ActionMethod']}")
-    # Turbine model: --derate_reference overrides the preset's key and
-    # --turbine_params (JSON) becomes dwm_params; applied to config /
-    # base_env_kwargs BEFORE the greedy probe env is snapshotted from them, so
-    # greedy is measured with the same turbine model the agent trains on.
-    turbine_model_kwargs = {}
-    apply_turbine_model(
-        config, turbine_model_kwargs,
-        derate_reference=args.derate_reference, turbine_params=args.turbine_params,
-    )
     print(f"derate_reference: {config.get('derate_reference', 'available')}; "
           f"dwm_params: {turbine_model_kwargs.get('dwm_params', {})}")
-    # Preset keys without a flag (derate_max, derate_penalty, track_def, ...).
-    apply_env_overrides(config, args.env_overrides)
     if args.env_overrides.strip() not in ("", "{}"):
         print(f"env_overrides applied: {args.env_overrides}")
     

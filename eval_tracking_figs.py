@@ -49,15 +49,13 @@ import torch
 from config import Args
 from networks import TransformerActor, create_profile_encoding
 from helpers.agent import WindFarmAgent
-from helpers.env_configs import make_env_config
 from helpers.helper_funcs import EnhancedPerTurbineWrapper
 from helpers.derating_turbine import (
     make_derating_turbine,
     make_operating_point_lookup_for,
 )
 from helpers.power_ref import build_power_ref, measure_greedy
-from helpers.turbine_model import apply_turbine_model
-from helpers.env_overrides import apply_env_overrides
+from helpers.tracking_env_config import build_tracking_env_config
 from WindGym import WindFarmEnv, AgentEvalFast
 from WindGym.farm_eval import FarmEval
 from WindGym.wrappers import PerTurbineObservationWrapper
@@ -167,19 +165,15 @@ def build_track3_env(args: dict, turbbox_path: str, obs_width: int | None = None
             f"Checkpoint config is {args['config']!r}, expected a "
             "power_tracking* preset -- this script only evals tracking runs."
         )
-    config = make_env_config(args["config"])
-    config["ActionMethod"] = args["action_type"]
-    # The checkpoint's turbine model (flags absent for runs saved before them):
-    # the reference into the config, the turbine parameters as dwm_params into
-    # the env kwargs, so the greedy probe below and the rollout env both run
-    # the model the policy was trained on.
-    turbine_model_kwargs = {}
-    apply_turbine_model(
-        config, turbine_model_kwargs,
-        derate_reference=args.get("derate_reference"),
-        turbine_params=args.get("turbine_params"),
-    )
-    apply_env_overrides(config, args.get("env_overrides"))
+    # The trainer's layers (helpers/tracking_env_config.py): preset, action
+    # method, the checkpoint's turbine model (flags absent for runs saved
+    # before them) with the turbine parameters as dwm_params into the env
+    # kwargs, the reward/wind flags and env_overrides, so the greedy probe
+    # below and the rollout env both run the env the policy was trained on.
+    # Checkpoints trained before the trainer applied the reward flags
+    # (TransformerSac b08a4ac and earlier) saved them without using them, so
+    # their rollouts here show the flagged reward, not the trained one.
+    config, turbine_model_kwargs = build_tracking_env_config(args)
 
     if obs_width is not None:
         # Per-turbine token = 3 sensors (ws/power/yaw) x samples + broadcast
