@@ -1173,7 +1173,9 @@ def main():
         print(f"\n{'='*60}")
         print(f"LOADING REPLAY BUFFER")
         print(f"{'='*60}")
-        buffer_meta_loaded = rb.load(args.load_buffer)
+        if len(args.load_buffer) != 1:
+            raise ValueError("this trainer loads ONE --load_buffer (pooling is the lut dataset path)")
+        buffer_meta_loaded = rb.load(args.load_buffer[0])
 
         if buffer_meta_loaded.get("layouts") != args.layouts:
             raise ValueError(

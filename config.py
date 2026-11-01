@@ -683,10 +683,17 @@ class Args:
     bc_batch_size: int = 256
     bc_std: float = 0.1
     bc_std_coef: float = 0.1
+    # lutpre2: with --load_buffer of lut datasets, fit BC, save bc.pt and exit (no RL)
+    bc_only: bool = False
 
     # === Replay Buffer Save/Load ===
-    load_buffer: Optional[str] = None           # Path to a saved replay buffer (.npz). Loading skips the exploration phase (learning_starts -> 0).
-    save_buffer_at_learning_starts: bool = False  # Save the replay buffer once global_step reaches learning_starts (buffer pre-generation)
+    # Path(s) to saved replay buffers (.npz). Loading skips the exploration phase (learning_starts -> 0),
+    # except for lut datasets under --initial_exploration lut (lutpre2): those keep learning_starts, the
+    # step counter starts at the warm-up's end (BC at the first iteration), and several paths pool
+    # (rows appended; dataset fingerprints must agree except wd function / wd band / seed).
+    load_buffer: Optional[Tuple[str, ...]] = None
+    save_buffer_at_learning_starts: bool = False  # Save the replay buffer once global_step reaches learning_starts (buffer pre-generation;
+                                                  # under --initial_exploration lut: BEFORE BC, the teacher rows only)
     buffer_only: bool = False                   # With save_buffer_at_learning_starts: exit right after saving (generation-only run)
     save_buffer_final: bool = False             # Save the replay buffer at the end of training (for splitting runs across cluster jobs)
     buffer_save_interval: int = 0               # If > 0, periodically save the buffer every N steps (overwrites runs/{run_name}/replay_buffer.npz). 0 = disabled.

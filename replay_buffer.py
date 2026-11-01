@@ -448,17 +448,19 @@ class TransformerReplayBuffer:
         size_mb = os.path.getsize(path) / 1e6
         print(f"[ReplayBuffer] Saved {n} transitions to {path} ({size_mb:.1f} MB)")
 
-    def load(self, path: str) -> dict:
+    def load(self, path: str, append: bool = False) -> dict:
         """
         Load transitions from a .npz file (created by save()) into this buffer.
 
         The buffer must already be constructed with a compatible configuration
         (same max_turbines/obs_dim/action_dim/use_profiles, and for profiles
         the same registry layout count and direction resolution). Existing
-        contents are overwritten.
+        contents are overwritten, unless ``append``.
 
         Args:
             path: Source .npz path
+            append: lutpre2 pooling -- write the rows after the stored ones
+                (the buffer must not have wrapped, and the sum must fit)
 
         Returns:
             The extra_meta dict that was passed to save()
@@ -493,39 +495,47 @@ class TransformerReplayBuffer:
                     f"{bool(data['use_profiles'])}, current buffer expects "
                     f"{self.use_profiles} ({path})"
                 )
-            if n > self.capacity:
+            start = 0
+            if append:
+                if self.size == self.capacity or self.position != self.size:
+                    raise ValueError(f"cannot append {path}: the buffer has wrapped "
+                                     f"(size {self.size}, position {self.position})")
+                start = self.size
+            if start + n > self.capacity:
                 raise ValueError(
-                    f"Saved buffer holds {n} transitions but capacity is only "
-                    f"{self.capacity}. Increase --buffer_size."
+                    f"Saved buffer holds {n} transitions (+ {start} already stored) but "
+                    f"capacity is only {self.capacity}. Increase --buffer_size."
                 )
+            sl = slice(start, start + n)
 
-            self._obs[:n] = data["obs"]
-            self._next_obs[:n] = data["next_obs"]
-            self._actions[:n] = data["actions"]
-            self._rewards[:n] = data["rewards"]
-            self._dones[:n] = data["dones"]
-            self._raw_positions[:n] = data["raw_positions"]
-            self._attention_mask[:n] = data["attention_mask"]
-            self._wind_directions[:n] = data["wind_directions"]
+            self._obs[sl] = data["obs"]
+            self._next_obs[sl] = data["next_obs"]
+            self._actions[sl] = data["actions"]
+            self._rewards[sl] = data["rewards"]
+            self._dones[sl] = data["dones"]
+            self._raw_positions[sl] = data["raw_positions"]
+            self._attention_mask[sl] = data["attention_mask"]
+            self._wind_directions[sl] = data["wind_directions"]
             if self._params is not None:
-                self._params[:n] = data["params"]
+                self._params[sl] = data["params"]
             if self._action_hist is not None:
-                self._action_hist[:n] = data["action_hist"]
+                self._action_hist[sl] = data["action_hist"]
             if self._labels is not None:
-                self._labels[:n] = data["labels"]
+                self._labels[sl] = data["labels"]
 
             if self.use_profiles:
                 _check("n_layouts", self._padded_recep.shape[0])
                 _check("n_dirs", self._n_dirs)
-                self._layout_indices[:n] = data["layout_indices"]
-                self._permutations[:n] = data["permutations"]
+                self._layout_indices[sl] = data["layout_indices"]
+                self._permutations[sl] = data["permutations"]
 
             meta = json.loads(str(data["meta_json"]))
 
-        self.size = n
-        self.position = n % self.capacity
+        self.size = start + n
+        self.position = self.size % self.capacity
 
-        print(f"[ReplayBuffer] Loaded {n} transitions from {path}")
+        print(f"[ReplayBuffer] Loaded {n} transitions from {path}"
+              + (f" (appended after {start})" if append else ""))
         return meta
 
     def __len__(self) -> int:

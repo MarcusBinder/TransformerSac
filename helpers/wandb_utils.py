@@ -21,7 +21,21 @@ from typing import Optional
 # Everything reaches W&B through sync_tensorboard, so the TB tag is the W&B key
 # and the TB step arrives as "global_step"; these groups chart against it.
 STEP_METRIC_GROUPS = ("perf/*", "actions/*", "del/*", "losses/*",
-                      "charts/*", "entropy/*", "timing/*", "eval/*", "eval_dr/*")
+                      "charts/*", "entropy/*", "timing/*", "eval/*", "eval_dr/*",
+                      # lutpre2: logged during the lut warm-up too
+                      "teacher/*", "yaw/*", "yaw_env0/*", "action/*")
+# lutpre2: the BC fit logs bc/step = its own iteration next to every bc/* scalar (BC runs between
+# two env steps, so global_step cannot be its x-axis).
+BC_STEP_METRIC = "bc/step"
+
+
+def define_step_metrics(wandb) -> None:
+    """Chart every STEP_METRIC_GROUPS group against global_step and bc/* against bc/step."""
+    wandb.define_metric("global_step")
+    for group in STEP_METRIC_GROUPS:
+        wandb.define_metric(group, step_metric="global_step")
+    wandb.define_metric(BC_STEP_METRIC)
+    wandb.define_metric("bc/*", step_metric=BC_STEP_METRIC)
 
 
 def wandb_init_kwargs(init_json: Optional[str], config: dict) -> dict:

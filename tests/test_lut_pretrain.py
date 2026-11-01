@@ -207,6 +207,8 @@ def test_multilayout_teacher_actions_are_token_ordered_padded_and_round_trip(win
         venv = gym.vector.SyncVectorEnv([lambda: env])
         (lab_v, exp_v), = venv.call("teacher_actions")
         np.testing.assert_allclose(lab_v, label)
+        (stats_v,) = venv.call("teacher_stats")                 # lutpre2 warm-up logging
+        assert stats_v == inner.teacher_stats()
         for _ in range(30):                                     # token-order actions reach the target
             _, explore = env.teacher_actions()
             *_, term, trunc, _ = env.step(explore)
@@ -313,7 +315,6 @@ def _args(**kw):
     ({"wd_source": "true"}, "wd_source"),
     ({"backend": "pywake"}, "pywake"),
     ({"action_prior": "lut3"}, "action_prior"),
-    ({"load_buffer": "x.npz"}, "load_buffer"),
     ({"action_type": "absolute"}, "action_type"),
     ({"learning_starts": 0}, "learning_starts"),
     ({"bc_steps": -1}, "bc_steps"),
@@ -347,3 +348,197 @@ def test_deg_per_action_unit():
     from helpers.lut_pretrain import deg_per_action_unit
     assert deg_per_action_unit("wind", yaw_min=-45.0, yaw_max=45.0, yaw_step_env=5.0) == 45.0
     assert deg_per_action_unit("yaw", yaw_min=-45.0, yaw_max=45.0, yaw_step_env=5.0) == 5.0
+
+
+# --------------------------------------------------------------------------- lutpre2: datasets
+def _full_args(**kw):
+    from config import Args
+    a = Args()
+    a.initial_exploration, a.wd_source, a.action_type = "lut", "est", "yaw"
+    a.learning_starts, a.num_envs, a.total_timesteps = 50_000, 30, 290_000
+    a.ti_min = a.ti_max = 0.0498
+    a.train_wd_function = "mix_cycle_richards_phase"
+    a.wd_min = a.wd_max = 270.0
+    for k, v in kw.items():
+        setattr(a, k, v)
+    return a
+
+
+def test_dataset_fingerprint_keys_exist_skip_the_poolable_axes_and_hash_stably():
+    import dataclasses
+    from config import Args
+    from helpers.lut_pretrain import DATASET_FP_KEYS, POOLABLE_KEYS, dataset_fingerprint, fingerprint_hash
+    names = {f.name for f in dataclasses.fields(Args)}
+    assert set(DATASET_FP_KEYS) <= names, set(DATASET_FP_KEYS) - names
+    assert set(POOLABLE_KEYS) <= names and not set(POOLABLE_KEYS) & set(DATASET_FP_KEYS)
+    for k in ("ti_min", "ti_max", "yaw_step", "action_type", "lut_noise_deg", "obs_agg", "turb_dr",
+              "dr_keys", "yaw_frame_source", "layouts", "config"):
+        assert k in DATASET_FP_KEYS, k
+    a = _full_args(turb_dr=("tau_yaw=0:20",), dr_keys=("k1", "k2"))
+    fp = dataset_fingerprint(a)
+    assert fp["turb_dr"] == ["tau_yaw=0:20"] and fp["ti_min"] == 0.0498
+    h = fingerprint_hash(fp)
+    assert len(h) == 12
+    b = _full_args(turb_dr=("tau_yaw=0:20",), dr_keys=("k1", "k2"), seed=7,
+                   train_wd_function="mix_static_richards_long", wd_min=235.0, wd_max=270.0,
+                   policy_lr=1e-5, total_timesteps=10, num_envs=4)
+    assert fingerprint_hash(dataset_fingerprint(b)) == h            # poolable / RL-only args
+    assert fingerprint_hash(dataset_fingerprint(_full_args(ti_min=0.038))) != h
+
+
+def _meta(args, **kw):
+    from helpers.lut_pretrain import dataset_fingerprint, fingerprint_hash
+    fp = dataset_fingerprint(args)
+    m = {"warmup_policy": "lut", "action_type": args.action_type, "dataset_fingerprint": fp,
+         "dataset_fp_hash": fingerprint_hash(fp), "label_rows": 100, "seed": args.seed,
+         "train_wd_function": args.train_wd_function}
+    m.update(kw)
+    return m
+
+
+def test_check_dataset_meta_accepts_the_poolable_axes_and_refuses_the_rest():
+    from helpers.lut_pretrain import check_dataset_meta
+    run = _full_args()
+    check_dataset_meta(_meta(_full_args(seed=3, train_wd_function="mix_static_richards_ends")), run, "d.npz")
+    check_dataset_meta(_meta(_full_args(wd_min=235.0, wd_max=270.0)), run, "d.npz")
+    with pytest.raises(ValueError, match="ti_min"):
+        check_dataset_meta(_meta(_full_args(ti_min=0.038)), run, "d.npz")
+    with pytest.raises(ValueError, match="action_type"):
+        check_dataset_meta(_meta(_full_args(action_type="wind")), run, "d.npz")
+    with pytest.raises(ValueError, match="warmup_policy"):
+        check_dataset_meta(_meta(run, warmup_policy="random"), run, "d.npz")
+    with pytest.raises(ValueError, match="fingerprint"):
+        m = _meta(run)
+        del m["dataset_fingerprint"]
+        check_dataset_meta(m, run, "d.npz")
+    with pytest.raises(ValueError, match="label"):
+        check_dataset_meta(_meta(run, label_rows=0), run, "d.npz")
+
+
+def test_validate_lut_args_accepts_a_dataset_and_its_refusals():
+    from helpers.lut_pretrain import validate_lut_args
+    validate_lut_args(_args(load_buffer=("a.npz", "b.npz")), {"farm": {}})
+    with pytest.raises(ValueError, match="obs_norm"):
+        validate_lut_args(_args(load_buffer=("a.npz",), obs_norm=True), {"farm": {}})
+    with pytest.raises(ValueError, match="bc_only"):
+        validate_lut_args(_args(initial_exploration="random", bc_only=True), {"farm": {}})
+    with pytest.raises(ValueError, match="bc_only"):
+        validate_lut_args(_args(bc_only=True), {"farm": {}})             # BC from what? no dataset
+    validate_lut_args(_args(bc_only=True, load_buffer=("a.npz",)), {"farm": {}})
+
+
+def test_dataset_start_step_puts_bc_at_lutpre1s_first_iteration_and_the_freeze_after_it():
+    from helpers.lut_pretrain import dataset_start_step
+    from helpers.training_utils import actor_update_allowed
+    s0 = dataset_start_step(50_000, 30)
+    assert s0 == 49_980                      # lutpre1's last warm-up step: 1666 x 30
+    first = s0 + 30
+    assert first >= 50_000 and first - 30 < 50_000      # BC fires at the first iteration
+    a = SimpleNamespace(learning_starts=50_000, finetune_freeze_actor_steps=50_000)
+    assert not actor_update_allowed(first, a)
+    assert not actor_update_allowed(99_990, a) and actor_update_allowed(100_020, a)
+    assert dataset_start_step(600, 2) == 598 and dataset_start_step(1000, 3) == 999
+
+
+def test_dataset_capacity_check():
+    from helpers.lut_pretrain import check_dataset_capacity
+    a = _full_args(buffer_size=300_000)
+    check_dataset_capacity([49_980], a, start_step=49_980)                 # 49,980 + 240,060 fits
+    # the loop runs num_updates + 2 iterations: (240,020 // 30 + 2) x 30 = 240,060 RL rows
+    with pytest.raises(ValueError, match="buffer_size.*390000"):
+        check_dataset_capacity([49_980] * 3, a, start_step=49_980)
+    a.buffer_size = 290_000                    # rows + (total - start) fits, the 2 extra iterations do not
+    with pytest.raises(ValueError, match="290040"):
+        check_dataset_capacity([49_980], a, start_step=49_980)
+    a.buffer_size = 300_000
+    a.bc_only = True
+    check_dataset_capacity([49_980] * 3, a, start_step=49_980)             # no RL rows
+
+
+class _Writer:
+    def __init__(self):
+        self.rows = []
+
+    def add_scalar(self, tag, value, step):
+        self.rows.append((tag, float(value), int(step)))
+
+
+def test_bc_logs_every_log_every_steps_on_bc_step_with_the_holdout_breakdown():
+    from config import Args
+    from networks import TransformerActor
+    from helpers.lut_pretrain import run_bc
+    torch.manual_seed(0)
+    rng = np.random.default_rng(0)
+    rb = _rb(label_dim=1, cap=400)
+    mask = np.array([False, False, False])
+    pos = np.array([[0.0, 0.0], [500.0, 0.0], [1000.0, 0.0]], np.float32)
+    for i in range(400):
+        o = rng.uniform(-1, 1, (3, 4)).astype(np.float32)
+        wd = (270.0, 250.0, 236.0)[i % 3]
+        rb.add(o, o, np.zeros((3, 1)), 0.0, False, pos, mask, wd, label=np.full((3, 1), 0.2, np.float32))
+    actor = TransformerActor(obs_dim_per_turbine=4, action_dim_per_turbine=1, embed_dim=16,
+                             num_heads=2, num_layers=1, args=Args())
+    w = _Writer()
+    stats = run_bc(actor, rb, steps=60, lr=1e-3, batch_size=32, std=0.1, std_coef=0.1, deg_per_unit=5.0,
+                   device=torch.device("cpu"), holdout_frac=0.25, writer=w, log_every=25)
+    steps = sorted({s for t, _, s in w.rows if t == "bc/step"})
+    assert steps == [0, 25, 50, 59]
+    assert all(v == s for t, v, s in w.rows if t == "bc/step")
+    tags = {t for t, _, _ in w.rows}
+    for sub in ("wd_ge265", "wd_ramp", "wd_le240", "front", "mid", "back"):
+        assert f"bc/rms_deg_holdout_{sub}" in tags, sub
+        assert np.isfinite(stats[f"rms_deg_holdout_{sub}"]), sub
+
+
+def test_holdout_groups_split_wd_bands_and_x_terciles():
+    from helpers.lut_pretrain import holdout_groups
+    wd = np.array([270.0, 265.0, 250.0, 240.0, 236.0])
+    x = np.array([[1000.0, 0.0, 500.0], [0.0, 500.0, 1000.0], [0, 1, 2], [0, 1, 2], [0, 1, 2]])
+    real = np.ones((5, 3), bool)
+    g = holdout_groups(wd, x, real)
+    np.testing.assert_array_equal(g["wd_ge265"], [1, 1, 0, 0, 0])
+    np.testing.assert_array_equal(g["wd_ramp"], [0, 0, 1, 0, 0])
+    np.testing.assert_array_equal(g["wd_le240"], [0, 0, 0, 1, 1])
+    np.testing.assert_array_equal(g["front"][:2], [[0, 1, 0], [1, 0, 0]])
+    np.testing.assert_array_equal(g["back"][:2], [[1, 0, 0], [0, 0, 1]])
+    np.testing.assert_array_equal(g["mid"][:2], [[0, 0, 1], [0, 1, 0]])
+
+
+def test_teacher_stats_report_the_noise_and_target_in_degrees(wind_turbine):
+    from helpers.lut_pretrain import LutTeacherWrapper
+    env = LutTeacherWrapper(_windfarm_env(wind_turbine, "wind"), _ctrl(), noise_deg=3.0, noise_tau_s=60.0)
+    try:
+        env.reset(seed=0)
+        s = env.teacher_stats()
+        assert s["noise_rms_deg"] == pytest.approx(float(np.sqrt(np.mean(env.noise.value ** 2))))
+        assert s["target_abs_mean_deg"] == pytest.approx(float(np.mean(np.abs(env.teacher_target()))))
+    finally:
+        env.close()
+
+
+def test_define_step_metrics_binds_bc_to_bc_step():
+    from helpers.wandb_utils import define_step_metrics
+    calls = []
+
+    class _W:
+        def define_metric(self, name, step_metric=None):
+            calls.append((name, step_metric))
+
+    define_step_metrics(_W())
+    d = dict(calls)
+    assert ("global_step", None) in calls and ("bc/step", None) in calls
+    assert d["bc/*"] == "bc/step"
+    for g in ("teacher/*", "yaw/*", "actions/*", "charts/*"):
+        assert d[g] == "global_step", g
+
+
+def test_dataset_fingerprint_resolves_the_history_n_coupling_like_the_trainer():
+    """The trainer sets history_N = history_length when it is None (after parsing); a driver that
+    fingerprints the raw argv must get the same hash (real-chain smoke 2026-11-01)."""
+    from helpers.lut_pretrain import dataset_fingerprint, fingerprint_hash
+    raw = _full_args(history_length=3, history_N=None)
+    resolved = _full_args(history_length=3, history_N=3)
+    assert fingerprint_hash(dataset_fingerprint(raw)) == fingerprint_hash(dataset_fingerprint(resolved))
+    assert dataset_fingerprint(raw)["history_N"] == 3
+    assert fingerprint_hash(dataset_fingerprint(_full_args(history_length=3, history_N=5))) != \
+        fingerprint_hash(dataset_fingerprint(resolved))

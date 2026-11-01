@@ -223,3 +223,36 @@ def test_old_file_without_cond_rejected_by_cond_buffer(tmp_path):
         _make_cond_buffer(cond_dim=12, action_hist_dim=0).load(str(p))
     with pytest.raises(ValueError, match="action_hist_dim"):
         _make_cond_buffer(cond_dim=0, action_hist_dim=15).load(str(p))
+
+
+# --------------------------------------------------------------------------- lutpre2: pooling
+def test_load_append_pools_two_files_in_order(tmp_path):
+    """lutpre2: --load_buffer a b appends b's rows after a's (the dataset library pools)."""
+    a, b = _make_buffer(capacity=30), _make_buffer(capacity=30)
+    _fill(a, 20, seed=1)
+    _fill(b, 15, seed=2)
+    pa, pb = str(tmp_path / "a.npz"), str(tmp_path / "b.npz")
+    a.save(pa, extra_meta={"tag": "a"})
+    b.save(pb, extra_meta={"tag": "b"})
+    rb = _make_buffer(capacity=40)
+    assert rb.load(pa)["tag"] == "a"
+    assert rb.load(pb, append=True)["tag"] == "b"
+    assert len(rb) == 35 and rb.position == 35
+    for name in DATA_ARRAYS:
+        np.testing.assert_array_equal(getattr(rb, name)[:20], getattr(a, name)[:20])
+        np.testing.assert_array_equal(getattr(rb, name)[20:35], getattr(b, name)[:15])
+
+
+def test_load_append_refuses_overflow_and_a_wrapped_buffer(tmp_path):
+    a = _make_buffer(capacity=30)
+    _fill(a, 20)
+    pa = str(tmp_path / "a.npz")
+    a.save(pa)
+    rb = _make_buffer(capacity=30)
+    rb.load(pa)
+    with pytest.raises(ValueError, match="capacity"):
+        rb.load(pa, append=True)                 # 40 rows > 30
+    wrapped = _make_buffer(capacity=10)
+    _fill(wrapped, 13)                           # position 3, size 10: wrapped
+    with pytest.raises(ValueError, match="wrapped"):
+        wrapped.load(pa, append=True)

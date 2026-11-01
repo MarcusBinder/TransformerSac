@@ -243,7 +243,7 @@ from helpers.env_configs import (
 )
 from helpers.metrics_jsonl import MetricsJsonl
 from helpers.eval_score import eval_scores, load_score_ref
-from helpers.wandb_utils import STEP_METRIC_GROUPS, init_wandb, wandb_init_kwargs
+from helpers.wandb_utils import define_step_metrics, init_wandb, wandb_init_kwargs
 
 # Receptivity profile computation
 from helpers.receptivity_profiles import compute_layout_profiles
@@ -875,6 +875,9 @@ def main():
     # residual prior's (env.wd_est_prior, tau 60 / front / deadband 0 = the harness lut3 feed).
     from helpers.lut_pretrain import validate_lut_args
     validate_lut_args(args, config)
+    # lutpre2: a run fed lut datasets (--load_buffer) never acts with the teacher (its step counter
+    # starts past the warm-up), so its envs carry no LutTeacherWrapper (no per-worker table build).
+    lut_dataset_mode = args.initial_exploration == "lut" and args.load_buffer is not None
     if args.initial_exploration == "lut":
         from helpers.action_prior import prior_wd_est_env_kwargs
         from helpers.lut_pretrain import teacher_point
@@ -947,7 +950,7 @@ def main():
                 _ctrl = build_prior_controller(wind_turbine, x_pos, y_pos, _ws, _ti,
                                                yaw_max=float(env_kwargs["config"]["farm"]["yaw_max"]))
                 env = ActionPriorWrapper(env, _ctrl, delta=float(args.action_prior_delta))
-            if args.initial_exploration == "lut" and teacher:
+            if args.initial_exploration == "lut" and teacher and not lut_dataset_mode:
                 # Same slot as the action prior (physical order, table once per worker).
                 # Actions pass through: the teacher only answers teacher_actions().
                 from helpers.action_prior import build_prior_controller
@@ -1535,10 +1538,8 @@ def main():
         # explicitly makes each one chart against global_step instead of
         # W&B's own monotonically-increasing _step, which otherwise spreads
         # metrics logged at different frequencies (per-iteration perf/* vs
-        # per-episode del/*) across mismatched x-axes.
-        wandb.define_metric("global_step")
-        for _group in STEP_METRIC_GROUPS:
-            wandb.define_metric(_group, step_metric="global_step")
+        # per-episode del/*) across mismatched x-axes. bc/* chart against bc/step.
+        define_step_metrics(wandb)
 
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
@@ -2135,14 +2136,16 @@ def main():
             # must never load into a yaw run) and the warm-up policy shapes its contents
             "action_type": args.action_type,
             "warmup_policy": args.initial_exploration,
+            # lutpre2: the dataset fingerprint (+ hash, label rows, the poolable axes)
+            **(dataset_meta(args, label_rows=len(rb.labelled_indices()))
+               if args.initial_exploration == "lut" else {}),
         }
 
-    if args.load_buffer is not None:
-        print(f"\n{'='*60}")
-        print(f"LOADING REPLAY BUFFER")
-        print(f"{'='*60}")
-        buffer_meta_loaded = rb.load(args.load_buffer)
+    from helpers.lut_pretrain import (check_dataset_capacity, check_dataset_meta, dataset_meta,
+                                      dataset_start_step)
+    _dataset_summary = None
 
+    def _check_loaded_buffer_meta(buffer_meta_loaded):
         if buffer_meta_loaded.get("cond_source", "none") != args.cond_source:
             raise ValueError(
                 f"Replay buffer was generated with cond_source="
@@ -2188,11 +2191,47 @@ def main():
             print(f"NOTE: buffer was generated with seed={buffer_meta_loaded.get('seed')}, "
                   f"this run uses seed={args.seed}.")
 
-        if args.learning_starts > 0:
+    if args.load_buffer is not None:
+        print(f"\n{'='*60}")
+        print(f"LOADING REPLAY BUFFER")
+        print(f"{'='*60}")
+        _buffer_paths = list(args.load_buffer)
+        if len(_buffer_paths) > 1 and not lut_dataset_mode:
+            raise ValueError("several --load_buffer paths pool lut datasets only "
+                             "(--initial_exploration lut)")
+        if lut_dataset_mode:
+            # lutpre2: refuse before allocating anything big if the pool + RL steps overflow
+            _rows = []
+            for _p in _buffer_paths:
+                with np.load(_p, allow_pickle=False) as _d:
+                    _rows.append(int(_d["size"]))
+            start_step = dataset_start_step(args.learning_starts, args.num_envs)
+            check_dataset_capacity(_rows, args, start_step)
+        for _ib, _p in enumerate(_buffer_paths):
+            buffer_meta_loaded = rb.load(_p, append=_ib > 0)
+            if lut_dataset_mode:
+                check_dataset_meta(buffer_meta_loaded, args, _p)
+            _check_loaded_buffer_meta(buffer_meta_loaded)
+        if lut_dataset_mode:
+            _lab = rb.labelled_indices()
+            _wd = rb._wind_directions[: len(rb)]
+            _wd_edges = (0.0, 240.0, 265.0, 360.0)
+            _dataset_summary = {
+                "dataset/n_files": len(_buffer_paths), "dataset/rows": int(len(rb)),
+                "dataset/labelled_rows": int(_lab.size),
+                **{f"dataset/wd_frac_{a:g}_{b:g}": float(np.mean((_wd >= a) & (_wd < b)))
+                   for a, b in zip(_wd_edges[:-1], _wd_edges[1:])},
+            }
+            print(f"lut datasets: {len(_buffer_paths)} file(s), {len(rb)} rows ({_lab.size} labelled); "
+                  f"step counter starts at {start_step} (warm-up end: BC at the first iteration, "
+                  f"actor frozen until {args.learning_starts + args.finetune_freeze_actor_steps}). "
+                  f"The envs start fresh: a dataset cannot restore mid-episode env state.")
+        elif args.learning_starts > 0:
             print(f"Loaded {len(rb)} transitions; skipping exploration phase "
                   f"(learning_starts: {args.learning_starts} -> 0)")
             args.learning_starts = 0
         print(f"{'='*60}\n")
+
 
 
     # =========================================================================
@@ -2571,6 +2610,101 @@ def main():
 
     bc_done = False
 
+    def _flush_yaw_stats(step: int) -> None:
+        """yaw/*, yaw_env0/*, action/* from the env-side accumulators (cleared here)."""
+        if not yaw_accumulator['yaw_abs_mean_deg']:
+            return
+        writer.add_scalar("yaw/abs_mean_deg", np.mean(yaw_accumulator['yaw_abs_mean_deg']), step)
+        writer.add_scalar("yaw/max_abs_deg", np.mean(yaw_accumulator['yaw_max_deg']), step)
+        writer.add_scalar("yaw/over_20_frac", np.mean(yaw_accumulator['yaw_over_20_frac']), step)
+        for t in range(n_turbines_max):
+            key = f'yaw_turb{t}_abs_deg'
+            if yaw_accumulator.get(key):
+                writer.add_scalar(f"yaw/turbine_{t}_abs_deg", np.mean(yaw_accumulator[key]), step)
+
+        for t in range(n_turbines_max):
+            key = f"yaw_env0_turb{t}_deg"
+            if yaw_accumulator.get(key):
+                writer.add_scalar(f"yaw_env0/turbine_{t}_deg", np.mean(yaw_accumulator[key]), step)
+                writer.add_histogram(
+                    f"yaw_env0_hist/turbine_{t}",
+                    np.array(yaw_accumulator[key]),
+                    step,
+                )
+
+        # Movement metrics: oscillation is visible here even when
+        # position stats (abs_mean/max) are flat.
+        yaw_move = yaw_tracker.compute_and_reset()
+        for k, v in yaw_move.items():
+            writer.add_scalar(f"yaw/{k}", v, step)
+        if 'travel_deg_per_step' in yaw_move:
+            # Matches the env's "change" penalty formula:
+            # action_penalty * mean(|yaw change|) per step. Logged
+            # even with penalty disabled ("what it would charge").
+            # action_penalty is Optional on the unified Args (None
+            # = preset value), so read the resolved config value.
+            # Under --curriculum lut the penalty sits inside r_env,
+            # i.e. it is weighted by w in the blended reward.
+            writer.add_scalar(
+                "yaw/penalty_reward_estimate",
+                float(config["act_pen"].get("action_penalty") or 0.0)
+                * yaw_move['travel_deg_per_step'],
+                step)
+        act_move = action_tracker.compute_and_reset()
+        if 'travel_deg_per_step' in act_move:
+            writer.add_scalar("action/delta_abs_mean",
+                              act_move['travel_deg_per_step'], step)
+        if 'reversal_rate' in act_move:
+            writer.add_scalar("action/reversal_rate",
+                              act_move['reversal_rate'], step)
+        if yaw_accumulator.get('action_saturation_frac'):
+            writer.add_scalar(
+                "action/saturation_frac",
+                np.mean(yaw_accumulator['action_saturation_frac']),
+                step)
+        yaw_accumulator.clear()
+
+    def _flush_action_stats(step: int) -> None:
+        """actions/* (mean / std / sat_frac per channel) from _act_acc (reset here)."""
+        if _act_acc["n"] > 0:
+            _an = _act_acc["n"]
+            for _ch in _act_cols:
+                _mean = _act_acc[f"{_ch}_sum"] / _an
+                _var = max(_act_acc[f"{_ch}_sq"] / _an - _mean * _mean, 0.0)
+                writer.add_scalar(f"actions/{_ch}_mean", _mean, step)
+                writer.add_scalar(f"actions/{_ch}_std", _var ** 0.5, step)
+                writer.add_scalar(f"actions/{_ch}_sat_frac",
+                                  _act_acc[f"{_ch}_sat"] / _an, step)
+            for _k in _act_acc:
+                _act_acc[_k] = 0.0
+
+    # lutpre2: teacher/* during the lut warm-up (label saturation summed per step, flushed
+    # with the env-side stats every 20 iterations = 600 steps at 30 envs)
+    _teacher_acc = {"sat": 0.0, "n": 0.0}
+
+    def _flush_warmup_stats(step: int, teacher_stats) -> None:
+        """The lut warm-up has no gradient burst, whose logging block flushes the env-side
+        stats: flush them here (+ teacher/*), so W&B sees the warm-up as it runs."""
+        sps = int((step - start_step) / max(time.time() - start_time, 1e-9))
+        writer.add_scalar("charts/SPS", sps, step)
+        writer.add_scalar("charts/step_reward_mean_1000",
+                          float(np.mean(step_reward_window)) if step_reward_window else 0.0, step)
+        _flush_yaw_stats(step)
+        _flush_action_stats(step)
+        if teacher_stats:
+            for _key in ("noise_rms_deg", "target_abs_mean_deg"):
+                writer.add_scalar(f"teacher/{_key}", float(np.mean([t[_key] for t in teacher_stats])), step)
+        if _teacher_acc["n"] > 0:
+            writer.add_scalar("teacher/label_sat_frac", _teacher_acc["sat"] / _teacher_acc["n"], step)
+        _teacher_acc["sat"] = _teacher_acc["n"] = 0.0
+        print(f"Step {step} (lut warm-up): SPS={sps}, rows={len(rb)}", flush=True)
+
+    def _close_and_exit(msg: str) -> None:
+        print(msg, flush=True)
+        close_all_evaluators()
+        envs.close()
+        writer.close()
+
     def run_lut_bc(step: int):
         """lutpre1: fit the actor to the warm-up's lut3 labels, save checkpoints/bc.pt and
         return a FRESH actor optimizer at --policy_lr (the BC Adam state is discarded)."""
@@ -2588,6 +2722,11 @@ def main():
         print(f"[lutpre] BC done in {time.time() - _t_bc:.0f} s: rms {_bc['rms_deg_train']:.3f} deg "
               f"(train) / {_bc['rms_deg_holdout']:.3f} deg (holdout, {_bc['n_holdout']} rows), "
               f"loss {_bc['loss']:.5f}", flush=True)
+        print("[lutpre] holdout rms (deg): " + "  ".join(
+            f"{k[len('rms_deg_holdout_'):]} {v:.3f}" for k, v in _bc.items()
+            if k.startswith("rms_deg_holdout_")), flush=True)
+        if args.track and _run is not None:
+            _run.summary.update({f"bc_final/{k}": v for k, v in _bc.items()})
         metrics_log.write("bc", step=int(step), **_bc)
         _new_opt = make_adam([p for p in actor.parameters() if id(p) not in shared_param_ids],
                              lr=args.policy_lr)
@@ -2603,6 +2742,20 @@ def main():
         print(f"[lutpre] saved {os.path.join(os.path.dirname(_path), 'bc.pt')}; actor optimizer "
               f"rebuilt at policy_lr {args.policy_lr:g}", flush=True)
         return _new_opt
+
+    if _dataset_summary is not None:
+        # lutpre2: what the loaded datasets hold (W&B run summary + stdout)
+        from helpers.lut_pretrain import deg_per_action_unit
+        _ys = float(envs.env.get_attr("yaw_step_env")[0]) if args.action_type == "yaw" else 0.0
+        _dpu = deg_per_action_unit(args.action_type, yaw_min=float(config["farm"]["yaw_min"]),
+                                   yaw_max=float(config["farm"]["yaw_max"]), yaw_step_env=_ys)
+        _li = rb.labelled_indices()
+        _real = ~rb._attention_mask[_li]
+        _dataset_summary["dataset/label_abs_mean_deg"] = float(np.abs(rb._labels[_li][_real]).mean() * _dpu)
+        print("[lutpre] dataset summary: " + ", ".join(f"{k} {v:.4g}" for k, v in _dataset_summary.items()),
+              flush=True)
+        if args.track and _run is not None:
+            _run.summary.update(_dataset_summary)
 
     for update in range(_rl_iterations):
         global_step += args.num_envs
@@ -2671,11 +2824,24 @@ def main():
         act_state = dict(wind_dirs=wind_dirs, raw_positions=raw_positions, masks=current_masks,
                         receptivity=current_receptivity, influence=current_influence,
                         params=current_params, action_hist=current_action_hist)
+        if (args.initial_exploration == "lut" and args.save_buffer_at_learning_starts
+                and not warmup_buffer_saved and global_step >= args.learning_starts):
+            # lutpre2: the warm-up dataset, BEFORE BC: exactly the teacher rows (all labelled;
+            # lutpre1 saved after this iteration's 30 BC-actor rows with NaN labels).
+            rb.save(f"runs/{run_name}/replay_buffer_warmup_{args.learning_starts}.npz",
+                    extra_meta=buffer_meta(global_step))
+            warmup_buffer_saved = True
+            if args.buffer_only:
+                _close_and_exit("\n--buffer_only set: lut warm-up dataset saved, exiting before BC.")
+                return
         if args.initial_exploration == "lut" and not bc_done and global_step >= args.learning_starts:
             # lutpre1 BC, once, at the first iteration past the warm-up: BEFORE the actor's first
             # action (and before step_async, so no env step is in flight). GPU only.
             actor_optimizer = run_lut_bc(global_step)
             bc_done = True
+            if args.bc_only:
+                _close_and_exit("\n--bc_only set: bc.pt saved, exiting before RL.")
+                return
         current_labels = None
         if global_step < args.learning_starts:
             if args.initial_exploration == "lut":
@@ -2685,6 +2851,12 @@ def main():
                 current_labels = np.stack([t[0] for t in _teach]).astype(np.float32)
                 actions = np.stack([t[1] for t in _teach]).astype(np.float32).reshape(
                     envs.action_space.shape)
+                # lutpre2 warm-up logging (all env IPC stays in this prefetch block)
+                _real = ~np.asarray(current_masks, dtype=bool).reshape(current_labels.shape[:2])
+                _teacher_acc["sat"] += float((np.abs(current_labels[_real]) >= 1.0 - 1e-6).sum())
+                _teacher_acc["n"] += float(current_labels[_real].size)
+                if update % 20 == 0:
+                    _flush_warmup_stats(global_step, envs.env.call("teacher_stats"))
             elif args.initial_exploration == "policy":
                 # Use the actor network (useful when resuming from checkpoint)
                 with torch.no_grad():
@@ -3142,7 +3314,7 @@ def main():
             # Logging
             # -----------------------------------------------------------------
             if update % 20 == 0:
-                sps = int(global_step / (time.time() - start_time))
+                sps = int((global_step - start_step) / (time.time() - start_time))
                 mean_reward = float(np.mean(step_reward_window)) if step_reward_window else 0.0
                 
                 # Average losses over the UTD updates: divide the GPU running-sums by
@@ -3220,56 +3392,7 @@ def main():
                 writer.add_scalar("debug/gradient_updates_per_iter", num_gradient_updates, global_step)
 
                 # Yaw statistics (per-step summaries + env0 per-turbine traces)
-                if yaw_accumulator['yaw_abs_mean_deg']:
-                    writer.add_scalar("yaw/abs_mean_deg", np.mean(yaw_accumulator['yaw_abs_mean_deg']), global_step)
-                    writer.add_scalar("yaw/max_abs_deg", np.mean(yaw_accumulator['yaw_max_deg']), global_step)
-                    writer.add_scalar("yaw/over_20_frac", np.mean(yaw_accumulator['yaw_over_20_frac']), global_step)
-                    for t in range(n_turbines_max):
-                        key = f'yaw_turb{t}_abs_deg'
-                        if yaw_accumulator.get(key):
-                            writer.add_scalar(f"yaw/turbine_{t}_abs_deg", np.mean(yaw_accumulator[key]), global_step)
-
-                    for t in range(n_turbines_max):
-                        key = f"yaw_env0_turb{t}_deg"
-                        if yaw_accumulator.get(key):
-                            writer.add_scalar(f"yaw_env0/turbine_{t}_deg", np.mean(yaw_accumulator[key]), global_step)
-                            writer.add_histogram(
-                                f"yaw_env0_hist/turbine_{t}",
-                                np.array(yaw_accumulator[key]),
-                                global_step,
-                            )
-
-                    # Movement metrics: oscillation is visible here even when
-                    # position stats (abs_mean/max) are flat.
-                    yaw_move = yaw_tracker.compute_and_reset()
-                    for k, v in yaw_move.items():
-                        writer.add_scalar(f"yaw/{k}", v, global_step)
-                    if 'travel_deg_per_step' in yaw_move:
-                        # Matches the env's "change" penalty formula:
-                        # action_penalty * mean(|yaw change|) per step. Logged
-                        # even with penalty disabled ("what it would charge").
-                        # action_penalty is Optional on the unified Args (None
-                        # = preset value), so read the resolved config value.
-                        # Under --curriculum lut the penalty sits inside r_env,
-                        # i.e. it is weighted by w in the blended reward.
-                        writer.add_scalar(
-                            "yaw/penalty_reward_estimate",
-                            float(config["act_pen"].get("action_penalty") or 0.0)
-                            * yaw_move['travel_deg_per_step'],
-                            global_step)
-                    act_move = action_tracker.compute_and_reset()
-                    if 'travel_deg_per_step' in act_move:
-                        writer.add_scalar("action/delta_abs_mean",
-                                          act_move['travel_deg_per_step'], global_step)
-                    if 'reversal_rate' in act_move:
-                        writer.add_scalar("action/reversal_rate",
-                                          act_move['reversal_rate'], global_step)
-                    if yaw_accumulator.get('action_saturation_frac'):
-                        writer.add_scalar(
-                            "action/saturation_frac",
-                            np.mean(yaw_accumulator['action_saturation_frac']),
-                            global_step)
-                    yaw_accumulator.clear()
+                _flush_yaw_stats(global_step)
 
                 if args.log_timing:
                     # env_span overlaps the other buckets (the burst runs inside
@@ -3362,17 +3485,7 @@ def main():
                 # "stuck at one derate level" failure; a sat_frac near 1 says
                 # the slew limit is binding rather than the policy choosing.
                 # -------------------------------------------------------------
-                if _act_acc["n"] > 0:
-                    _an = _act_acc["n"]
-                    for _ch in _act_cols:
-                        _mean = _act_acc[f"{_ch}_sum"] / _an
-                        _var = max(_act_acc[f"{_ch}_sq"] / _an - _mean * _mean, 0.0)
-                        writer.add_scalar(f"actions/{_ch}_mean", _mean, global_step)
-                        writer.add_scalar(f"actions/{_ch}_std", _var ** 0.5, global_step)
-                        writer.add_scalar(f"actions/{_ch}_sat_frac",
-                                          _act_acc[f"{_ch}_sat"] / _an, global_step)
-                    for _k in _act_acc:
-                        _act_acc[_k] = 0.0
+                _flush_action_stats(global_step)
 
                 print(f"Step {global_step}: SPS={sps}, qf_loss={mean_qf_loss:.4f}, "
                       f"actor_loss={mean_actor_loss:.4f}, alpha={alpha_val:.4f}, "
@@ -3718,6 +3831,7 @@ def main():
 
         # One-shot warmup buffer save (buffer pre-generation for ablation runs)
         if (args.save_buffer_at_learning_starts
+                and args.initial_exploration != "lut"     # lut: saved before BC (top of the loop)
                 and not warmup_buffer_saved
                 and global_step >= args.learning_starts):
             rb.save(
