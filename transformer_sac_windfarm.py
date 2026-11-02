@@ -2561,7 +2561,8 @@ def main():
     _acc_keys = _qf_keys + ['actor_loss', 'alpha_loss',
                             'logpi_per_turbine', 'ent_term', 'q_term', 'n_real_mean',
                             'q_mean', 'td_abs', 'td_sq',
-                            'critic_gnorm', 'actor_gnorm', 'target_entropy']
+                            'critic_gnorm', 'actor_gnorm', 'target_entropy',
+                            'bc_anchor', 'q_norm', 'bc_anchor_rms_deg']    # lutpre3 anchor (actor updates)
 
     def _zero_losses():
         return {k: torch.zeros((), device=device) for k in _acc_keys}
@@ -2609,6 +2610,8 @@ def main():
     current_action_hist = None
 
     bc_done = False
+    bc_anchor_actor = None      # lutpre3: the frozen bc.pt actor (--bc_anchor_coef > 0), set by run_lut_bc
+    bc_anchor_deg = 1.0         # degrees per squashed action unit (losses/bc_anchor_rms_deg)
 
     def _flush_yaw_stats(step: int) -> None:
         """yaw/*, yaw_env0/*, action/* from the env-side accumulators (cleared here)."""
@@ -2707,7 +2710,9 @@ def main():
 
     def run_lut_bc(step: int):
         """lutpre1: fit the actor to the warm-up's lut3 labels, save checkpoints/bc.pt and
-        return a FRESH actor optimizer at --policy_lr (the BC Adam state is discarded)."""
+        return a FRESH actor optimizer at --policy_lr (the BC Adam state is discarded), plus
+        (lutpre3) the frozen deep copy of the BC actor when --bc_anchor_coef > 0 (else None) and
+        the degrees per action unit."""
         from helpers.lut_pretrain import deg_per_action_unit, run_bc
         _yaw_step_env = float(envs.env.get_attr("yaw_step_env")[0]) if args.action_type == "yaw" else 0.0
         _deg = deg_per_action_unit(args.action_type, yaw_min=float(config["farm"]["yaw_min"]),
@@ -2741,7 +2746,15 @@ def main():
         os.replace(_path, os.path.join(os.path.dirname(_path), "bc.pt"))
         print(f"[lutpre] saved {os.path.join(os.path.dirname(_path), 'bc.pt')}; actor optimizer "
               f"rebuilt at policy_lr {args.policy_lr:g}", flush=True)
-        return _new_opt
+        _anchor = None
+        if float(args.bc_anchor_coef) > 0:
+            # lutpre3: the anchor is the BC policy itself, frozen (eval mode, no grads); bc.pt on disk
+            # is the same network, so checkpoints carry nothing new
+            _anchor = copy.deepcopy(actor).eval()
+            _anchor.requires_grad_(False)
+            print(f"[lutpre] BC anchor armed: coef {args.bc_anchor_coef:g}, qnorm {args.bc_anchor_qnorm} "
+                  f"(losses/bc_anchor_rms_deg = {_deg:g} deg per action unit)", flush=True)
+        return _new_opt, _anchor, _deg
 
     if _dataset_summary is not None:
         # lutpre2: what the loaded datasets hold (W&B run summary + stdout)
@@ -2837,7 +2850,7 @@ def main():
         if args.initial_exploration == "lut" and not bc_done and global_step >= args.learning_starts:
             # lutpre1 BC, once, at the first iteration past the warm-up: BEFORE the actor's first
             # action (and before step_async, so no env step is in flight). GPU only.
-            actor_optimizer = run_lut_bc(global_step)
+            actor_optimizer, bc_anchor_actor, bc_anchor_deg = run_lut_bc(global_step)
             bc_done = True
             if args.bc_only:
                 _close_and_exit("\n--bc_only set: bc.pt saved, exiting before RL.")
@@ -3151,7 +3164,7 @@ def main():
                     _t_actor = _sync_timer()
                     # Get actions from current policy + Q-values (under AMP autocast)
                     with amp_ctx:
-                        actions_pi, log_pi, _, _ = actor.get_action(
+                        actions_pi, log_pi, mean_pi, _ = actor.get_action(
                             data["observations"], data["positions"], batch_mask,
                             recep_profile=batch_receptivity,
                             influence_profile=batch_influence,
@@ -3187,7 +3200,28 @@ def main():
                             min_qf_pi = torch.min(qf1_pi, qf2_pi)
 
                         # Policy loss (maximize Q - alpha * entropy), fp32 for stability
-                        actor_loss = (alpha * log_pi.float() - min_qf_pi.float()).mean()
+                        if bc_anchor_actor is not None:
+                            # lutpre3: TD3+BC-style anchor to the frozen bc.pt actor's mean action
+                            # (helpers/lut_pretrain.anchored_actor_loss); Q normalised by its
+                            # detached batch mean |Q| when --bc_anchor_qnorm
+                            from helpers.lut_pretrain import anchored_actor_loss
+                            with torch.no_grad():
+                                _, _, mean_bc, _ = bc_anchor_actor.get_action(
+                                    data["observations"], data["positions"], batch_mask,
+                                    deterministic=True,
+                                    recep_profile=batch_receptivity,
+                                    influence_profile=batch_influence,
+                                    cond=batch_params,
+                                )
+                            actor_loss, _anc = anchored_actor_loss(
+                                min_qf_pi, log_pi, alpha, mean_pi, mean_bc, ~batch_mask,
+                                coef=args.bc_anchor_coef, qnorm=args.bc_anchor_qnorm,
+                                deg_per_unit=bc_anchor_deg)
+                            loss_accumulator['bc_anchor'] += _anc['anchor']
+                            loss_accumulator['q_norm'] += _anc['q_norm']
+                            loss_accumulator['bc_anchor_rms_deg'] += _anc['anchor_rms_deg']
+                        else:
+                            actor_loss = (alpha * log_pi.float() - min_qf_pi.float()).mean()
 
                     # Update actor
                     actor_optimizer.zero_grad(set_to_none=True)
@@ -3336,6 +3370,12 @@ def main():
                     writer.add_scalar("losses/qf2_loss", mean_qf2_loss, global_step)
 
                 writer.add_scalar("losses/actor_loss", mean_actor_loss, global_step)
+                if bc_anchor_actor is not None and n_actor_updates > 0:
+                    # lutpre3: the anchor's distance to the BC policy (action units / deg) and the Q scale
+                    writer.add_scalar("losses/bc_anchor", (loss_accumulator['bc_anchor'] / _na).item(), global_step)
+                    writer.add_scalar("losses/q_norm", (loss_accumulator['q_norm'] / _na).item(), global_step)
+                    writer.add_scalar("losses/bc_anchor_rms_deg",
+                                      (loss_accumulator['bc_anchor_rms_deg'] / _na).item(), global_step)
                 writer.add_scalar("losses/alpha", alpha_val, global_step)
                 writer.add_scalar("charts/lr_actor", float(actor_optimizer.param_groups[0]["lr"]), global_step)
                 writer.add_scalar("charts/lr_critic", float(q_optimizer.param_groups[0]["lr"]), global_step)

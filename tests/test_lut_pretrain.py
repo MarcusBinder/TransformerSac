@@ -542,3 +542,61 @@ def test_dataset_fingerprint_resolves_the_history_n_coupling_like_the_trainer():
     assert dataset_fingerprint(raw)["history_N"] == 3
     assert fingerprint_hash(dataset_fingerprint(_full_args(history_length=3, history_N=5))) != \
         fingerprint_hash(dataset_fingerprint(resolved))
+
+
+# --------------------------------------------------------------------------- lutpre3: BC anchor
+def _anchor_inputs(seed=0, batch=6, n_turb=3):
+    torch.manual_seed(seed)
+    q = torch.randn(batch, 1) * 5 + 20                      # (B, 1) truncated-mean Q of the policy action
+    log_pi = torch.randn(batch, 1)
+    a_pi = torch.tanh(torch.randn(batch, n_turb, 1, requires_grad=True))
+    a_bc = torch.tanh(torch.randn(batch, n_turb, 1))
+    real = torch.tensor([[True, True, False]] * batch)       # one padded slot
+    return q, log_pi, a_pi, a_bc, real
+
+
+def test_anchored_actor_loss_with_coef_zero_and_no_qnorm_is_the_plain_tqc_loss():
+    from helpers.lut_pretrain import anchored_actor_loss
+    q, log_pi, a_pi, a_bc, real = _anchor_inputs()
+    alpha = torch.tensor(0.002)
+    loss, stats = anchored_actor_loss(q, log_pi, alpha, a_pi, a_bc, real, coef=0.0, qnorm=False, deg_per_unit=5.0)
+    assert torch.allclose(loss, (alpha * log_pi - q).mean())
+    assert stats["q_norm"] == 1.0 and stats["anchor"] >= 0.0
+
+
+def test_anchored_actor_loss_qnorm_makes_the_q_term_scale_free():
+    from helpers.lut_pretrain import anchored_actor_loss
+    q, log_pi, a_pi, a_bc, real = _anchor_inputs()
+    alpha = torch.tensor(0.0)
+    l1, s1 = anchored_actor_loss(q, log_pi, alpha, a_pi, a_bc, real, coef=0.5, qnorm=True, deg_per_unit=5.0)
+    l10, s10 = anchored_actor_loss(10 * q, log_pi, alpha, a_pi, a_bc, real, coef=0.5, qnorm=True, deg_per_unit=5.0)
+    assert torch.allclose(l1, l10, atol=1e-5)
+    assert abs(s10["q_norm"] - 10 * s1["q_norm"]) < 1e-3 and s1["anchor"] == s10["anchor"]
+    # the anchor itself: masked mean over REAL turbines of (a_pi - a_bc)^2, reported in degrees too
+    want = ((a_pi - a_bc).pow(2) * real.unsqueeze(-1)).sum() / real.sum()
+    assert abs(s1["anchor"] - float(want)) < 1e-6
+    assert abs(s1["anchor_rms_deg"] - 5.0 * float(want.sqrt())) < 1e-5
+
+
+def test_anchored_actor_loss_gradient_pulls_the_policy_action_toward_the_bc_action():
+    from helpers.lut_pretrain import anchored_actor_loss
+    q, log_pi, a_pi, a_bc, real = _anchor_inputs()
+    a_pi.retain_grad()
+    loss, _ = anchored_actor_loss(q, log_pi, torch.tensor(0.0), a_pi, a_bc, real, coef=1e4, qnorm=True,
+                                  deg_per_unit=5.0)
+    loss.backward()
+    g = a_pi.grad
+    # on the real turbines -grad points from a_pi to a_bc (descent moves a_pi toward a_bc); padded slots get none
+    assert torch.all(torch.sign(g[real]) == torch.sign((a_pi - a_bc)[real]))
+    assert torch.all(g[~real] == 0)
+
+
+def test_validate_lut_args_refuses_the_anchor_with_compile_or_without_the_lut_warmup():
+    from helpers.lut_pretrain import validate_lut_args
+    validate_lut_args(_args(bc_anchor_coef=0.5, compile=False), {"farm": {}})
+    with pytest.raises(ValueError, match="compile"):
+        validate_lut_args(_args(bc_anchor_coef=0.5, compile=True), {"farm": {}})
+    with pytest.raises(ValueError, match="bc_anchor_coef"):
+        validate_lut_args(_args(initial_exploration="random", wd_source="true", bc_anchor_coef=0.5), {})
+    with pytest.raises(ValueError, match="bc_anchor_coef"):
+        validate_lut_args(_args(bc_anchor_coef=-0.1), {"farm": {}})

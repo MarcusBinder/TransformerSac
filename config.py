@@ -685,6 +685,12 @@ class Args:
     bc_std_coef: float = 0.1
     # lutpre2: with --load_buffer of lut datasets, fit BC, save bc.pt and exit (no RL)
     bc_only: bool = False
+    # lutpre3: BC anchor in the actor loss (TD3+BC style, helpers/lut_pretrain.anchored_actor_loss):
+    #   actor_loss = (alpha log_pi - Q) / qnorm + bc_anchor_coef * mean_real (a_pi - a_bc)^2
+    # with a_bc the FROZEN bc.pt actor's mean action (deep copy taken right after BC) and qnorm the
+    # detached mean |Q| of the batch (--bc_anchor_qnorm; off = 1). 0 = plain TQC loss (lutpre1 / 2).
+    bc_anchor_coef: float = 0.0
+    bc_anchor_qnorm: bool = True
 
     # === Replay Buffer Save/Load ===
     # Path(s) to saved replay buffers (.npz). Loading skips the exploration phase (learning_starts -> 0),

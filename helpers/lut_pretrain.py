@@ -95,6 +95,8 @@ def validate_lut_args(args, config: dict) -> None:
     if _arg(args, "initial_exploration", "random") != "lut":
         if bool(_arg(args, "bc_only", False)):
             raise ValueError("--bc_only needs --initial_exploration lut (BC on a lut dataset)")
+        if float(_arg(args, "bc_anchor_coef", 0.0) or 0.0) != 0.0:
+            raise ValueError("--bc_anchor_coef needs --initial_exploration lut (the anchor is the bc.pt actor)")
         return
     if _arg(args, "wd_source") != "est":
         raise ValueError("--initial_exploration lut needs --wd_source est (the teacher's estimator "
@@ -131,6 +133,12 @@ def validate_lut_args(args, config: dict) -> None:
         raise ValueError("--lut_noise_deg must be >= 0 and --lut_noise_tau_s > 0")
     if bool((config or {}).get("derate_action", False)):
         raise ValueError("--initial_exploration lut is yaw-only (the preset has derate_action)")
+    coef = float(_arg(args, "bc_anchor_coef", 0.0))
+    if coef < 0:
+        raise ValueError("--bc_anchor_coef must be >= 0")
+    if coef > 0 and bool(_arg(args, "compile", False)):
+        raise ValueError("--bc_anchor_coef > 0 cannot run with --compile (the anchor deep-copies the actor "
+                         "after BC; a compiled forward does not copy)")
 
 
 def teacher_point(args, config: dict) -> Tuple[float, float]:
@@ -337,6 +345,32 @@ class LutTeacherWrapper(gym.Wrapper):
         label = teacher_action_from_target(tgt, self.method, **kw)
         explore = teacher_action_from_target(noisy, self.method, **kw)
         return label.astype(np.float32), explore.astype(np.float32)
+
+
+# --------------------------------------------------------------------------- lutpre3: BC anchor
+def anchored_actor_loss(min_qf_pi, log_pi, alpha, a_pi, a_bc, real_mask, *, coef: float, qnorm: bool,
+                        deg_per_unit: float):
+    """TD3+BC-style actor loss: ``(alpha log_pi - Q).mean() / qnorm + coef * anchor`` with
+    ``anchor`` the mean over REAL turbines of ``(a_pi - a_bc)^2`` (squashed action units) and
+    ``qnorm`` the detached mean |Q| of the batch (``qnorm=True``; else 1), so beta keeps a fixed
+    weight relative to the Q term whatever the critics' scale (TD3+BC's lambda 2.5 = beta 0.4).
+
+    ``a_pi`` (B, T, A) = the actor's squashed MEAN action (differentiable), ``a_bc`` the frozen bc.pt
+    actor's (no grad), ``real_mask`` (B, T) True on real turbines. Returns ``(loss, stats)`` with
+    stats ``anchor``, ``q_norm`` (floats) and ``anchor_rms_deg`` = sqrt(anchor) * deg_per_unit."""
+    import torch
+
+    q = min_qf_pi.float()
+    if qnorm:
+        q_norm = q.abs().mean().detach().clamp_min(1e-3)
+    else:
+        q_norm = torch.ones((), dtype=q.dtype, device=q.device)
+    real = real_mask.unsqueeze(-1).to(a_pi.dtype)
+    n = real.sum().clamp(min=1.0)
+    anchor = ((a_pi.float() - a_bc.detach().float()).pow(2) * real).sum() / n
+    loss = (alpha * log_pi.float() - q).mean() / q_norm + float(coef) * anchor
+    a = anchor.detach()     # stats stay device tensors: the trainer accumulates them without a host sync
+    return loss, {"anchor": a, "q_norm": q_norm.detach(), "anchor_rms_deg": a.sqrt() * float(deg_per_unit)}
 
 
 # --------------------------------------------------------------------------- BC
