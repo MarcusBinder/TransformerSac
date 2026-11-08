@@ -247,7 +247,7 @@ def main():
                 receptivity_profiles, influence_profiles = compute_layout_profiles_vectorized(
                     x_pos, y_pos,
                     rotor_diameter=D,
-                    k_wake=0.04,
+                    k_wake=args.k_wake,
                     n_directions=args.n_profile_directions,
                     sigma_smooth=args.profile_sigma_smooth,
                     scale_factor=15.0,
@@ -590,6 +590,7 @@ def main():
             profile_source=args.profile_source,
             profile_sigma_smooth=args.profile_sigma_smooth,
             profile_geom_mode=args.profile_geom_mode,
+            k_wake=args.k_wake,
         )
         for _factory in eval_env_factories
     ]

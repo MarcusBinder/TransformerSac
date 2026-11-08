@@ -118,6 +118,7 @@ class PolicyEvaluator:
         profile_source: str = "pywake",
         profile_sigma_smooth: float = 10.0,
         profile_geom_mode: str = "wake",
+        k_wake: float = 0.04,
     ):
         """
         Args:
@@ -155,6 +156,7 @@ class PolicyEvaluator:
         self.profile_source = profile_source
         self.profile_sigma_smooth = profile_sigma_smooth
         self.profile_geom_mode = profile_geom_mode
+        self.k_wake = k_wake
         
         # Create layout configs
         self.eval_layouts = self._create_layout_configs()
@@ -178,7 +180,7 @@ class PolicyEvaluator:
                     receptivity_profiles, influence_profiles = compute_layout_profiles_vectorized(
                         x_pos, y_pos,
                         rotor_diameter=D,
-                        k_wake=0.04,
+                        k_wake=self.k_wake,
                         n_directions=self.n_profile_directions,
                         sigma_smooth=self.profile_sigma_smooth,
                         scale_factor=15.0,
