@@ -66,11 +66,11 @@ def create_eval_env(layout: str, args: dict, turbbox_path: str, seed: int = 42, 
                 from helpers.geometric_profiles import compute_layout_profiles_vectorized
 
                 D = wind_turbine.diameter()
-                print(f"Computing GEOMETRIC profiles for layout: {name}")
+                print(f"Computing GEOMETRIC profiles for layout: {name} (k_wake={args['k_wake']})")
                 receptivity_profiles, influence_profiles = compute_layout_profiles_vectorized(
                     x_pos, y_pos,
                     rotor_diameter=D,
-                    k_wake=0.04,
+                    k_wake=args["k_wake"],
                     n_directions=args["n_profile_directions"],
                     sigma_smooth=args.get("profile_sigma_smooth", 10.0),
                     scale_factor=15.0,
@@ -380,6 +380,11 @@ def main():
     parser.add_argument("--turbbox-path", default="./boxes/")
     parser.add_argument("--stochastic", action="store_true",
                         help="Sample actions instead of deterministic mean")
+    parser.add_argument("--k-wake", type=float, default=None,
+                        help="Override the wake expansion rate used to build the geometric "
+                             "profiles at eval time (default: the value the checkpoint was "
+                             "trained with; 0.04 for checkpoints predating the flag). Use for "
+                             "the train/eval k_w mismatch test.")
     cli = parser.parse_args()
 
     # Line-buffer stdout/stderr so progress shows up promptly in SLURM logs.
@@ -411,6 +416,10 @@ def main():
     args = {**_defaults, **args}
     if _missing:
         print(f"[Eval] Backfilled {len(_missing)} missing args from defaults: {sorted(_missing)}")
+    train_k_wake = float(args["k_wake"])
+    if cli.k_wake is not None:
+        args["k_wake"] = cli.k_wake
+        print(f"[Eval] k_wake OVERRIDE: profiles built at {cli.k_wake} (checkpoint trained at {train_k_wake})")
 
     # ---- Env + agent ----
     assert cli.num_episodes % cli.num_envs == 0, (
@@ -450,6 +459,8 @@ def main():
             "seed": cli.seed,
             "deterministic": int(deterministic),
             "checkpoint": ckpt_path,
+            "k_wake_train": train_k_wake,
+            "k_wake_eval": float(args["k_wake"]),
         },
     )
 

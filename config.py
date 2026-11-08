@@ -51,6 +51,7 @@ class Args:
     profile_sigma_smooth: float = 1.0       # Gaussian smoothing sigma (bins) for geometric profile computation (stage-1 baseline)
     profile_use_influence: bool = True      # False => single receptivity rose + one encoder (drop redundant influence)
     profile_geom_mode: str = "wake"         # geometric rose construction: "wake" (up/downstream wake sum) or "distance" (bearing-keyed inverse-distance)
+    k_wake: float = 0.04                    # wake expansion rate k_w of the geometric roses (lateral Gaussian sigma = k_w * x). Review R1 k_w sweep.
     profile_fusion_type: str = "add"       # "add" or "joint" fusion of receptivity and influence profiles
     profile_embed_mode: str = "concat"     # "add" or "concat" — how fused profile is integrated into token embedding (stage-1 baseline)
     share_profile_encoder: bool = False         # Whether to share weights between actor and critic for profile encoder
