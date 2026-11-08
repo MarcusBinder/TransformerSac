@@ -90,6 +90,15 @@ def test_check_turbine_model_refuses_mismatches():
         check_turbine_model(spec_r, SimpleNamespace(derate_reference="setpoint", derate_max=1.0))
     with pytest.raises(ValueError, match="derate_min"):
         check_turbine_model(spec_r, SimpleNamespace(derate_min=0.1))
+    # the derate method (WindGym's share inner loop) and the yaw deadband too
+    spec_m = {**spec, "derate_method": "share", "yaw_deadband": 0.375}
+    check_turbine_model(spec_m, SimpleNamespace(derate_method="share", yaw_deadband=0.375))
+    with pytest.raises(ValueError, match="derate_method"):
+        check_turbine_model(spec_m, SimpleNamespace(derate_method="absolute"))
+    with pytest.raises(ValueError, match="yaw_deadband"):
+        check_turbine_model(spec_m, SimpleNamespace(derate_method="share", yaw_deadband=0.0))
+    # a spec without them (checkpoints evaluated before) compares nothing
+    check_turbine_model(spec, SimpleNamespace(derate_method="share", yaw_deadband=0.375))
 
 
 def test_build_track3_env_carries_the_checkpoint_turbine_model(monkeypatch):

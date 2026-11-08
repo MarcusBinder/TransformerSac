@@ -54,7 +54,7 @@ from helpers.derating_turbine import (
     make_derating_turbine,
     make_operating_point_lookup_for,
 )
-from helpers.power_ref import build_power_ref, measure_greedy
+from helpers.power_ref import build_power_ref, greedy_probe_config, measure_greedy
 from helpers.tracking_env_config import build_tracking_env_config
 from WindGym import WindFarmEnv, AgentEvalFast
 from WindGym.farm_eval import FarmEval
@@ -221,7 +221,9 @@ def build_track3_env(args: dict, turbbox_path: str, obs_width: int | None = None
     # Yaw is disabled on the probe so measure_greedy's all-min action means
     # "full power, no steering" even for yaw+derate configs; otherwise the
     # boost schedule's >100% segments would scale off a steered (wrong) greedy.
-    probe_config = {**config, "yaw_action": False}
+    # (helpers.power_ref.greedy_probe_config also turns WindGym's share inner
+    # loop off: under it the all-min action would track, not run greedy.)
+    probe_config = greedy_probe_config(config)
 
     def _make_probe_env():
         return WindFarmEnv(

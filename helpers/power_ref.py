@@ -67,6 +67,21 @@ def build_power_ref(greedy, *, power_schedule="default", factory=None, factory_k
     return partial(stepwise_power_ref, greedy=greedy, schedule=schedule), desc
 
 
+def greedy_probe_config(config: dict) -> dict:
+    """The env config of the greedy probe: the training config without yaw and inner loop.
+
+    Yaw is disabled so ``measure_greedy``'s all-min action is the no-steering,
+    full-power baseline. WindGym's inner loop (``derate_method: share``) is
+    switched to the plain ``absolute`` method: under it the derate action is a
+    deficit share, the all-min action means equal shares, and the env would
+    track its default reference instead of running greedy. Returns a new dict.
+    """
+    probe = {**config, "yaw_action": False}
+    if probe.get("derate_method") == "share":
+        probe["derate_method"] = "absolute"
+    return probe
+
+
 def measure_greedy(make_probe_env, *, n_steps=100, burn_in=20) -> float:
     """Measure greedy (undereated) waked farm power [W] for the fixed inflow.
 

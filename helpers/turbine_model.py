@@ -95,6 +95,22 @@ def check_turbine_model(spec: dict[str, Any], facts) -> None:
                 f"{key} differs from training: {have} vs {want} s "
                 "(set turbine_params in the eval config)"
             )
+    # What the derate action does (WindGym's share inner loop or the command
+    # itself) and the yaw deadband: both change what the policy learned.
+    if "derate_method" in spec:
+        have = getattr(facts, "derate_method", None)
+        if have is not None and str(have).lower() != str(spec["derate_method"]).lower():
+            raise ValueError(
+                f"derate_method differs from training: {have!r} vs {spec['derate_method']!r} "
+                "(set it in the eval config's env_overrides)"
+            )
+    if "yaw_deadband" in spec:
+        have = getattr(facts, "yaw_deadband", None)
+        if have is not None and float(have) != float(spec["yaw_deadband"]):
+            raise ValueError(
+                f"yaw_deadband differs from training: {have} vs {spec['yaw_deadband']} deg "
+                "(set it in the eval config's env_overrides)"
+            )
     # The derate action range: the policy's [-1, 1] maps onto it.
     for key in ("derate_min", "derate_max"):
         have = getattr(facts, key, None)

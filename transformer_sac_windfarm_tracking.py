@@ -105,7 +105,7 @@ from helpers.layouts import get_layout_positions
 
 # Power-tracking / derate-only helpers (see module docstring).
 from helpers.derating_turbine import make_derating_turbine
-from helpers.power_ref import build_power_ref, measure_greedy
+from helpers.power_ref import build_power_ref, greedy_probe_config, measure_greedy
 
 # Receptivity profile computation
 from helpers.receptivity_profiles import compute_layout_profiles
@@ -414,7 +414,9 @@ def main():
     # Then measure_greedy's all-min-derate action is simply full power at the fixed
     # (aligned) yaw, and the >100% BOOST_SCHEDULE is measured against the true
     # unsteered ceiling. For the derate-only config this is already the case.
-    probe_config = {**config, "yaw_action": False}
+    # (helpers.power_ref.greedy_probe_config also turns WindGym's share inner
+    # loop off: under it the all-min action would track, not run greedy.)
+    probe_config = greedy_probe_config(config)
     probe_env_kwargs = {**base_env_kwargs, "config": probe_config}
 
     def _make_probe_env():

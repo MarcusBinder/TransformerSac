@@ -85,6 +85,8 @@ class TrackingPolicy:
             "env_overrides": args.get("env_overrides", "{}"),
             "derate_min": float(base_env.derate_min),
             "derate_max": float(base_env.derate_max),
+            "derate_method": str(base_env.derate_method),
+            "yaw_deadband": float(getattr(base_env, "yaw_deadband", 0.0)),
             **turbine_model_spec(args),
         }
 

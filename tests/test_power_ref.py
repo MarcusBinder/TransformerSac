@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from helpers.power_ref import build_power_ref  # noqa: E402
+from helpers.power_ref import build_power_ref, greedy_probe_config  # noqa: E402
 
 ENV = SimpleNamespace(delay=1.0)
 FACTORY_SRC = '''
@@ -49,3 +49,15 @@ def test_factory_with_json_kwargs(tmp_path, monkeypatch):
 def test_factory_needs_module_and_attribute():
     with pytest.raises(ValueError, match="module:attr"):
         build_power_ref(10e6, factory="no_colon_here")
+
+
+def test_greedy_probe_config_disables_yaw_and_the_share_inner_loop():
+    cfg = {"yaw_action": True, "derate_method": "share", "yaw_deadband": 0.375}
+    probe = greedy_probe_config(cfg)
+    # under WindGym's inner loop the all-min action means equal deficit shares and
+    # the probe would track its default reference instead of running greedy
+    assert probe == {"yaw_action": False, "derate_method": "absolute", "yaw_deadband": 0.375}
+    assert cfg["derate_method"] == "share"  # the training config is untouched
+    for method in ("absolute", "step", None):
+        cfg = {"yaw_action": True} if method is None else {"yaw_action": True, "derate_method": method}
+        assert greedy_probe_config(cfg) == {**cfg, "yaw_action": False}
