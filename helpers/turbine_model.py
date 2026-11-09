@@ -111,6 +111,24 @@ def check_turbine_model(spec: dict[str, Any], facts) -> None:
                 f"yaw_deadband differs from training: {have} vs {spec['yaw_deadband']} deg "
                 "(set it in the eval config's env_overrides)"
             )
+    # The agent step (seconds per env step) and the derate slew per sim step:
+    # a policy evaluated at another cadence or slew runs silently but wrongly.
+    if "dt_env" in spec:
+        have = getattr(facts, "dt_env", None)
+        if have is not None and float(have) != float(spec["dt_env"]):
+            raise ValueError(
+                f"dt_env differs from training: {have} vs {spec['dt_env']} s "
+                "(set dt_env in the eval config)"
+            )
+    if "derate_step_sim" in spec and hasattr(facts, "derate_step_sim"):
+        have, want = facts.derate_step_sim, spec["derate_step_sim"]
+        if (have is None) != (want is None) or (
+            have is not None and float(have) != float(want)
+        ):
+            raise ValueError(
+                f"derate_step_sim differs from training: {have} vs {want} "
+                "(set it in the eval config's env_overrides)"
+            )
     # The derate action range: the policy's [-1, 1] maps onto it.
     for key in ("derate_min", "derate_max"):
         have = getattr(facts, key, None)

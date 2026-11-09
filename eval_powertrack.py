@@ -87,6 +87,12 @@ class TrackingPolicy:
             "derate_max": float(base_env.derate_max),
             "derate_method": str(base_env.derate_method),
             "yaw_deadband": float(getattr(base_env, "yaw_deadband", 0.0)),
+            "dt_env": float(base_env.dt_env),
+            "derate_step_sim": (
+                None
+                if getattr(base_env, "derate_step_sim", None) is None
+                else float(base_env.derate_step_sim)
+            ),
             **turbine_model_spec(args),
         }
 

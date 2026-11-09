@@ -99,6 +99,18 @@ def test_check_turbine_model_refuses_mismatches():
         check_turbine_model(spec_m, SimpleNamespace(derate_method="share", yaw_deadband=0.0))
     # a spec without them (checkpoints evaluated before) compares nothing
     check_turbine_model(spec, SimpleNamespace(derate_method="share", yaw_deadband=0.375))
+    # the agent step and the derate slew (round 4 trains at 1 s; a 1 s policy on a
+    # 5 s eval env would run silently otherwise)
+    spec_t = {**spec, "dt_env": 1.0, "derate_step_sim": 0.05}
+    check_turbine_model(spec_t, SimpleNamespace(dt_env=1.0, derate_step_sim=0.05))
+    with pytest.raises(ValueError, match="dt_env"):
+        check_turbine_model(spec_t, SimpleNamespace(dt_env=5.0, derate_step_sim=0.05))
+    with pytest.raises(ValueError, match="derate_step_sim"):
+        check_turbine_model(spec_t, SimpleNamespace(dt_env=1.0, derate_step_sim=None))
+    spec_none = {**spec, "derate_step_sim": None}
+    check_turbine_model(spec_none, SimpleNamespace(derate_step_sim=None))
+    with pytest.raises(ValueError, match="derate_step_sim"):
+        check_turbine_model(spec_none, SimpleNamespace(derate_step_sim=0.05))
 
 
 def test_build_track3_env_carries_the_checkpoint_turbine_model(monkeypatch):
