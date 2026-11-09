@@ -82,7 +82,7 @@ def greedy_probe_config(config: dict) -> dict:
     return probe
 
 
-def measure_greedy(make_probe_env, *, n_steps=100, burn_in=20) -> float:
+def measure_greedy(make_probe_env, *, probe_s=500.0, burn_in_s=100.0) -> float:
     """Measure greedy (undereated) waked farm power [W] for the fixed inflow.
 
     Builds a throwaway env via ``make_probe_env()`` (a zero-arg callable
@@ -101,10 +101,18 @@ def measure_greedy(make_probe_env, *, n_steps=100, burn_in=20) -> float:
     scores a windowed MEAN of farm power (``farm_pow_deq``), so the reference must
     be a mean too; we read the same per-step quantity here (``farm_pow_deq[-1]``,
     which also survives the flow cleanup on a late truncation).
+
+    The probe length and burn-in are counted in simulated seconds (``probe_s``,
+    ``burn_in_s``) and converted with the env's seconds per step (``delay``,
+    = ``dt_env`` unless set), so the reference is the same 400 s mean at any
+    agent step length (100 / 20 steps at 5 s, 500 / 100 at 1 s).
     """
     env = make_probe_env()
     env.reset(seed=0)
     u = env.unwrapped
+    step_s = float(u.delay)
+    n_steps = max(1, int(round(probe_s / step_s)))
+    burn_in = int(round(burn_in_s / step_s))
 
     # -1 across the derate action -> derate=0 -> full power (see WindFarmEnv's
     # affine [-1,1] -> [derate_min, derate_max] map, derate_min=0). The probe env

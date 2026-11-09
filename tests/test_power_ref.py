@@ -13,7 +13,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from helpers.power_ref import build_power_ref, greedy_probe_config  # noqa: E402
+import numpy as np  # noqa: E402
+
+from helpers.power_ref import build_power_ref, greedy_probe_config, measure_greedy  # noqa: E402
 
 ENV = SimpleNamespace(delay=1.0)
 FACTORY_SRC = '''
@@ -61,3 +63,40 @@ def test_greedy_probe_config_disables_yaw_and_the_share_inner_loop():
     for method in ("absolute", "step", None):
         cfg = {"yaw_action": True} if method is None else {"yaw_action": True, "derate_method": method}
         assert greedy_probe_config(cfg) == {**cfg, "yaw_action": False}
+
+
+class _CountingProbe:
+    """Fake probe env: farm power = env-step index, `delay` seconds per step."""
+
+    def __init__(self, delay):
+        self.delay = delay
+        self.farm_pow_deq = [0.0]
+        self.action_space = SimpleNamespace(shape=(3,))
+        self.unwrapped = self
+        self.k = 0
+
+    def reset(self, seed=None):
+        self.k = 0
+
+    def step(self, action):
+        self.k += 1
+        self.farm_pow_deq.append(float(self.k))
+        return None, 0.0, False, False, {}
+
+    def close(self):
+        pass
+
+
+@pytest.mark.parametrize("delay", [5, 1])
+def test_measure_greedy_probes_500_s_and_drops_the_first_100_s(delay):
+    # 500 s / delay steps, the first 100 s / delay dropped: the mean of steps
+    # n_burn+1 .. n_steps, i.e. the same 400 s window at any agent step length
+    probes = []
+
+    def make():
+        probes.append(_CountingProbe(delay))
+        return probes[-1]
+
+    n_steps, n_burn = 500 // delay, 100 // delay
+    assert measure_greedy(make) == pytest.approx(np.mean(np.arange(n_burn + 1, n_steps + 1)))
+    assert probes[0].k == n_steps
