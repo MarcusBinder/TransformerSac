@@ -391,6 +391,12 @@ def main():
                              "profiles at eval time (default: the value the checkpoint was "
                              "trained with; 0.04 for checkpoints predating the flag). Use for "
                              "the train/eval k_w mismatch test.")
+    parser.add_argument("--ti-type", choices=["Random", "MannLoad"], default=None,
+                        help="Override the inflow turbulence type at eval time (default: the "
+                             "checkpoint's TI_type). MannLoad loads a pre-generated Mann box "
+                             "(TF_*.nc) from --turbbox-path and rescales it to the episode TI, "
+                             "so only the spatial correlation differs from Random. Use for the "
+                             "correlated-turbulence robustness test.")
     cli = parser.parse_args()
 
     # Line-buffer stdout/stderr so progress shows up promptly in SLURM logs.
@@ -426,6 +432,17 @@ def main():
     if cli.k_wake is not None:
         args["k_wake"] = cli.k_wake
         print(f"[Eval] k_wake OVERRIDE: profiles built at {cli.k_wake} (checkpoint trained at {train_k_wake})")
+    train_ti_type = str(args["TI_type"])
+    if cli.ti_type is not None:
+        args["TI_type"] = cli.ti_type
+        print(f"[Eval] TI_type OVERRIDE: eval inflow {cli.ti_type} (checkpoint trained with {train_ti_type})")
+    if args["TI_type"] == "MannLoad":
+        boxes = sorted(f for f in os.listdir(cli.turbbox_path) if f.startswith("TF_") and f.endswith(".nc")) \
+            if os.path.isdir(cli.turbbox_path) else []
+        if not boxes:
+            sys.exit(f"[Eval] ERROR: TI_type=MannLoad but no TF_*.nc boxes in {cli.turbbox_path!r} "
+                     f"(generate them with make_boxes.py)")
+        print(f"[Eval] MannLoad: {len(boxes)} boxes in {cli.turbbox_path} ({boxes[0]} .. {boxes[-1]})")
 
     # ---- Env + agent ----
     assert cli.num_episodes % cli.num_envs == 0, (
@@ -467,6 +484,8 @@ def main():
             "checkpoint": ckpt_path,
             "k_wake_train": train_k_wake,
             "k_wake_eval": float(args["k_wake"]),
+            "ti_type_train": train_ti_type,
+            "ti_type_eval": str(args["TI_type"]),
         },
     )
 
