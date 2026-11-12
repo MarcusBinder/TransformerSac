@@ -60,6 +60,10 @@ def test_greedy_probe_config_disables_yaw_and_the_share_inner_loop():
     # the probe would track its default reference instead of running greedy
     assert probe == {"yaw_action": False, "derate_method": "absolute", "yaw_deadband": 0.375}
     assert cfg["derate_method"] == "share"  # the training config is untouched
+    # share_mapping only exists under the share method (WindGym refuses 'tilt' without it)
+    tilt = {"yaw_action": True, "derate_method": "share", "share_mapping": "tilt"}
+    assert greedy_probe_config(tilt) == {"yaw_action": False, "derate_method": "absolute"}
+    assert tilt["share_mapping"] == "tilt"
     for method in ("absolute", "step", None):
         cfg = {"yaw_action": True} if method is None else {"yaw_action": True, "derate_method": method}
         assert greedy_probe_config(cfg) == {**cfg, "yaw_action": False}

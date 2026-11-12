@@ -74,11 +74,13 @@ def greedy_probe_config(config: dict) -> dict:
     full-power baseline. WindGym's inner loop (``derate_method: share``) is
     switched to the plain ``absolute`` method: under it the derate action is a
     deficit share, the all-min action means equal shares, and the env would
-    track its default reference instead of running greedy. Returns a new dict.
+    track its default reference instead of running greedy; ``share_mapping``
+    goes with it. Returns a new dict.
     """
     probe = {**config, "yaw_action": False}
     if probe.get("derate_method") == "share":
         probe["derate_method"] = "absolute"
+        probe.pop("share_mapping", None)  # a share-method key ('tilt' is refused without it)
     return probe
 
 
