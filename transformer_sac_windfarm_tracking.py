@@ -458,7 +458,8 @@ def main():
     # info["reward_unpenalized"], hence one or the other.
     _thrust_load_active = any(
         s > 0 for s in (args.load_dthrust2_scale, args.load_thrust_eq_scale,
-                        args.load_thrust_level_scale))
+                        args.load_thrust_level_scale, args.load_thrust_max_scale,
+                        args.load_yaw_mis_scale))
     if _thrust_load_active and args.del_penalty_scale > 0:
         raise ValueError("load_*_scale and del_penalty_scale > 0 cannot be combined")
     if _thrust_load_active and args.backend != "dynamiks":
@@ -534,6 +535,10 @@ def main():
                 dthrust2_scale=args.load_dthrust2_scale,
                 thrust_eq_scale=args.load_thrust_eq_scale,
                 thrust_level_scale=args.load_thrust_level_scale,
+                thrust_max_scale=args.load_thrust_max_scale,
+                thrust_max_kappa=args.load_thrust_max_kappa,
+                thrust_max_tau_s=args.load_thrust_max_tau_s,
+                yaw_mis_scale=args.load_yaw_mis_scale,
                 thrust_ref=args.load_thrust_ref,
             )
         # v9.1: scale the (tiny) Wake_recovery reward to probe optimization signal-to-noise.
@@ -1342,7 +1347,8 @@ def main():
     del_ratio_window = deque(maxlen=1000)
     reward_unpen_window = deque(maxlen=1000)
     # Thrust load-term diagnostics (filled only when a load_*_scale > 0).
-    _load_keys = ("load_penalty", "load_dthrust2", "load_thrust_eq", "load_thrust_level")
+    _load_keys = ("load_penalty", "load_dthrust2", "load_thrust_eq", "load_thrust_level",
+                  "load_thrust_max", "load_yaw_mis")
     load_windows = {k: deque(maxlen=1000) for k in _load_keys}
     # next_save_step = ((start_step // args.save_interval) + 1) * args.save_interval  # Account for resumed step
     next_save_step = start_step + args.save_interval

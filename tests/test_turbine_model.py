@@ -99,6 +99,19 @@ def test_check_turbine_model_refuses_mismatches():
         check_turbine_model(spec_m, SimpleNamespace(derate_method="share", yaw_deadband=0.0))
     # a spec without them (checkpoints evaluated before) compares nothing
     check_turbine_model(spec, SimpleNamespace(derate_method="share", yaw_deadband=0.375))
+    # round 5: the share mapping (tilt), the yaw hold and the share reference
+    spec_r5 = {**spec, "share_mapping": "tilt", "yaw_hold_s": 10.0, "share_reference": "observed"}
+    ok = dict(share_mapping="tilt", yaw_hold_s=10.0, share_reference="observed")
+    check_turbine_model(spec_r5, SimpleNamespace(**ok))
+    with pytest.raises(ValueError, match="share_mapping"):
+        check_turbine_model(spec_r5, SimpleNamespace(**{**ok, "share_mapping": "raw"}))
+    with pytest.raises(ValueError, match="yaw_hold_s"):
+        check_turbine_model(spec_r5, SimpleNamespace(**{**ok, "yaw_hold_s": 0.0}))
+    with pytest.raises(ValueError, match="share_reference"):
+        check_turbine_model(spec_r5, SimpleNamespace(**{**ok, "share_reference": "scored"}))
+    # facts without the fields (older runners) and specs without them are not compared
+    check_turbine_model(spec_r5, SimpleNamespace())
+    check_turbine_model(spec, SimpleNamespace(**{**ok, "share_mapping": "raw"}))
     # the agent step and the derate slew (round 4 trains at 1 s; a 1 s policy on a
     # 5 s eval env would run silently otherwise)
     spec_t = {**spec, "dt_env": 1.0, "derate_step_sim": 0.05}

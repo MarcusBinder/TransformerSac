@@ -100,10 +100,18 @@ class Args:
     #   reward -= dthrust2_scale * sum_i sum_substeps (dT_i)^2
     #           + thrust_eq_scale * sum_i (mean_step T_i - farm mean)^2
     #           + thrust_level_scale * sum_i mean_step T_i
+    #           + thrust_max_scale * (1/kappa) log sum_i exp(kappa z_i)
+    #           + yaw_mis_scale * mean_step mean_i |yaw_i| / 30 deg
+    # with z_i turbine i's thrust low-passed with load_thrust_max_tau_s (the
+    # worst turbine's thrust level as a soft maximum, sharpness kappa).
     # All 0 = wrapper not attached. Not combinable with del_penalty_scale > 0.
     load_dthrust2_scale: float = 0.0
     load_thrust_eq_scale: float = 0.0
     load_thrust_level_scale: float = 0.0
+    load_thrust_max_scale: float = 0.0
+    load_thrust_max_kappa: float = 20.0
+    load_thrust_max_tau_s: float = 60.0
+    load_yaw_mis_scale: float = 0.0
     load_thrust_ref: Optional[float] = None
     # Max apparent turbine displacement per sim step (m) — dynamiks'
     # max_turb_move, which is the SOLE input to the wd_slow frame slew limit

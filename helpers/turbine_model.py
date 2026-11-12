@@ -111,6 +111,22 @@ def check_turbine_model(spec: dict[str, Any], facts) -> None:
                 f"yaw_deadband differs from training: {have} vs {spec['yaw_deadband']} deg "
                 "(set it in the eval config's env_overrides)"
             )
+    # The share inner loop's action meaning (raw shares or a tilt of proportional
+    # shares) and reference (observed or scored), and the yaw hold.
+    for key in ("share_mapping", "share_reference"):
+        have = getattr(facts, key, None)
+        if key in spec and have is not None and str(have).lower() != str(spec[key]).lower():
+            raise ValueError(
+                f"{key} differs from training: {have!r} vs {spec[key]!r} "
+                "(set it in the eval config's env_overrides)"
+            )
+    if "yaw_hold_s" in spec:
+        have = getattr(facts, "yaw_hold_s", None)
+        if have is not None and float(have) != float(spec["yaw_hold_s"]):
+            raise ValueError(
+                f"yaw_hold_s differs from training: {have} vs {spec['yaw_hold_s']} s "
+                "(set it in the eval config's env_overrides)"
+            )
     # The agent step (seconds per env step) and the derate slew per sim step:
     # a policy evaluated at another cadence or slew runs silently but wrongly.
     if "dt_env" in spec:

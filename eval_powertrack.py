@@ -87,6 +87,9 @@ class TrackingPolicy:
             "derate_max": float(base_env.derate_max),
             "derate_method": str(base_env.derate_method),
             "yaw_deadband": float(getattr(base_env, "yaw_deadband", 0.0)),
+            "share_mapping": str(getattr(base_env, "share_mapping", "raw")),
+            "share_reference": str(getattr(base_env, "share_reference", "observed")),
+            "yaw_hold_s": float(getattr(base_env, "yaw_hold_s", 0.0)),
             "dt_env": float(base_env.dt_env),
             "derate_step_sim": (
                 None
