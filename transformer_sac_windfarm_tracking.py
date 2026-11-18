@@ -138,6 +138,9 @@ def main():
     
     # Parse arguments
     args = tyro.cli(Args)
+    if args.layout_descriptor is not None and not args.use_wind_relative_pos:
+        raise ValueError("--layout_descriptor needs --use_wind_relative_pos: the descriptor "
+                         "reads up- and downstream neighbours off the wind-frame positions")
     
     # Validate initial_exploration
     assert args.initial_exploration in ("random", "policy"), \
@@ -731,6 +734,7 @@ def main():
             "profile_fusion_type", "profile_embed_mode",
             "profile_encoder_kwargs",
             "n_profile_directions",
+            "layout_descriptor", "layout_descriptor_kwargs", "layout_descriptor_mode",
         ]
 
         overrides = []

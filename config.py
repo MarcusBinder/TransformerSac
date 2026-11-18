@@ -56,6 +56,13 @@ class Args:
     profile_fusion_type: str = "add"       # "add" or "joint" fusion of receptivity and influence profiles
     profile_embed_mode: str = "concat"     # "add" or "concat" — how fused profile is integrated into token embedding (stage-1 baseline)
     share_profile_encoder: bool = False         # Whether to share weights between actor and critic for profile encoder
+    # Lane descriptor: a per-turbine layout input computed in the network from the wind-frame
+    # positions (helpers/layout_descriptor.py), the alternative to the roses above. A lane run
+    # sets profile_encoding_type None and layout_descriptor lanes2_wide_half; needs
+    # use_wind_relative_pos.
+    layout_descriptor: Optional[str] = None     # None (off), "lanes2_wide_half" or "lanes2"
+    layout_descriptor_kwargs: str = "{}"        # JSON overrides of the preset (nodes, outer, lat_nodes, lat_outer, lat_weights, first, lane, tau)
+    layout_descriptor_mode: str = "concat"      # "add" or "concat" -- how the descriptor embedding joins the token (as profile_embed_mode)
 
     # === Environment Settings ===
     backend: str = "dynamiks"  # Flow solver backend: "dynamiks" (default) or "pywake" (steady-state)

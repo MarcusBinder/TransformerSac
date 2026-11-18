@@ -326,6 +326,9 @@ def main():
     
     # Parse arguments
     args = tyro.cli(Args)
+    if args.layout_descriptor is not None and not args.use_wind_relative_pos:
+        raise ValueError("--layout_descriptor needs --use_wind_relative_pos: the descriptor "
+                         "reads up- and downstream neighbours off the wind-frame positions")
     
     # Validate initial_exploration
     assert args.initial_exploration in ("random", "policy"), \
@@ -1488,6 +1491,7 @@ def main():
             "n_profile_directions",
             # Stage 10 conditioning changes the actor's shapes / modules
             "cond_source", "cond_latent_dim", "cond_mode", "cond_critic",
+            "layout_descriptor", "layout_descriptor_kwargs", "layout_descriptor_mode",
         ]
 
         overrides = []

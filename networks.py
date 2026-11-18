@@ -32,6 +32,7 @@ from positional_encodings import (
     GATPositionalEncoder,
 )
 
+from helpers.layout_descriptor import create_layout_descriptor
 from profile_encodings import (
     CNNProfileEncoder,
     DilatedProfileEncoder,
@@ -875,6 +876,11 @@ class TransformerActor(nn.Module):
         if profile_encoding is not None and profile_embed_mode == "concat":
             self.profile_proj = nn.Linear(2 * embed_dim, embed_dim)
 
+        # Lane descriptor (--layout_descriptor): a layout input computed from the positions,
+        # independent of the profile encoders. Off (None, None) by default.
+        self.layout_desc_encoder, self.layout_desc_proj = \
+            create_layout_descriptor(args, embed_dim)
+
 
         # Observation encoder (shared across turbines). change_wd_4: "per_sensor"
         # swaps in one small MLP per sensor group (see PerSensorObsEncoder);
@@ -1031,6 +1037,14 @@ class TransformerActor(nn.Module):
                 h = self.profile_proj(torch.cat([h, profile_embed], dim=-1))
             else:  # "add"
                 h = h + profile_embed
+
+        # Lane descriptor (after the profiles, before attention)
+        if self.layout_desc_encoder is not None:
+            desc_embed = self.layout_desc_encoder(positions, key_padding_mask)
+            if self.layout_desc_proj is not None:  # "concat"
+                h = self.layout_desc_proj(torch.cat([h, desc_embed], dim=-1))
+            else:  # "add"
+                h = h + desc_embed
 
 
 
@@ -1317,6 +1331,11 @@ class TransformerCritic(nn.Module):
         if profile_encoding is not None and profile_embed_mode == "concat":
             self.profile_proj = nn.Linear(2 * embed_dim, embed_dim)
 
+        # Lane descriptor (--layout_descriptor): a layout input computed from the positions,
+        # independent of the profile encoders. Off (None, None) by default.
+        self.layout_desc_encoder, self.layout_desc_proj = \
+            create_layout_descriptor(args, embed_dim)
+
         # Transformer encoder (+ v5 log-N scaling / local attention)
         (_ls, _sm, self.attn_local, self.attn_local_radius_D,
          self.attn_local_k, self.attn_local_cone_deg) = _read_attn_cfg(args)
@@ -1397,6 +1416,14 @@ class TransformerCritic(nn.Module):
                 h = self.profile_proj(torch.cat([h, profile_embed], dim=-1))
             else:
                 h = h + profile_embed
+
+        # Lane descriptor (after the profiles, before attention)
+        if self.layout_desc_encoder is not None:
+            desc_embed = self.layout_desc_encoder(positions, key_padding_mask)
+            if self.layout_desc_proj is not None:  # "concat"
+                h = self.layout_desc_proj(torch.cat([h, desc_embed], dim=-1))
+            else:  # "add"
+                h = h + desc_embed
 
 
         # Compute relative position bias if using relative encoding
