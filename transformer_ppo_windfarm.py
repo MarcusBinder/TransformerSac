@@ -32,6 +32,7 @@ from collections import deque
 import json
 
 from config import Args
+from helpers.layout_descriptor import check_layout_descriptor_args
 
 # Set memory allocation config BEFORE importing torch
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -340,6 +341,7 @@ def main():
 
     # Parse arguments
     args = tyro.cli(Args)
+    check_layout_descriptor_args(args)
     args.algorithm = "ppo"  # checkpoints self-describe
 
     assert args.pretrain_checkpoint is None, \

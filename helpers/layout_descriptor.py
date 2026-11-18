@@ -209,3 +209,20 @@ def create_layout_descriptor(args, embed_dim: int):
     encoder = LaneDescriptorEncoder(embed_dim, name, **kwargs)
     proj = nn.Linear(2 * embed_dim, embed_dim) if mode == "concat" else None
     return encoder, proj
+
+
+def check_layout_descriptor_args(args) -> None:
+    """Refuse flag combinations under which the descriptor would be wrong or slow; called by
+    the trainers right after parsing. Nothing to check with the flag off."""
+    if getattr(args, "layout_descriptor", None) is None:
+        return
+    if args.layout_descriptor not in PRESETS:
+        raise ValueError(
+            f"Unknown layout_descriptor: {args.layout_descriptor!r}. Valid: {sorted(PRESETS)}")
+    if not getattr(args, "use_wind_relative_pos", True):
+        raise ValueError("--layout_descriptor needs --use_wind_relative_pos: the descriptor "
+                         "reads up- and downstream neighbours off the wind-frame positions")
+    if getattr(args, "compile", False):
+        # the number of neighbours kept per turbine is read off the batch (a GPU sync and
+        # a shape that changes with the layout mix), which torch.compile cannot keep static
+        raise ValueError("--layout_descriptor cannot be combined with --compile")

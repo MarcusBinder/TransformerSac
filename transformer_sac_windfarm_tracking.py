@@ -54,6 +54,7 @@ from collections import deque
 import json
 
 from config import Args
+from helpers.layout_descriptor import check_layout_descriptor_args
 from replay_buffer import TransformerReplayBuffer
 from helpers.training_utils import (
     clear_gpu_memory, compute_adaptive_target_entropy,
@@ -138,9 +139,10 @@ def main():
     
     # Parse arguments
     args = tyro.cli(Args)
-    if args.layout_descriptor is not None and not args.use_wind_relative_pos:
-        raise ValueError("--layout_descriptor needs --use_wind_relative_pos: the descriptor "
-                         "reads up- and downstream neighbours off the wind-frame positions")
+    check_layout_descriptor_args(args)
+    if args.layout_descriptor is not None:
+        print(f"Layout descriptor: {args.layout_descriptor} (mode {args.layout_descriptor_mode}, "
+              f"kwargs {args.layout_descriptor_kwargs}), built in actor and critics")
     
     # Validate initial_exploration
     assert args.initial_exploration in ("random", "policy"), \

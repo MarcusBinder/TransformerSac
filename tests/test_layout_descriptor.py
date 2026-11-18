@@ -17,6 +17,7 @@ from config import Args  # noqa: E402
 from helpers.layout_descriptor import (  # noqa: E402
     PRESETS,
     LaneDescriptorEncoder,
+    check_layout_descriptor_args,
     lane_descriptor,
 )
 from networks import TransformerActor, TransformerCritic  # noqa: E402
@@ -228,3 +229,15 @@ def test_kwargs_flag_overrides_the_preset():
     assert net.layout_desc_encoder.params["first"] is None
     assert net.layout_desc_encoder.params["outer"] == 30.0
     assert net.layout_desc_encoder.params["nodes"] == PRESETS["lanes2"]["nodes"]
+
+
+def test_trainer_check_refuses_wrong_frame_compile_and_unknown_names():
+    check_layout_descriptor_args(Args())
+    check_layout_descriptor_args(Args(use_wind_relative_pos=False, compile=True))  # flag off
+    check_layout_descriptor_args(Args(layout_descriptor="lanes2"))
+    with pytest.raises(ValueError, match="use_wind_relative_pos"):
+        check_layout_descriptor_args(Args(layout_descriptor="lanes2", use_wind_relative_pos=False))
+    with pytest.raises(ValueError, match="compile"):
+        check_layout_descriptor_args(Args(layout_descriptor="lanes2", compile=True))
+    with pytest.raises(ValueError, match="Unknown"):
+        check_layout_descriptor_args(Args(layout_descriptor="roses"))
